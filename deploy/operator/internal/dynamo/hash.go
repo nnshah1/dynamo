@@ -25,6 +25,7 @@ import (
 	"sort"
 
 	"github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/provideroverride"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/runtimeversion"
 	"k8s.io/utils/ptr"
 )
@@ -71,12 +72,34 @@ func ComputeDGDWorkersSpecHash(dgd *v1beta1.DynamoGraphDeployment) (string, erro
 			if _, exists := workerDCDs[componentName]; exists {
 				return "", fmt.Errorf("duplicate generated worker DCD component name %q", componentName)
 			}
+
+			// Rollout budgets change the availability envelope, not the worker generation.
+			spec := workerHashSpec(dcd)
+			if spec.ProviderOverride != nil && spec.ProviderOverride.APIVersion == provideroverride.GroveAPIVersion {
+				if _, exists := provideroverride.GroveMaxUnavailable(spec.ProviderOverride.Value.Raw); exists {
+					var value map[string]json.RawMessage
+					if err := json.Unmarshal(spec.ProviderOverride.Value.Raw, &value); err != nil {
+						return "", fmt.Errorf("decode worker provider override: %w", err)
+					}
+					delete(value, "rollingUpdate")
+					if len(value) == 0 {
+						spec.ProviderOverride = nil
+					} else {
+						raw, err := json.Marshal(value)
+						if err != nil {
+							return "", fmt.Errorf("marshal worker provider override: %w", err)
+						}
+						spec.ProviderOverride.Value.Raw = raw
+					}
+				}
+			}
+
 			workerDCDs[componentName] = workerTemplate{
 				Labels:              GetDCDKubeLabels(dcd),
 				Annotations:         GetDCDKubeAnnotations(dcd),
 				RuntimeVersion:      resolvedRuntimeVersionForHash(&dcd.Spec.DynamoComponentDeploymentSharedSpec),
 				RoleRuntimeVersions: resolvedRoleRuntimeVersionsForHash(&dcd.Spec.DynamoComponentDeploymentSharedSpec),
-				Spec:                workerHashSpec(dcd),
+				Spec:                spec,
 			}
 		}
 	}

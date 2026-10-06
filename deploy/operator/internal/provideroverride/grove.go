@@ -151,14 +151,14 @@ func applyGroveComponentOverride(
 	name := strings.ToLower(component.ComponentName)
 	switch override.Target {
 	case TargetPodCliqueTemplateSpec:
-		return setNamedGroveTopologyConstraint(
+		return setNamedGroveOverride(
 			result,
 			[]string{"spec", "template", "cliques"},
 			name,
 			override,
 		)
 	case TargetPodCliqueScalingGroupConfig:
-		return setNamedGroveTopologyConstraint(
+		return setNamedGroveOverride(
 			result,
 			[]string{"spec", "template", "podCliqueScalingGroups"},
 			name,
@@ -192,7 +192,7 @@ func applyGroveRoleOverride(
 	}
 
 	// Insert the PCLQ topology subtree named for the selected multinode role.
-	return setNamedGroveTopologyConstraint(
+	return setNamedGroveOverride(
 		result,
 		[]string{"spec", "template", "cliques"},
 		strings.ToLower(component.ComponentName+"-"+suffix),
@@ -216,6 +216,13 @@ func validateOverrideIdentity(
 		return fmt.Errorf("unsupported Grove target %q; resolved target is %q", override.Target, expected)
 	}
 
+	// Member cliques draw their budget from their owning scaling group.
+	if scope != ScopeComponent {
+		if _, exists := GroveMaxUnavailable(override.Value.Raw); exists {
+			return fmt.Errorf("rollingUpdate is supported only at component scope; member cliques use the owning scaling group's budget")
+		}
+	}
+
 	// Recheck value ownership before the controller mutates provider resources.
 	if valueErrs := ValidateValue(override.Target, override.Value.Raw); len(valueErrs) != 0 {
 		return fmt.Errorf("value is invalid: %s", valueErrs[0].Error())
@@ -223,9 +230,9 @@ func validateOverrideIdentity(
 	return nil
 }
 
-// setNamedGroveTopologyConstraint sets the registered opaque subtree on one
+// setNamedGroveOverride sets the registered provider subtrees on one
 // named embedded target. result and override must not be nil.
-func setNamedGroveTopologyConstraint(
+func setNamedGroveOverride(
 	result *unstructured.Unstructured,
 	path []string,
 	name string,
@@ -240,8 +247,9 @@ func setNamedGroveTopologyConstraint(
 		return fmt.Errorf("generated destination %s[%q] was not found", strings.Join(path, "."), name)
 	}
 
-	// Decode the raw subtree once before locating its generated destination.
-	topologyConstraint, err := groveTopologyConstraint(override)
+	// Decode the allowed subtrees without requiring topology for a budget-only override.
+	var value map[string]interface{}
+	err = sigsjson.UnmarshalCaseSensitivePreserveInts(override.Value.Raw, &value)
 	if err != nil {
 		return err
 	}
@@ -252,7 +260,9 @@ func setNamedGroveTopologyConstraint(
 		if !ok || item["name"] != name {
 			continue
 		}
-		item["topologyConstraint"] = topologyConstraint
+		for key, subtree := range value {
+			item[key] = subtree
+		}
 		items[i] = item
 		return unstructured.SetNestedSlice(result.Object, items, path...)
 	}

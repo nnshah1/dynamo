@@ -31,6 +31,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/epp"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/provideroverride"
+	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
@@ -145,6 +146,7 @@ type dynamoComponentDeploymentSharedSpecValidationOptions struct {
 	providerOverridesSupported        bool
 	workloadProvider                  string
 	oldComponent                      *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec
+	groveUpdateStrategy               grovev1alpha1.UpdateStrategyType
 }
 
 // validateDynamoComponentDeploymentSharedSpec validates spec. spec and fldPath must not be nil.
@@ -170,6 +172,7 @@ func (v *sharedValidation) validateDynamoComponentDeploymentSharedSpec(
 				workloadProvider: options.workloadProvider,
 				scope:            provideroverride.ScopeComponent,
 				component:        spec,
+				updateStrategy:   options.groveUpdateStrategy,
 			},
 		)...)
 	}
@@ -404,6 +407,7 @@ type providerOverrideValidationOptions struct {
 	workloadProvider string
 	scope            provideroverride.Scope
 	component        *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec
+	updateStrategy   grovev1alpha1.UpdateStrategyType
 }
 
 // validateProviderOverride validates override. override and fldPath must not be nil.
@@ -490,6 +494,26 @@ func (v *sharedValidation) validateProviderOverride(
 			continue
 		}
 		allErrs = append(allErrs, field.Invalid(errPath, nil, valueErr.Detail))
+	}
+
+	// Validate the budget in its authored component context before Grove admission.
+	if budget, exists := provideroverride.GroveMaxUnavailable(override.Value.Raw); exists && budget > 0 {
+		budgetPath := valuePath.Child("rollingUpdate", "maxUnavailable")
+		if options.scope != provideroverride.ScopeComponent {
+			allErrs = append(allErrs, field.Forbidden(valuePath.Child("rollingUpdate"), "member cliques use the owning component's rollingUpdate budget"))
+		} else {
+			replicas := k8sptr.Deref(options.component.Replicas, 1)
+			minAvailable := k8sptr.Deref(options.component.MinAvailable, 1)
+			if options.updateStrategy == grovev1alpha1.OnDeleteStrategy {
+				allErrs = append(allErrs, field.Forbidden(valuePath.Child("rollingUpdate"), "must not be set when the update strategy is OnDelete"))
+			}
+			if budget > replicas {
+				allErrs = append(allErrs, field.Invalid(budgetPath, budget, fmt.Sprintf("must not be greater than replicas (%d); lower or remove the budget before scaling down", replicas)))
+			}
+			if options.updateStrategy == grovev1alpha1.CoherentStrategy && budget < minAvailable {
+				allErrs = append(allErrs, field.Invalid(budgetPath, budget, fmt.Sprintf("must not be less than minAvailable (%d) under the Coherent update strategy", minAvailable)))
+			}
+		}
 	}
 	return allErrs
 }

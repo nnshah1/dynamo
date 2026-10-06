@@ -77,7 +77,8 @@ type CompilationCacheConfig struct {
 //   - target is `PodCliqueSet`, `PodCliqueTemplateSpec`, or
 //     `PodCliqueScalingGroupConfig`, according to the field location and
 //     component shape.
-//   - value may set only the target's topologyConstraint subtree.
+//   - graph and role values may set only the target's topologyConstraint subtree.
+//   - component values may also set rollingUpdate.maxUnavailable.
 //
 // All other providers, versions, targets, and fields are rejected.
 type ProviderOverride struct {
@@ -94,9 +95,10 @@ type ProviderOverride struct {
 	Target string `json:"target,omitempty"`
 
 	// value is a sparse fragment of the selected provider schema. For Grove,
-	// PodCliqueSet accepts only `spec.template.topologyConstraint`; embedded
-	// PodCliqueTemplateSpec and PodCliqueScalingGroupConfig targets accept only
-	// `topologyConstraint`.
+	// PodCliqueSet accepts only `spec.template.topologyConstraint`. At component
+	// scope, PodCliqueTemplateSpec and PodCliqueScalingGroupConfig targets accept
+	// `topologyConstraint` and `rollingUpdate.maxUnavailable`; role targets accept
+	// only `topologyConstraint`.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Type=object

@@ -49,7 +49,7 @@ The DCD spec is `backendFramework` plus the [shared component spec](#shared-comp
 These fields are shared between a standalone DCD and each entry of a DGD `spec.components` list, except where a field is marked DGD-only. In a DGD, prefix them with `spec.components[*]`. Container paths below use the standalone DCD layout; replace the leading `spec.podTemplate` with `spec.components[*].podTemplate` for DGD components.
 
 <ParamField path="providerOverride" type="ProviderOverride">
-  Customizes the primary Grove unit for a component embedded in a DGD. Standalone DCD OpenAPI omits this field. Use `apiVersion: grove.io/v1alpha1`; the target is `PodCliqueTemplateSpec` for a component backed by a PodClique or `PodCliqueScalingGroupConfig` for one backed by a scaling group. The `value` may set only `topologyConstraint`. See [ProviderOverride](dynamo-graph-deployment.mdx#provideroverride).
+  Customizes the primary Grove unit for a component embedded in a DGD. Standalone DCD OpenAPI omits this field. Use `apiVersion: grove.io/v1alpha1`; the target is `PodCliqueTemplateSpec` for a component backed by a PodClique or `PodCliqueScalingGroupConfig` for one backed by a scaling group. The `value` may set `topologyConstraint` and `rollingUpdate.maxUnavailable`, separately or together. Omit `target` to let admission resolve it from the component shape. See [Grove rollout budget overrides](dynamo-graph-deployment.mdx#grove-rollout-budget-overrides) and [ProviderOverride](dynamo-graph-deployment.mdx#provideroverride).
 </ParamField>
 
 <ParamField path="name" type="string" required={true}>

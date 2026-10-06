@@ -32,6 +32,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/provideroverride"
 	internalwebhook "github.com/ai-dynamo/dynamo/deploy/operator/internal/webhook"
+	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
@@ -69,6 +70,7 @@ type dynamoGraphDeploymentSpecValidationOptions struct {
 	grovePathway            bool
 	grovePathwayRequirement string
 	oldComponents           map[string]*nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec
+	groveUpdateStrategy     grovev1alpha1.UpdateStrategyType
 }
 
 // Validate performs stateless validation on the v1beta1 DynamoGraphDeployment.
@@ -201,6 +203,13 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeployment(
 		hasIntraPodFailover(&dgd.Spec),
 	)...)
 
+	// Validate desired strategy intent; admission has no observed PCS rollout state.
+	updateStrategy, err := dynamo.ResolveGroveUpdateStrategy(dgd, nil)
+	if err != nil {
+		// The metadata validator reports an invalid annotation at its exact path.
+		updateStrategy = nil
+	}
+
 	groveEnabled := features.MustGateFrom(v.ctx).Enabled(features.Grove)
 	grovePathway, grovePathwayRequirement := grovePathwayForDynamoGraphDeployment(groveEnabled, dgd)
 	workloadProvider := dgd.Annotations[consts.KubeAnnotationWorkloadProvider]
@@ -214,6 +223,7 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeployment(
 		grovePathway:            grovePathway,
 		grovePathwayRequirement: grovePathwayRequirement,
 		oldComponents:           oldComponents,
+		groveUpdateStrategy:     k8sptr.Deref(updateStrategy, grovev1alpha1.RollingRecreateStrategy),
 	}
 	if grovePathway {
 		specOpts.pcsName = dynamo.PCSNameForDGD(
@@ -422,6 +432,7 @@ func (v *dynamoGraphDeploymentValidation) validateDynamoGraphDeploymentSpec(
 				providerOverridesSupported:        true,
 				workloadProvider:                  opts.workloadProvider,
 				oldComponent:                      opts.oldComponents[component.ComponentName],
+				groveUpdateStrategy:               opts.groveUpdateStrategy,
 			},
 		)...)
 	}

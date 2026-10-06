@@ -163,7 +163,7 @@ func ValidateValue(target string, raw []byte) []ValueError {
 	case TargetPodCliqueSet:
 		return validatePodCliqueSetValue(root)
 	case TargetPodCliqueTemplateSpec, TargetPodCliqueScalingGroupConfig:
-		return validateTopologyOwner(root, "")
+		return validateComponentValue(root)
 	default:
 		return []ValueError{{Detail: fmt.Sprintf("target %q has no registered ownership policy", target)}}
 	}
@@ -249,6 +249,57 @@ func validateTopologyOwner(root map[string]json.RawMessage, path string) []Value
 		errs = append(errs, *valueErr)
 	}
 	return errs
+}
+
+// validateComponentValue permits topology and the supported rollout budget subtree.
+func validateComponentValue(root map[string]json.RawMessage) []ValueError {
+	// Keep all other embedded provider fields owned by Dynamo.
+	errs := rejectUnknown(root, "", "topologyConstraint", "rollingUpdate")
+	if _, topology := root["topologyConstraint"]; topology {
+		_, valueErr := requiredObject(root, "topologyConstraint", "topologyConstraint")
+		if valueErr != nil {
+			errs = append(errs, *valueErr)
+		}
+	}
+
+	// Require at least one supported subtree; neither is mandatory on its own.
+	if _, topology := root["topologyConstraint"]; !topology {
+		if _, rolling := root["rollingUpdate"]; !rolling {
+			errs = append(errs, ValueError{Path: "topologyConstraint", Detail: "topologyConstraint or rollingUpdate is required"})
+		}
+	}
+
+	// Restrict this extension to the positive integer maxUnavailable knob.
+	if _, exists := root["rollingUpdate"]; exists {
+		rolling, valueErr := requiredObject(root, "rollingUpdate", "rollingUpdate")
+		if valueErr != nil {
+			return append(errs, *valueErr)
+		}
+		errs = append(errs, rejectUnknown(rolling, "rollingUpdate", "maxUnavailable")...)
+		var budget int32
+		raw, exists := rolling["maxUnavailable"]
+		if !exists || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			errs = append(errs, ValueError{Path: "rollingUpdate.maxUnavailable", Detail: "is required"})
+		} else if err := json.Unmarshal(raw, &budget); err != nil || budget <= 0 {
+			errs = append(errs, ValueError{Path: "rollingUpdate.maxUnavailable", Detail: "must be a positive 32-bit integer"})
+		}
+	}
+	return errs
+}
+
+// GroveMaxUnavailable returns the configured budget, if present and well-formed.
+// Shape and value errors are reported by ValidateValue.
+func GroveMaxUnavailable(raw []byte) (int32, bool) {
+	// Decode only the supported knob without modifying the raw provider fragment.
+	var value struct {
+		RollingUpdate *struct {
+			MaxUnavailable *int32 `json:"maxUnavailable"`
+		} `json:"rollingUpdate"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil || value.RollingUpdate == nil || value.RollingUpdate.MaxUnavailable == nil {
+		return 0, false
+	}
+	return *value.RollingUpdate.MaxUnavailable, true
 }
 
 func decodeObject(raw []byte, path string) (map[string]json.RawMessage, *ValueError) {

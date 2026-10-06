@@ -2297,6 +2297,207 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 
 		// Provider-native override rules.
 		{
+			name: "v1alpha1 component budget converts and defaults",
+			deployment: alphaDGDForAdmission(func(dgd *nvidiacomv1alpha1.DynamoGraphDeployment) {
+				worker := dgd.Spec.Services["worker"]
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = alphaGroveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+		},
+		{
+			name: "Grove standalone budget override is defaulted and admitted",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+		},
+		{
+			name: "Grove multinode budget override is applied at component scope",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				setBetaExplicitMultinodeRoles(worker, 2)
+			}),
+		},
+		{
+			name: "Grove forced scaling group budget override is admitted",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.Experimental = &nvidiacomv1beta1.ExperimentalSpec{Grove: &nvidiacomv1beta1.GroveSpec{ForceScalingGroup: k8sptr.To(true)}}
+			}),
+		},
+		{
+			name: "budget override coexists with typed topology",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				dgd.Spec.TopologyConstraint = &nvidiacomv1beta1.SpecTopologyConstraint{ClusterTopologyName: "grove-topology", PackDomain: "rack"}
+				worker.TopologyConstraint = &nvidiacomv1beta1.TopologyConstraint{PackDomain: "rack"}
+			}),
+		},
+		{
+			name: "RollingRecreate allows budget below minAvailable",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.MinAvailable = k8sptr.To(int32(3))
+			}),
+		},
+		{
+			name: "Coherent rejects budget below minAvailable",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.MinAvailable = k8sptr.To(int32(3))
+				dgd.Annotations = map[string]string{consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderGrove, consts.KubeAnnotationGroveUpdateStrategy: "Coherent"}
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate.maxUnavailable: Invalid value: 2: must not be less than minAvailable (3) under the Coherent update strategy`},
+		},
+		{
+			name: "OnDelete rejects budget override",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				dgd.Annotations = map[string]string{consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderGrove, consts.KubeAnnotationGroveUpdateStrategy: "OnDelete"}
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate: Forbidden: must not be set when the update strategy is OnDelete`},
+		},
+		{
+			name: "budget cannot exceed desired replicas",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.Replicas = k8sptr.To(int32(1))
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate.maxUnavailable: Invalid value: 2: must not be greater than replicas (1); lower or remove the budget before scaling down`},
+		},
+		{
+			name: "scale-to-zero requires removing explicit budget",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.Replicas = k8sptr.To(int32(0))
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate.maxUnavailable: Invalid value: 2: must not be greater than replicas (0); lower or remove the budget before scaling down`},
+		},
+		{
+			name: "replica reduction revalidates an unchanged budget",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.Replicas = k8sptr.To(int32(1))
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate.maxUnavailable: Invalid value: 2: must not be greater than replicas (1); lower or remove the budget before scaling down`},
+		},
+		{
+			name: "budget removal permits scale-to-zero",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.Replicas = k8sptr.To(int32(0))
+				worker.ProviderOverride = nil
+			}),
+		},
+		{
+			name: "strategy change revalidates unchanged budget",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				dgd.Annotations = map[string]string{consts.KubeAnnotationWorkloadProvider: consts.WorkloadProviderGrove, consts.KubeAnnotationGroveUpdateStrategy: "OnDelete"}
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate: Forbidden: must not be set when the update strategy is OnDelete`},
+		},
+		{
+			name: "member clique role rejects budget override",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				setBetaExplicitMultinodeRoles(worker, 2)
+				worker.Roles[0].ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":1}}`)
+			}),
+			wantWebhookErrs: []string{`spec.components[1].roles[0].providerOverride.value.rollingUpdate: Forbidden: member cliques use the owning component's rollingUpdate budget`},
+		},
+		{
+			name: "root override rejects rolling update configuration",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Spec.ProviderOverride = groveProviderOverride("", `{"spec":{"template":{"topologyConstraint":{},"rollingUpdate":{"maxUnavailable":1}}}}`)
+			}),
+			wantWebhookErrs: []string{`spec.providerOverride.value.spec.template.rollingUpdate: Forbidden: is Dynamo-owned or not enabled for provider override`},
+		},
+		{
+			name:               "origin-gated coherent default enforces component budget",
+			seedWithoutWebhook: true,
+			// Seed through the older test operator, then materialize the newer origin
+			// with the existing legacy seeder before exercising real update admission.
+			oldBeforeUpdate: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{consts.KubeAnnotationDynamoOperatorOriginVersion: "1.1.0"}
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.MinAvailable = k8sptr.To(int32(3))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":3}}`)
+			}),
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{consts.KubeAnnotationDynamoOperatorOriginVersion: "1.6.0"}
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.MinAvailable = k8sptr.To(int32(3))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":3}}`)
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				dgd.Annotations = map[string]string{consts.KubeAnnotationDynamoOperatorOriginVersion: "1.6.0"}
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.MinAvailable = k8sptr.To(int32(3))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+			}),
+			wantWebhookErrs: []string{`spec.components[1].providerOverride.value.rollingUpdate.maxUnavailable: Invalid value: 2: must not be less than minAvailable (3) under the Coherent update strategy`},
+		},
+		{
+			name: "older origin retains RollingRecreate budget rules for disaggregated graphs",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				worker.Replicas = k8sptr.To(int32(4))
+				worker.ProviderOverride = groveProviderOverride("", `{"rollingUpdate":{"maxUnavailable":2}}`)
+				worker.ComponentType = "decode"
+				worker.MinAvailable = k8sptr.To(int32(3))
+				prefill := worker.DeepCopy()
+				prefill.ComponentName = "prefill"
+				prefill.ComponentType = "prefill"
+				prefill.ProviderOverride = nil
+				dgd.Spec.Components = append(dgd.Spec.Components, *prefill)
+			}),
+			wantOriginVersion: "1.1.0",
+		},
+		{
 			name: "valid Grove root provider override is admitted and defaulted",
 			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
 				dgd.Spec.ProviderOverride = groveProviderOverride(
@@ -2306,10 +2507,10 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 			}),
 		},
 		{
-			name: "v1alpha1 Grove root provider override converts and defaults",
+			name: "v1alpha1 Grove root provider override preserves an explicit target",
 			deployment: alphaDGDForAdmission(func(dgd *nvidiacomv1alpha1.DynamoGraphDeployment) {
 				dgd.Spec.ProviderOverride = alphaGroveProviderOverride(
-					"",
+					"PodCliqueSet",
 					`{"spec":{"template":{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"rack"}}}}}`,
 				)
 			}),

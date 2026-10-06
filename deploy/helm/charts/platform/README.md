@@ -102,9 +102,17 @@ Grove-backed DGDs created by Dynamo 1.6.0 or later now default to `Coherent` for
 
 Coherent updates require Grove v0.1.0-alpha.14 or later and matching CRDs. The operator reports an unsupported strategy instead of falling back when the installed PCS schema lacks Coherent. Upgrade externally managed Grove controllers and CRDs together.
 
-Changed components within one PCS roll together, including a frontend changed with workers. Separate PCSes roll independently. Coherent uses no surge capacity and takes down `minAvailable` pods or scaling-group replicas per step; `minAvailable == replicas` can cause a full component outage. Grove's `maxUnavailable` defaults to `minAvailable` and cannot be lower under Coherent. DGD does not yet expose this knob.
+Changed components within one PCS roll together, including a frontend changed with workers. Separate PCSes roll independently. Coherent uses no surge capacity and takes down `minAvailable` pods or scaling-group replicas per step; `minAvailable == replicas` can cause a full component outage. Grove's `maxUnavailable` defaults to `minAvailable` and cannot be lower under Coherent. Set a component-level provider override to supply `rollingUpdate.maxUnavailable`; see the budget notes below.
 
 Grove rejects replica changes during coherent updates. Dynamo defers its scaling and reports `ScalingDeferred` while continuing readiness and status reconciliation. External scalers writing directly to Grove still receive the rejection. See the [DGD update strategy reference](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment.mdx#grove-update-strategy).
+
+##### Per-component Grove rollout budgets
+
+**Change:** Component-level `providerOverride.value` now accepts `rollingUpdate.maxUnavailable`, alone or alongside `topologyConstraint`. Admission infers an omitted target, and Dynamo applies the budget to the generated standalone clique or owning scaling group. Graph-root and multinode role overrides remain topology-only. Requires Grove v0.1.0-alpha.14.
+
+**Affected:** Grove-backed DGDs that explicitly opt into a rollout budget. Existing workloads keep Grove's defaults when the override is absent: `minAvailable` for Coherent and `1` for RollingRecreate. Budget-only edits preserve worker hashes and pod templates and do not initiate a workload rollout.
+
+**Action:** Set a positive integer no greater than the component's desired replicas, and at least `minAvailable` under Coherent. Lower or remove it before scaling below that budget; remove the rollout fragment before scaling to zero or selecting OnDelete. See the [DGD reference](https://github.com/ai-dynamo/dynamo/blob/main/docs/fern/pages/reference/kubernetes-api/dynamo-graph-deployment.mdx#grove-rollout-budget-overrides) for a complete P/D example and scope rules.
 
 #### Dependency compatibility
 
