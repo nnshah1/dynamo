@@ -11,6 +11,7 @@
 //! outcome. The router keeps no session.
 
 mod booking;
+mod class_table;
 mod placement;
 mod plan;
 
@@ -18,17 +19,27 @@ mod plan;
 mod plan_tests;
 
 pub use booking::Booking;
+pub use class_table::{ClassTable, DEFAULT_DEFERRED_WAIT, Fallback, StageList};
 pub use placement::{TOPOLOGY_TAINT_PREFIX, topology_taint};
 pub use plan::{
     Budget, Constraint, DomainMode, Failure, Outcome, Plan, PlanError, PlanId, PlanState, Retry,
     SkipRule, Stage, StageAttempt, StageState, StageWork, When, WorkerFacts,
 };
 
+#[cfg(all(feature = "standalone-selection", any(test, feature = "testing")))]
+pub mod fake;
 #[cfg(feature = "standalone-selection")]
-pub use interface::Router;
+mod multistage;
+#[cfg(all(test, feature = "standalone-selection"))]
+mod multistage_tests;
 
 #[cfg(feature = "standalone-selection")]
-mod interface {
+pub use multistage::{MultiStageRouter, MultiStageRouterBuilder, RouterLimits};
+#[cfg(feature = "standalone-selection")]
+pub use router_trait::Router;
+
+#[cfg(feature = "standalone-selection")]
+mod router_trait {
     use async_trait::async_trait;
 
     use super::Plan;

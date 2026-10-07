@@ -40,7 +40,7 @@ pub use core::{
 };
 pub use error::SelectionError;
 pub use ingress::KvEventIngress;
-pub use input::{PromptRequest, PromptView};
+pub use input::{MmRoutingInfoRequest, PromptRequest, PromptView};
 pub use membership::{CatalogObserver, CatalogReconciler, WorkerCatalogSource};
 pub use pending::SelectionCacheConfig;
 pub use server::{AppState, run_server};

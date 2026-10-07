@@ -52,6 +52,8 @@ use crate::services::overlap::MooncakeOverlapSummary;
 use crate::tracking_hash::{TrackingHashContext, TrackingHashScope};
 
 mod hint;
+#[cfg(test)]
+mod multistage_tests;
 mod operation;
 mod queries;
 mod reservations;

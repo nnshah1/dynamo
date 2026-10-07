@@ -48,7 +48,7 @@ fn local_core_with(
 }
 
 /// `new_inner` with the test defaults.
-fn core_with(
+pub(super) fn core_with(
     config: crate::config::KvRouterConfig,
     host: SelectionHost,
     policy_factory: Option<WorkerSelectionPolicyFactory>,
