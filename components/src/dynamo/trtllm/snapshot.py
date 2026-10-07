@@ -202,18 +202,6 @@ def _validate_supported_snapshot_config(config: Any) -> None:
             ),
             (not config.encode_endpoint, "--encode-endpoint"),
             (not config.frontend_decoding, "--frontend-decoding"),
-            (
-                config.tensor_parallel_size == 1,
-                f"tensor_parallel_size={config.tensor_parallel_size}",
-            ),
-            (
-                config.pipeline_parallel_size == 1,
-                f"pipeline_parallel_size={config.pipeline_parallel_size}",
-            ),
-            (
-                config.gpus_per_node in (None, 1),
-                f"gpus_per_node={config.gpus_per_node}",
-            ),
             (not config.has_connector("kvbm"), "--connector kvbm"),
         )
         if not supported
@@ -221,7 +209,7 @@ def _validate_supported_snapshot_config(config: Any) -> None:
 
     if unsupported:
         raise ValueError(
-            "TRT-LLM Dynamo Snapshot currently supports only the single-GPU "
-            "aggregated text worker path. Unsupported snapshot setting(s): "
+            "TRT-LLM Dynamo Snapshot currently supports only the aggregated "
+            "text worker path. Unsupported snapshot setting(s): "
             + ", ".join(unsupported)
         )
