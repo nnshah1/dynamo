@@ -13,7 +13,11 @@ from dynamo.common.snapshot.constants import (
     RESTORE_COMPLETE_FILE,
     SNAPSHOT_CONTROL_DIR_ENV,
 )
-from dynamo.common.snapshot.lifecycle import SnapshotConfig, elect_and_wake
+from dynamo.common.snapshot.lifecycle import (
+    SnapshotConfig,
+    elect_and_wake,
+    is_cuinterpose_loaded,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.gpu_0, pytest.mark.pre_merge]
 
@@ -94,6 +98,20 @@ async def test_snapshot_lifecycle_clears_capture_only_env_after_restore(
             lifecycle.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await lifecycle
+
+
+@pytest.mark.parametrize(
+    "preload, loaded",
+    [
+        ("", False),
+        ("/usr/lib/libother.so", False),
+        ("/usr/lib/libcuinterpose_core.so", False),
+        ("/tmp/snapshot-cuda/libcuinterpose.so", True),
+        ("/usr/lib/libother.so:/tmp/snapshot-cuda/libcuinterpose.so", True),
+    ],
+)
+def test_is_cuinterpose_loaded_matches_preloaded_frontend(preload, loaded):
+    assert is_cuinterpose_loaded({"LD_PRELOAD": preload}) is loaded
 
 
 async def test_elect_and_wake_resumes_without_lock(monkeypatch):

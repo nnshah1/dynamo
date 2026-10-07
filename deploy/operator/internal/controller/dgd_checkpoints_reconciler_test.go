@@ -1916,3 +1916,36 @@ func TestDGDCheckpointsReconciler_RetainProtectsArtifactCreatedDuringFinalizatio
 	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(job), retainedJob))
 	assert.Empty(t, retainedJob.OwnerReferences)
 }
+
+func TestDefaultCUDASharedMemorySupport(t *testing.T) {
+	tests := []struct {
+		name        string
+		gpus        string
+		annotations map[string]string
+		want        string
+	}{
+		{name: "single GPU", gpus: "1", want: ""},
+		{name: "multi-GPU", gpus: "8", want: "enabled"},
+		{
+			name:        "explicit opt-out",
+			gpus:        "8",
+			annotations: map[string]string{commonconsts.CUDASharedMemorySupportAnnotation: "disabled"},
+			want:        "disabled",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			podTemplate := corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Annotations: test.annotations},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: commonconsts.MainContainerName,
+					Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+						corev1.ResourceName("nvidia.com/gpu"): resource.MustParse(test.gpus),
+					}},
+				}}},
+			}
+			require.NoError(t, defaultCUDASharedMemorySupport(&podTemplate, commonconsts.MainContainerName))
+			assert.Equal(t, test.want, podTemplate.Annotations[commonconsts.CUDASharedMemorySupportAnnotation])
+		})
+	}
+}

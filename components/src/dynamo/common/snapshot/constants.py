@@ -23,6 +23,9 @@ SNAPSHOT_RESTORE_STANDBY_ENV = "SNAPSHOT_RESTORE_STANDBY"
 SNAPSHOT_COMPLETE_FILE = "snapshot-complete"
 RESTORE_COMPLETE_FILE = "restore-complete"
 READY_FOR_SNAPSHOT_FILE = "ready-for-snapshot"
+# Snapshot's launcher preloads this library, from
+# /tmp/snapshot-cuda in podcontract, when CUDA shared-memory support is enabled.
+CUINTERPOSE_LIBRARY = "libcuinterpose.so"
 
 RESTORE_RUNTIME_ENV_NAMES = {
     # Parsed Python runtime config that must also refresh the in-memory config

@@ -682,6 +682,30 @@ func checkpointGMSResourceClaimTemplateName(checkpointID string) string {
 	return dra.ResourceClaimTemplateName("checkpoint-"+checkpointID, "worker")
 }
 
+// defaultCUDASharedMemorySupport enables Snapshot's CUDA shared-memory support for
+// multi-GPU capture targets, whose ranks share CUDA memory that native CUDA
+// checkpointing cannot capture. An explicit annotation in the DGD takes precedence.
+func defaultCUDASharedMemorySupport(podTemplate *corev1.PodTemplateSpec, targetContainerName string) error {
+	if _, set := podTemplate.Annotations[consts.CUDASharedMemorySupportAnnotation]; set {
+		return nil
+	}
+	target, err := findPodTemplateContainer(podTemplate, targetContainerName)
+	if err != nil {
+		return err
+	}
+	gpus, err := dra.ExtractGPUCountFromResourceRequirements(target.Resources)
+	if err != nil {
+		return fmt.Errorf("checkpoint target container %q: %w", targetContainerName, err)
+	}
+	if gpus > 1 {
+		if podTemplate.Annotations == nil {
+			podTemplate.Annotations = map[string]string{}
+		}
+		podTemplate.Annotations[consts.CUDASharedMemorySupportAnnotation] = "enabled"
+	}
+	return nil
+}
+
 func findPodTemplateContainer(podTemplate *corev1.PodTemplateSpec, containerName string) (*corev1.Container, error) {
 	for i := range podTemplate.Spec.Containers {
 		if podTemplate.Spec.Containers[i].Name == containerName {
@@ -1128,6 +1152,9 @@ func (r *dgdCheckpointsReconciler) buildCheckpointJobPodTemplate(
 				}
 			}
 		}
+	}
+	if err := defaultCUDASharedMemorySupport(&podTemplate, targetContainerName); err != nil {
+		return corev1.PodTemplateSpec{}, err
 	}
 	return podTemplate, nil
 }
