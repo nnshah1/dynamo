@@ -62,6 +62,7 @@ pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
 pub(crate) mod metrics_subscriber;
+pub(crate) mod plan_host;
 pub mod plugins;
 pub mod prefill_router;
 pub mod publisher;

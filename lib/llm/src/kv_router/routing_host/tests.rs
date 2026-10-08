@@ -4513,3 +4513,50 @@ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
 
     runtime.shutdown();
 }
+
+#[tokio::test]
+async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan_beside_the_plan() {
+    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Router, StageState};
+
+    let (host, _dispatch, worker_id, _runtime) =
+        router_with_recorded_dispatch("plan-host-books").await;
+    let host = Arc::new(host);
+    let request = Context::new(request());
+    let set_router = HostSetRouter::new(
+        Arc::clone(&host),
+        WorkerType::Aggregated,
+        RequestPhase::Aggregated,
+        &request,
+        false,
+        BusyThresholds::default(),
+    );
+    let req = routing_request(&request, &set_router.partition(), None);
+    let mut plan = set_router.plan(&req).unwrap();
+    assert_eq!(plan.stage_count(), 1);
+    set_router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.state_of(0), Some(&StageState::Booked));
+    assert_eq!(plan.worker(0).map(|w| w.worker_id), Some(worker_id));
+    assert!(
+        !plan.booking(0).unwrap().is_owned(),
+        "the host's route plan owns the lease; the plan only records it"
+    );
+    let admitted = potential_loads(&host).await;
+    assert_eq!(active_requests_for(&admitted, worker_id, 0), 1);
+
+    let side = set_router
+        .take_side(0)
+        .expect("the admitted route is parked beside the plan");
+    assert_eq!(side.plan.worker().worker_id, worker_id);
+    assert_eq!(side.signals.worker.worker_id, worker_id);
+    assert!(set_router.take_side(0).is_none(), "taken once");
+
+    // Dropping the plan frees nothing; aborting the route plan frees the booking.
+    drop(plan);
+    let still_held = potential_loads(&host).await;
+    assert_eq!(active_requests_for(&still_held, worker_id, 0), 1);
+    side.plan.abort().await;
+    let released = potential_loads(&host).await;
+    assert_eq!(active_requests_for(&released, worker_id, 0), 0);
+}
