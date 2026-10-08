@@ -13,9 +13,15 @@
 //!   stage may be booked first and forwarded last (decode-first).
 //! - A failed stage takes every booked stage that reads it back to `Pending`,
 //!   transitively.
+//!
+//! Time is `tokio::time::Instant` so a paused test clock can age a held
+//! booking.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+use serde::Deserialize;
+use tokio::time::Instant;
 
 use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
@@ -57,6 +63,11 @@ impl StageAttempt {
     pub fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// Zero-based; `FIRST` is 0.
+    pub fn index(self) -> u32 {
+        self.0
+    }
 }
 
 impl std::fmt::Display for StageAttempt {
@@ -65,8 +76,9 @@ impl std::fmt::Display for StageAttempt {
     }
 }
 
-/// When a stage may be booked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// When a stage may be booked. YAML: `now` or `after: k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum When {
     /// On the first `schedule` call, with the other `Now` stages.
     Now,
@@ -75,7 +87,7 @@ pub enum When {
 }
 
 /// How long the stage's queue may hold the request while earlier bookings
-/// are held.
+/// are held. YAML: `full`, `immediate`, or a duration such as `2s` / `500ms`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Budget {
     /// The class's queue policy applies unchanged.
@@ -87,7 +99,34 @@ pub enum Budget {
     Bounded(Duration),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl<'de> Deserialize<'de> for Budget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.as_str() {
+            "full" => Ok(Self::Full),
+            "immediate" => Ok(Self::Immediate),
+            _ => parse_duration(&text).map(Self::Bounded).ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "wait budget {text:?}: expected full, immediate, or an integer duration like 2s or 500ms"
+                ))
+            }),
+        }
+    }
+}
+
+/// `<integer>ms` or `<integer>s`.
+fn parse_duration(text: &str) -> Option<Duration> {
+    if let Some(ms) = text.strip_suffix("ms") {
+        return ms.parse().ok().map(Duration::from_millis);
+    }
+    text.strip_suffix('s')
+        .and_then(|secs| secs.parse().ok())
+        .map(Duration::from_secs)
+}
+
+/// YAML: `required` or `preferred: { weight: 0.5 }`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DomainMode {
     Required,
     /// Adds `weight` to the matching topology taint's preference.
@@ -98,8 +137,10 @@ pub enum DomainMode {
 
 /// A placement rule. Rules that name a stage read that stage's booked
 /// worker, so they may only name earlier stages. `Plan::routing_constraints`
-/// turns the first two into today's topology taints.
-#[derive(Debug, Clone, PartialEq)]
+/// turns the first two into today's topology taints. YAML:
+/// `transfer_compatible: 0`, `same_domain: { stage: 0, key: zone, mode: required }`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Constraint {
     /// The worker must be able to receive KV from stage `k`'s worker.
     TransferCompatible(usize),
@@ -129,8 +170,9 @@ impl Constraint {
 }
 
 /// What a stage's worker does for the request: what its booking is charged
-/// for. Derived from the set when a stage does not say.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// for. Derived from the set when a stage does not say. YAML: `work: decode_only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StageWork {
     /// Prefill and decode on one worker.
     PrefillAndDecode,
@@ -142,15 +184,18 @@ pub enum StageWork {
     None,
 }
 
-/// When the router skips a stage instead of booking it.
-#[derive(Debug, Clone, PartialEq)]
+/// When the router skips a stage instead of booking it. YAML: the variant
+/// name (`no_multimodal`, `conditional_disagg`, …) or `worker_busy: 0.9`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SkipRule {
     /// No multimodal input (an encode stage).
     NoMultimodal,
     /// The decode worker already holds the prefix (a prefill stage).
     DecodeHoldsPrefix,
-    /// The stage's worker set is busier than this fraction.
-    SetBusy(f64),
+    /// The worker this stage's set would pick has more active prefill
+    /// tokens than this fraction of its capacity.
+    WorkerBusy(f64),
     /// The conditional-disaggregation policy and decode-busy gate.
     ConditionalDisagg,
 }
@@ -246,7 +291,11 @@ impl StageState {
 /// One element of a plan: a kind of work on its worker set, when it is
 /// booked, what it waits for before it runs, how long it may wait, and its
 /// placement rules. Pure configuration; the plan keeps the state beside it.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// YAML: a bare lowercase set name (`prefill`) or a map:
+/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ... }`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "StageSpec")]
 pub struct Stage {
     pub set: WorkerType,
     pub when: When,
@@ -257,6 +306,64 @@ pub struct Stage {
     pub skip: Option<SkipRule>,
     /// Overrides the accounting derived from the set; see [`Plan::work_of`].
     pub work: Option<StageWork>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StageSpec {
+    Set(WorkerType),
+    Full {
+        set: WorkerType,
+        #[serde(default = "When::now")]
+        when: When,
+        #[serde(default)]
+        inputs: Vec<usize>,
+        #[serde(default = "Budget::full")]
+        wait: Budget,
+        #[serde(default)]
+        constraints: Vec<Constraint>,
+        #[serde(default)]
+        skip: Option<SkipRule>,
+        #[serde(default)]
+        work: Option<StageWork>,
+    },
+}
+
+impl When {
+    fn now() -> Self {
+        Self::Now
+    }
+}
+
+impl Budget {
+    fn full() -> Self {
+        Self::Full
+    }
+}
+
+impl From<StageSpec> for Stage {
+    fn from(spec: StageSpec) -> Self {
+        match spec {
+            StageSpec::Set(set) => Self::new(set),
+            StageSpec::Full {
+                set,
+                when,
+                inputs,
+                wait,
+                constraints,
+                skip,
+                work,
+            } => Self {
+                set,
+                when,
+                inputs,
+                wait,
+                constraints,
+                skip,
+                work,
+            },
+        }
+    }
 }
 
 impl Stage {
@@ -291,6 +398,7 @@ struct Slot {
     booking: Option<Booking>,
     facts: Option<WorkerFacts>,
     kv_hint: Option<KvHint>,
+    booked_at: Option<Instant>,
     attempt: StageAttempt,
     /// Attempts the host reported failed and retried; a limit counts these,
     /// not re-placements caused by another stage's failure.
@@ -307,6 +415,7 @@ impl Slot {
             booking: None,
             facts: None,
             kv_hint: None,
+            booked_at: None,
             attempt: StageAttempt::FIRST,
             failures: 0,
             last_worker: None,
@@ -317,6 +426,7 @@ impl Slot {
         self.state = state;
         self.facts = None;
         self.kv_hint = None;
+        self.booked_at = None;
         self.booking.take()
     }
 }
@@ -467,6 +577,15 @@ impl Plan {
     /// forwards it with the request.
     pub fn kv_hint(&self, k: usize) -> Option<&KvHint> {
         self.slots.get(k)?.kv_hint.as_ref()
+    }
+
+    /// How long stage `k` has been booked without being dispatched.
+    pub fn held_for(&self, k: usize) -> Option<Duration> {
+        let slot = self.slots.get(k)?;
+        if slot.state != StageState::Booked {
+            return None;
+        }
+        slot.booked_at.map(|booked_at| booked_at.elapsed())
     }
 
     pub fn outcome(&self, k: usize) -> Option<&Outcome> {
@@ -648,6 +767,69 @@ impl Plan {
         slot.booking = Some(booking);
         slot.facts = Some(facts);
         slot.kv_hint = kv_hint;
+        slot.booked_at = Some(Instant::now());
+        slot.state = StageState::Booked;
+        Ok(())
+    }
+
+    /// Add a placement rule to a pending stage: the router pins a stage to a
+    /// worker it previewed, or excludes one.
+    pub fn constrain(&mut self, k: usize, constraint: Constraint) -> Result<(), PlanError> {
+        self.check_index(k)?;
+        if !self.slots[k].state.is_pending() {
+            return Err(self.invalid_transition(k, "constrain"));
+        }
+        if let Some(j) = constraint.reads()
+            && j >= k
+        {
+            return Err(PlanError::ForwardDependency {
+                stage: k,
+                depends_on: j,
+            });
+        }
+        self.slots[k].stage.constraints.push(constraint);
+        Ok(())
+    }
+
+    /// Move the booking out of a booked, dispatched or handed-off stage. The
+    /// stage keeps its worker, facts and state; the plan no longer releases
+    /// or fails the booking, whose owner is now the caller.
+    pub fn take_booking(&mut self, k: usize) -> Result<Booking, PlanError> {
+        self.check_index(k)?;
+        match self.slots[k].state {
+            StageState::Booked | StageState::Dispatched(_) | StageState::HandedOff(_) => {}
+            _ => return Err(self.invalid_transition(k, "take the booking of")),
+        }
+        self.slots[k]
+            .booking
+            .take()
+            .ok_or_else(|| self.invalid_transition(k, "take the booking of an untracked"))
+    }
+
+    /// Book a stage that does no scheduler work (an encoder): record the
+    /// worker and its facts with no booking behind them.
+    pub fn book_untracked(
+        &mut self,
+        k: usize,
+        worker: WorkerWithDpRank,
+        facts: WorkerFacts,
+    ) -> Result<(), PlanError> {
+        self.check_index(k)?;
+        if self.work_of(k) != Some(StageWork::None) {
+            return Err(self.invalid_transition(k, "book untracked a stage that does work on"));
+        }
+        if !self.slots[k].state.is_pending() {
+            return Err(self.invalid_transition(k, "book"));
+        }
+        if !self.is_bookable(k) {
+            return Err(PlanError::InputsNotReady { stage: k });
+        }
+        let slot = &mut self.slots[k];
+        slot.last_worker = Some(worker);
+        slot.booking = None;
+        slot.facts = Some(facts);
+        slot.kv_hint = None;
+        slot.booked_at = Some(Instant::now());
         slot.state = StageState::Booked;
         Ok(())
     }

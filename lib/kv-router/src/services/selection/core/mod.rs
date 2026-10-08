@@ -52,6 +52,8 @@ use crate::services::overlap::MooncakeOverlapSummary;
 use crate::tracking_hash::{TrackingHashContext, TrackingHashScope};
 
 mod hint;
+#[cfg(test)]
+mod multistage_tests;
 mod operation;
 mod queries;
 mod reservations;
@@ -322,8 +324,29 @@ impl SelectionCore {
             .collect()
     }
 
-    /// Create a local selector and report invalid tracking configuration.
+    /// Create a local selector for aggregated workers and report invalid
+    /// tracking configuration.
     pub fn try_new_local(
+        kv_router_config: crate::config::KvRouterConfig,
+        indexer_threads: usize,
+        cancel_token: CancellationToken,
+        cache_config: SelectionCacheConfig,
+        policy_factory: WorkerSelectionPolicyFactory,
+    ) -> anyhow::Result<Self> {
+        Self::try_new_local_for(
+            WorkerType::Aggregated,
+            kv_router_config,
+            indexer_threads,
+            cancel_token,
+            cache_config,
+            policy_factory,
+        )
+    }
+
+    /// Create a local selector for one worker set: the one-set
+    /// [`Router`](crate::router::Router) a multistage router composes.
+    pub fn try_new_local_for(
+        worker_type: WorkerType,
         mut kv_router_config: crate::config::KvRouterConfig,
         indexer_threads: usize,
         cancel_token: CancellationToken,
@@ -345,7 +368,7 @@ impl SelectionCore {
             None,
             policy_factory,
             SelectionHost::default(),
-            WorkerType::Aggregated,
+            worker_type,
             true,
             cache_config,
             tracking_hash,
