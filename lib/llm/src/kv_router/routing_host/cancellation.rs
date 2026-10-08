@@ -30,7 +30,7 @@ const CLEANUP_DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The clock starts the first time a stage actually observes a stopped context,
 /// which means a live request never arms it and keeps today's semantics exactly.
 #[derive(Debug, Default)]
-pub(super) struct CleanupBudget {
+pub(crate) struct CleanupBudget {
     started: Mutex<Option<Instant>>,
 }
 

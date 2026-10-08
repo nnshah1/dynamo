@@ -24,7 +24,10 @@ use dynamo_kv_router::{
         BlockExtraInfo, BlockHashOptions, WorkerWithDpRank, compute_block_hash_for_seq,
         compute_next_seq_hash,
     },
-    scheduling::{AbortCause, RequestLifecycle, queue::BookingHandle},
+    scheduling::{
+        AbortCause, RequestLifecycle,
+        queue::{BookingHandle, SchedulerBookingDescriptor},
+    },
 };
 use dynamo_runtime::{
     error::DynamoError,
@@ -461,6 +464,15 @@ impl KvRequestCleanup {
             lifecycle,
             request_lifecycle: None,
         }
+    }
+
+    /// The committed booking this cleanup will release, if admission booked one.
+    // Consumed by the Plan host (`plan_host.rs`), which lands next.
+    #[allow(dead_code)]
+    pub(super) fn descriptor(&self) -> Option<SchedulerBookingDescriptor> {
+        self.lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.booking().clone())
     }
 
     fn lifecycle(&self) -> Option<&RequestAttemptLease> {

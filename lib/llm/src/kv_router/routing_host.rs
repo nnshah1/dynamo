@@ -10,7 +10,7 @@ use std::{
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
-    scheduling::{AbortCause, KvSchedulerError},
+    scheduling::{AbortCause, KvSchedulerError, queue::SchedulerBookingDescriptor},
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -53,7 +53,8 @@ mod occupancy;
 mod request_guard;
 
 use builtin::BuiltinWorkerSelector;
-use cancellation::{CleanupBudget, DispatchCancellation, StagedKv, await_with_cleanup_policy};
+pub(crate) use cancellation::CleanupBudget;
+use cancellation::{DispatchCancellation, StagedKv, await_with_cleanup_policy};
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
 pub(crate) use request_guard::prompt_private_blocks;
@@ -358,9 +359,26 @@ impl RoutePlan {
         self.budget.remaining()
     }
 
-    #[cfg(test)]
+    /// Free the admitted booking without dispatching.
+    // Consumed by the Plan host (`plan_host.rs`), which lands next.
+    #[allow(dead_code)]
     pub(crate) async fn abort(self) {
         self.cleanup.finish().await;
+    }
+
+    // Consumed by the Plan host (`plan_host.rs`), which lands next.
+    #[allow(dead_code)]
+    pub(crate) fn worker(&self) -> WorkerWithDpRank {
+        self.signals.worker
+    }
+
+    /// The scheduler booking this plan's cleanup holds, for a host that
+    /// records the admission elsewhere and keeps this plan as its owner.
+    /// `None` when admission booked nothing.
+    // Consumed by the Plan host (`plan_host.rs`), which lands next.
+    #[allow(dead_code)]
+    pub(crate) fn booking_descriptor(&self) -> Option<SchedulerBookingDescriptor> {
+        self.cleanup.descriptor()
     }
 }
 
