@@ -208,6 +208,9 @@ pub enum StageState {
     Pending,
     Booked,
     Dispatched(StageAttempt),
+    /// Dispatched, and it has produced what its dependents need (bootstrap
+    /// info, a first output) while it is still running.
+    HandedOff(StageAttempt),
     Completed(Outcome),
     Failed(StageAttempt, Failure),
     Skipped,
@@ -218,9 +221,12 @@ impl StageState {
         matches!(self, Self::Pending)
     }
 
-    /// Completed or skipped: a dependent's input is available.
+    /// Completed, handed off or skipped: a dependent's input is available.
     pub fn is_settled(&self) -> bool {
-        matches!(self, Self::Completed(_) | Self::Skipped)
+        matches!(
+            self,
+            Self::Completed(_) | Self::HandedOff(_) | Self::Skipped
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -228,6 +234,7 @@ impl StageState {
             Self::Pending => "pending",
             Self::Booked => "booked",
             Self::Dispatched(_) => "dispatched",
+            Self::HandedOff(_) => "handed off",
             Self::Completed(_) => "completed",
             Self::Failed(..) => "failed",
             Self::Skipped => "skipped",
@@ -444,6 +451,8 @@ impl Plan {
         self.slots.get(k).map(|slot| slot.failures)
     }
 
+    /// The booking the plan holds for stage `k`: `None` before booking, after
+    /// `take_booking`, and for a stage booked untracked.
     pub fn booking(&self, k: usize) -> Option<&Booking> {
         self.slots.get(k)?.booking.as_ref()
     }
@@ -467,15 +476,21 @@ impl Plan {
     }
 
     /// The worker stage `k` is booked on.
+    /// The worker stage `k` is booked on or ran on; `None` before booking
+    /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {
-        self.booking(k).map(Booking::worker)
+        let slot = self.slots.get(k)?;
+        match slot.state {
+            StageState::Pending | StageState::Failed(..) | StageState::Skipped => None,
+            _ => slot.last_worker,
+        }
     }
 
     pub fn state(&self) -> PlanState {
         let mut state = PlanState::Planned;
         for slot in &self.slots {
             match slot.state {
-                StageState::Dispatched(_) | StageState::Completed(_) => {
+                StageState::Dispatched(_) | StageState::HandedOff(_) | StageState::Completed(_) => {
                     return PlanState::Dispatched;
                 }
                 StageState::Booked => state = PlanState::Booked,
@@ -636,6 +651,48 @@ impl Plan {
         Ok(())
     }
 
+    /// Move the booking out of a booked, dispatched or handed-off stage. The
+    /// stage keeps its worker, facts and state; the plan no longer releases
+    /// or fails the booking, whose owner is now the caller.
+    pub fn take_booking(&mut self, k: usize) -> Result<Booking, PlanError> {
+        self.check_index(k)?;
+        match self.slots[k].state {
+            StageState::Booked | StageState::Dispatched(_) | StageState::HandedOff(_) => {}
+            _ => return Err(self.invalid_transition(k, "take the booking of")),
+        }
+        self.slots[k]
+            .booking
+            .take()
+            .ok_or_else(|| self.invalid_transition(k, "take the booking of an untracked"))
+    }
+
+    /// Book a stage that does no scheduler work (an encoder): record the
+    /// worker and its facts with no booking behind them.
+    pub fn book_untracked(
+        &mut self,
+        k: usize,
+        worker: WorkerWithDpRank,
+        facts: WorkerFacts,
+    ) -> Result<(), PlanError> {
+        self.check_index(k)?;
+        if self.work_of(k) != Some(StageWork::None) {
+            return Err(self.invalid_transition(k, "book untracked a stage that does work on"));
+        }
+        if !self.slots[k].state.is_pending() {
+            return Err(self.invalid_transition(k, "book"));
+        }
+        if !self.is_bookable(k) {
+            return Err(PlanError::InputsNotReady { stage: k });
+        }
+        let slot = &mut self.slots[k];
+        slot.last_worker = Some(worker);
+        slot.booking = None;
+        slot.facts = Some(facts);
+        slot.kv_hint = None;
+        slot.state = StageState::Booked;
+        Ok(())
+    }
+
     pub fn skip(&mut self, k: usize) -> Result<(), PlanError> {
         self.check_index(k)?;
         if !self.slots[k].state.is_pending() {
@@ -659,6 +716,21 @@ impl Plan {
         Ok(attempt)
     }
 
+    /// Stage `k`'s attempt is running and has handed its dependents what
+    /// they need: they may be booked and forwarded now. The stage still
+    /// completes or fails later. Idempotent for the current attempt.
+    pub fn handoff(&mut self, k: usize, attempt: StageAttempt) -> Result<(), PlanError> {
+        self.check_index(k)?;
+        self.check_attempt(k, attempt)?;
+        match &self.slots[k].state {
+            StageState::Dispatched(_) => {}
+            StageState::HandedOff(_) => return Ok(()),
+            _ => return Err(self.invalid_transition(k, "hand off")),
+        }
+        self.slots[k].state = StageState::HandedOff(attempt);
+        Ok(())
+    }
+
     /// Stage `k`'s attempt finished with routing facts. The booking stays
     /// held until `release`. Idempotent for the current attempt.
     pub fn complete(
@@ -670,7 +742,7 @@ impl Plan {
         self.check_index(k)?;
         self.check_attempt(k, attempt)?;
         match &self.slots[k].state {
-            StageState::Dispatched(_) => {}
+            StageState::Dispatched(_) | StageState::HandedOff(_) => {}
             StageState::Completed(_) => return Ok(()),
             StageState::Pending
             | StageState::Booked
@@ -697,14 +769,16 @@ impl Plan {
         self.check_index(k)?;
         self.check_attempt(k, attempt)?;
         match &self.slots[k].state {
-            StageState::Booked | StageState::Dispatched(_) => {}
+            StageState::Booked | StageState::Dispatched(_) | StageState::HandedOff(_) => {}
             StageState::Failed(..) => return Ok(()),
             StageState::Pending | StageState::Completed(_) | StageState::Skipped => {
                 return Err(self.invalid_transition(k, "fail"));
             }
         }
         drop(self.slots[k].reset(StageState::Failed(attempt, cause)));
-        // Dependents of dependents also lose their placement. `inputs` may
+        // Only booked dependents lose their placement: one already running
+        // on a worker is the host's to fail. Dependents of dependents also
+        // lose theirs. `inputs` may
         // point either way, so repeat until nothing changes; the graph is
         // acyclic, so this ends. A re-placed dependent is a new attempt:
         // its next booking gets a new id and events for the released one
