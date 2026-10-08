@@ -467,8 +467,6 @@ impl KvRequestCleanup {
     }
 
     /// The committed booking this cleanup will release, if admission booked one.
-    // Consumed by the Plan host (`plan_host.rs`), which lands next.
-    #[allow(dead_code)]
     pub(super) fn descriptor(&self) -> Option<SchedulerBookingDescriptor> {
         self.lifecycle
             .as_ref()

@@ -41,6 +41,7 @@ mod activation;
 mod admission;
 mod conditional_bypass;
 mod handoff;
+mod planned;
 mod query;
 use handoff::PrefillTask;
 pub use query::PrefillReservation;
@@ -228,7 +229,7 @@ pub struct PrefillRouter {
     decode_router_mode: RouterMode,
     session_affinity_ttl: Option<std::time::Duration>,
     session_affinity_mode: SessionAffinityMode,
-    conditional_disagg_policy: Box<dyn ConditionalDisaggPolicy>,
+    conditional_disagg_policy: Arc<dyn ConditionalDisaggPolicy>,
     /// Resolved once at construction: dedicated threshold if set, otherwise
     /// `router_queue_threshold`. `None` means the prefill-load condition is disabled.
     conditional_disagg_prefill_busy_threshold: Option<f64>,
@@ -326,6 +327,16 @@ impl
         // do not turn an advisory worker lookup into conditional local execution.
         if req.get_annotation_value("query_instance_id").is_some() {
             return next.generate(context.map(|_| req)).await;
+        }
+
+        // KV-routed prefill and decode: the plan decides stage order, the
+        // conditional bypass and per-stage accounting; this operator hosts it.
+        if let Some(binding) = self.binding.load_full()
+            && let Some(decode_host) = self.planned_decode_host(&binding)
+        {
+            return self
+                .generate_planned(req, context, binding, decode_host)
+                .await;
         }
 
         let session_affinity = context
@@ -575,9 +586,9 @@ impl
 
 /// Prefill must survive client cancellation once decode needs its KV transfer.
 /// Copy request identity and metadata, but keep a separate cancellation controller.
-fn independent_prefill_context(
+fn independent_prefill_context<S: Send + Sync + 'static>(
     request: PreprocessedRequest,
-    source: &Context<()>,
+    source: &Context<S>,
 ) -> Result<Context<PreprocessedRequest>> {
     let mut prefill =
         Context::with_id_and_metadata(request, source.id().to_string(), source.metadata().clone());
@@ -586,6 +597,7 @@ fn independent_prefill_context(
 }
 
 impl PrefillRouter {
+    #[cfg(test)]
     pub(crate) fn conditional_disagg_enabled(&self) -> bool {
         self.conditional_disagg_policy.is_enabled()
     }

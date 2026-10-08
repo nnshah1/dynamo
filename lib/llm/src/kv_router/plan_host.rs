@@ -13,9 +13,6 @@
 //! The router library sees bookings, placement and accounting. The host keeps
 //! dispatch, response streams, cleanup, affinity holds and cache tracking.
 
-// Consumed by `prefill_router::planned`, which lands in the next commit.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
