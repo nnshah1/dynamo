@@ -575,3 +575,175 @@ fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
     drop(p);
     assert_eq!(releases.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn a_taken_booking_belongs_to_the_host_and_is_released_once() {
+    let releases = Arc::new(AtomicUsize::new(0));
+    let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
+    plan.book(
+        0,
+        booking("p", worker(1), &releases),
+        WorkerFacts::default(),
+        None,
+    )
+    .unwrap();
+    let taken = plan.take_booking(0).unwrap();
+    assert_eq!(taken.worker(), worker(1));
+    assert!(plan.booking(0).is_none(), "the plan no longer holds it");
+    assert_eq!(
+        plan.worker(0),
+        Some(worker(1)),
+        "but still knows the worker"
+    );
+    assert_eq!(state(&plan, 0), &StageState::Booked);
+    // Failing the stage afterwards must not touch the moved booking.
+    let attempt = plan.dispatch(0).unwrap();
+    plan.fail(0, attempt, failure(true)).unwrap();
+    assert_eq!(releases.load(Ordering::SeqCst), 0);
+    drop(plan);
+    assert_eq!(
+        releases.load(Ordering::SeqCst),
+        0,
+        "drop frees nothing it does not own"
+    );
+    drop(taken);
+    assert_eq!(
+        releases.load(Ordering::SeqCst),
+        1,
+        "the host's drop frees it once"
+    );
+}
+
+#[test]
+fn take_booking_needs_a_booked_or_dispatched_stage() {
+    let mut plan = plan(vec![Stage::new(WorkerType::Aggregated)]);
+    assert!(matches!(
+        plan.take_booking(0),
+        Err(PlanError::InvalidTransition { .. })
+    ));
+    assert!(matches!(
+        plan.take_booking(5),
+        Err(PlanError::NoSuchStage { stage: 5 })
+    ));
+}
+
+#[test]
+fn an_untracked_booking_records_the_worker_without_a_handle() {
+    let mut plan = plan(vec![
+        Stage::new(WorkerType::Encode),
+        Stage {
+            when: When::After(0),
+            inputs: vec![0],
+            ..Stage::new(WorkerType::Prefill)
+        },
+    ]);
+    plan.book_untracked(0, worker(31), zone("b")).unwrap();
+    assert_eq!(state(&plan, 0), &StageState::Booked);
+    assert_eq!(plan.worker(0), Some(worker(31)));
+    assert!(plan.booking(0).is_none());
+    assert_eq!(plan.facts(0), Some(&zone("b")));
+    assert!(matches!(
+        plan.take_booking(0),
+        Err(PlanError::InvalidTransition { .. })
+    ));
+    let attempt = plan.dispatch(0).unwrap();
+    plan.complete(0, attempt, outcome(worker(31))).unwrap();
+    assert!(plan.ready().next().is_none(), "prefill is not booked yet");
+    // Only a stage that does no scheduler work may be untracked.
+    let mut other = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
+    assert!(matches!(
+        other.book_untracked(0, worker(1), WorkerFacts::default()),
+        Err(PlanError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
+fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
+    let releases = Arc::new(AtomicUsize::new(0));
+    let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
+    plan.book(
+        0,
+        booking("p", worker(1), &releases),
+        WorkerFacts::default(),
+        None,
+    )
+    .unwrap();
+    let attempt = plan.dispatch(0).unwrap();
+    // A rejected booking drops and releases itself; count it apart.
+    let rejected = Arc::new(AtomicUsize::new(0));
+    assert!(
+        matches!(
+            plan.book(
+                1,
+                booking("d", worker(2), &rejected),
+                WorkerFacts::default(),
+                None
+            ),
+            Err(PlanError::InputsNotReady { stage: 1 })
+        ),
+        "decode waits for the handoff"
+    );
+    assert_eq!(rejected.load(Ordering::SeqCst), 1);
+    plan.handoff(0, attempt).unwrap();
+    assert_eq!(state(&plan, 0), &StageState::HandedOff(attempt));
+    plan.book(
+        1,
+        booking("d", worker(2), &releases),
+        WorkerFacts::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vec_of(plan.ready()), vec![1]);
+    let decode_attempt = plan.dispatch(1).unwrap();
+    assert_eq!(plan.state(), PlanState::Dispatched);
+    // Late prefill failure: decode is running on a worker; it is not reset.
+    plan.fail(0, attempt, failure(false)).unwrap();
+    assert_eq!(state(&plan, 1), &StageState::Dispatched(decode_attempt));
+    assert!(matches!(state(&plan, 0), StageState::Failed(..)));
+    assert_eq!(
+        releases.load(Ordering::SeqCst),
+        1,
+        "only the prefill booking was freed"
+    );
+
+    // Completing after a handoff is also fine.
+    let mut ok = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
+    ok.book(
+        0,
+        booking("p", worker(1), &releases),
+        WorkerFacts::default(),
+        None,
+    )
+    .unwrap();
+    let a = ok.dispatch(0).unwrap();
+    ok.handoff(0, a).unwrap();
+    ok.complete(0, a, outcome(worker(1))).unwrap();
+    assert!(matches!(state(&ok, 0), StageState::Completed(_)));
+}
+
+#[test]
+fn handoff_is_fenced_by_attempt_and_state() {
+    let releases = Arc::new(AtomicUsize::new(0));
+    let mut plan = plan(vec![Stage::new(WorkerType::Prefill)]);
+    plan.book(
+        0,
+        booking("p", worker(1), &releases),
+        WorkerFacts::default(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            plan.handoff(0, StageAttempt::FIRST),
+            Err(PlanError::InvalidTransition { .. })
+        ),
+        "not dispatched yet"
+    );
+    let attempt = plan.dispatch(0).unwrap();
+    assert!(matches!(
+        plan.handoff(0, attempt.next()),
+        Err(PlanError::StaleAttempt { .. })
+    ));
+    plan.handoff(0, attempt).unwrap();
+    plan.handoff(0, attempt).unwrap();
+}
