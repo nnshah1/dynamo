@@ -181,8 +181,14 @@ impl SelectionCore {
                 pinned_worker,
                 allowed_worker_ids,
                 routing_constraints,
-                admission: SelectionAdmission::Lease {
-                    request_id: booking_id,
+                admission: if req.export_bookings {
+                    SelectionAdmission::Book {
+                        selection_id: booking_id,
+                    }
+                } else {
+                    SelectionAdmission::Lease {
+                        request_id: booking_id,
+                    }
                 },
                 track_active_blocks,
                 return_routing_hashes: false,
@@ -198,10 +204,27 @@ impl SelectionCore {
                 )));
             }
         };
-        let Some(handle) = selected.booking else {
-            return Err(SelectionError::Internal(
-                "lease admission returned no booking handle".to_string(),
-            ));
+        // An exported booking lives in the core's reservation index under its
+        // id, for a host that completes and frees by id; the plan records
+        // the descriptor and never releases it. A leased booking is the
+        // plan's own.
+        let booking = match (
+            req.export_bookings,
+            selected.booking,
+            selected.booking_descriptor,
+        ) {
+            (true, _, Some(descriptor)) => Booking::Committed(descriptor),
+            (false, Some(handle), _) => Booking::Owned(handle),
+            (true, _, None) => {
+                return Err(SelectionError::Internal(
+                    "book admission returned no booking descriptor".to_string(),
+                ));
+            }
+            (false, None, _) => {
+                return Err(SelectionError::Internal(
+                    "lease admission returned no booking handle".to_string(),
+                ));
+            }
         };
         let worker = selected.response.best_worker;
         // The worker was in the snapshot the selector read an instant ago;
@@ -219,7 +242,7 @@ impl SelectionCore {
                 ))
             })?;
         plan.check_placement(k, &facts).map_err(placement_error)?;
-        plan.book(k, Booking::Owned(handle), facts, selected.kv_hint)
+        plan.book(k, booking, facts, selected.kv_hint)
             .map_err(|error| SelectionError::Internal(error.to_string()))
     }
 }
@@ -598,6 +621,44 @@ mod tests {
         );
         assert!(!entry.scheduler.has_request("now"));
         held.abort();
+    }
+
+    #[tokio::test]
+    async fn exported_bookings_live_in_the_reservation_index() {
+        let core = local_core(test_config(false));
+        core.upsert_worker(worker(1)).await.expect("worker upsert");
+        let entry = core.entry(&default_key()).expect("entry");
+        let mut req = reserve_request("exported");
+        req.export_bookings = true;
+        let mut plan = core.plan(&req).unwrap();
+        core.schedule(&req, &mut plan).await.unwrap();
+        let booking = plan.booking(0).expect("booked");
+        assert_eq!(
+            booking.id(),
+            "exported",
+            "a one-stage first attempt keeps the plan id"
+        );
+        assert!(!booking.is_owned(), "the reservation index owns it");
+        assert!(entry.scheduler.has_request("exported"));
+        // The wire lifecycle works while the plan is alive ...
+        core.prefill_complete("exported").await.expect("indexed");
+        core.free_reservation("exported").await.expect("indexed");
+        // ... and releasing the plan afterwards is a no-op, not a double free.
+        plan.release().await.unwrap();
+        wait_until("the exported booking is gone", || {
+            core.loads(None, None)
+                .iter()
+                .all(|model| model.loads.iter().all(|load| load.active_requests == 0))
+        })
+        .await;
+
+        // A leased booking is not indexed.
+        let req = reserve_request("leased");
+        let mut plan = core.plan(&req).unwrap();
+        core.schedule(&req, &mut plan).await.unwrap();
+        assert!(plan.booking(0).unwrap().is_owned());
+        assert!(core.free_reservation("leased").await.is_err());
+        plan.release().await.unwrap();
     }
 
     #[tokio::test]

@@ -199,6 +199,7 @@ impl SelectionCore {
             routing_hashes: _,
             shared_cache_hits: _,
             booking: _,
+            booking_descriptor: _,
         } = selected;
         let booked = sequence_hashes.is_some();
         let potential_decode_blocks = response.potential_decode_blocks as u64;
@@ -510,6 +511,7 @@ impl SelectionCore {
         // The routing hashes go to exactly one of: the reservation recorded
         // now, or the replay cache a later reservation records from.
         let mut routing_hashes = routing_hashes;
+        let mut booking_descriptor = None;
         let booking = if let Some(claim) = claim {
             let Some(booking) = booking else {
                 return Err(SelectionError::Internal(
@@ -528,6 +530,7 @@ impl SelectionCore {
                 self.record_routing_decision(&entry, response.best_worker, hashes)
                     .await;
             }
+            booking_descriptor = Some(booking.descriptor().clone());
             claim.install(booking, affinity_lease)?;
             None
         } else {
@@ -581,6 +584,7 @@ impl SelectionCore {
             routing_hashes: returned_routing_hashes,
             shared_cache_hits: host_shared_cache_hits,
             booking,
+            booking_descriptor,
         }))
     }
 

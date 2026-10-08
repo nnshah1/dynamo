@@ -488,6 +488,12 @@ pub struct SelectAndReserveRequest {
     /// per-stage `when` and `wait` apply. One stage: the stage is `Immediate`.
     #[serde(default)]
     pub all_now: bool,
+    /// Book each stage through the core's reservation index under its
+    /// booking id, so an out-of-process host can complete and free it by id
+    /// (`/reservations/{id}/prefill_complete`, `DELETE /reservations/{id}`).
+    /// Off, the plan owns a lease and releases it.
+    #[serde(default)]
+    pub export_bookings: bool,
 }
 
 impl SelectAndReserveRequest {
