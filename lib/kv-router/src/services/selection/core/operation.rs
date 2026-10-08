@@ -16,7 +16,7 @@ use crate::protocols::{
     WorkerWithDpRank,
 };
 use crate::scheduling::config::RouterConfigOverride;
-use crate::scheduling::queue::BookingHandle;
+use crate::scheduling::queue::{BookingHandle, SchedulerBookingDescriptor};
 use crate::scheduling::{AdvisoryWorkerLoad, QueueRejection, SchedulingResponse, SessionContext};
 
 use super::super::error::SelectionError;
@@ -146,4 +146,6 @@ pub struct Selected {
     /// The booking's handle; `Lease` admission only. Dropping it frees the
     /// booking, `commit` hands it to the caller's own cleanup.
     pub booking: Option<BookingHandle>,
+    /// The booking the reservation index now holds; `Book` admission only.
+    pub booking_descriptor: Option<SchedulerBookingDescriptor>,
 }

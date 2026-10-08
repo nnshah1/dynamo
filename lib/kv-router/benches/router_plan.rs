@@ -164,6 +164,7 @@ fn request(id: &str) -> SelectAndReserveRequest {
         routing_constraints: RoutingConstraints::default(),
         policy_class: None,
         all_now: false,
+        export_bookings: false,
     }
 }
 
