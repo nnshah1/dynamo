@@ -355,8 +355,9 @@ impl MultiStageRouter {
                 if plan.unresolved_reads(decode).any(|j| j != k) {
                     return Ok(Decision::Keep);
                 }
-                let probe = advisory(req);
-                let mut decode_probe = probe.clone();
+                // One advisory copy of the request; a second is made only
+                // for a policy that also asks the prefill set.
+                let mut decode_probe = advisory(req);
                 decode_probe.routing_constraints = plan
                     .placement_constraints(decode, &req.routing_constraints)
                     .map_err(internal)?;
@@ -396,7 +397,7 @@ impl MultiStageRouter {
                         // not a failed request, as in the frontend today.
                         let prefill_busy = if policy.needs_prefill_worker_busy() {
                             self.set_router(stage.set)?
-                                .select(probe)
+                                .select(advisory(req))
                                 .await
                                 .ok()
                                 .and_then(|response| response.worker_load)
