@@ -44,6 +44,7 @@ mod handoff;
 mod planned;
 mod query;
 use handoff::PrefillTask;
+pub use planned::{PlanRouterFactory, PlanRouterParts, default_plan_router};
 pub use query::PrefillReservation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +221,10 @@ pub struct PrefillRouter {
     /// Decode routing owns conditional-disagg planning and dispatch. This is
     /// installed after the frontend constructs its one decode `RoutingHost`.
     decode_routing_host: OnceLock<Arc<RoutingHost>>,
+    /// Builds the `Router` the planned path drives; the default is a
+    /// `MultiStageRouter` over the class's stage list. A deployment with a
+    /// custom flow policy installs its own once, at construction time.
+    plan_router_factory: OnceLock<planned::PlanRouterFactory>,
     selection_policy: Option<SelectionPolicySource>,
     model_manager: Arc<ModelManager>,
     cancel_token: CancellationToken,
@@ -600,6 +605,15 @@ impl PrefillRouter {
     #[cfg(test)]
     pub(crate) fn conditional_disagg_enabled(&self) -> bool {
         self.conditional_disagg_policy.is_enabled()
+    }
+
+    /// Install the `Router` factory the planned path uses for every request.
+    /// The host's dispatch and lifecycle code is unchanged by what it
+    /// returns. Fails if one is already installed.
+    pub fn set_plan_router_factory(&self, factory: planned::PlanRouterFactory) -> Result<()> {
+        self.plan_router_factory
+            .set(factory)
+            .map_err(|_| anyhow::anyhow!("PrefillRouter already has a plan router factory"))
     }
 
     pub(crate) fn set_decode_routing_host(&self, routing_host: Arc<RoutingHost>) -> Result<()> {
