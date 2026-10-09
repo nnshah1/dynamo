@@ -13,9 +13,7 @@ use async_trait::async_trait;
 use super::super::types::resolve_session_context;
 use super::run::session_binding;
 use super::*;
-use crate::router::{
-    Booking, Budget, Constraint, Plan, PlanError, PlanId, Router, Stage, WorkerFacts,
-};
+use crate::router::{Booking, Budget, Constraint, Plan, PlanId, Router, Stage, WorkerFacts};
 
 #[async_trait]
 impl Router for SelectionCore {
@@ -68,13 +66,6 @@ fn partition_of(req: &SelectAndReserveRequest) -> RoutingPartitionId {
     RoutingPartitionId::new(req.model_name.clone(), req.routing_group.clone())
 }
 
-fn placement_error(error: PlanError) -> SelectionError {
-    match error {
-        PlanError::Placement { .. } => SelectionError::Conflict(error.to_string()),
-        other => SelectionError::BadRequest(other.to_string()),
-    }
-}
-
 impl SelectionCore {
     /// One stage's classify → order → place → reserve, with the stage's wait
     /// budget as the queue's hold budget and its constraints folded into the
@@ -107,9 +98,7 @@ impl SelectionCore {
                 Constraint::TransferCompatible(_) | Constraint::SameDomain { .. } => {}
             }
         }
-        let routing_constraints = plan
-            .placement_constraints(k, &req.routing_constraints)
-            .map_err(placement_error)?;
+        let routing_constraints = plan.placement_constraints(k, &req.routing_constraints)?;
         let hold_budget = match stage.wait {
             Budget::Full => None,
             Budget::Immediate => Some(Duration::ZERO),
@@ -260,7 +249,7 @@ impl SelectionCore {
                     worker.worker_id
                 ))
             })?;
-        plan.check_placement(k, &facts).map_err(placement_error)?;
+        plan.check_placement(k, &facts)?;
         plan.book(k, booking, facts, kv_hint)
             .map_err(|error| SelectionError::Internal(error.to_string()))
     }

@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::indexer::KvRouterError;
+use crate::router::PlanError;
 use crate::scheduling::KvSchedulerError;
 use crate::sequences::SequenceError;
 
@@ -29,6 +30,19 @@ pub enum SelectionError {
     /// anything else is internal.
     #[error(transparent)]
     Indexer(#[from] KvRouterError),
+}
+
+/// How a plan's refusal reads to the caller, the same from the core and from
+/// every host adapter: a placement the chosen worker cannot satisfy is a
+/// conflict between stages; anything else the plan rejects (an unknown stage,
+/// a pin the worker breaks, a booking out of order) is a bad request.
+impl From<PlanError> for SelectionError {
+    fn from(error: PlanError) -> Self {
+        match error {
+            PlanError::Placement { .. } => Self::Conflict(error.to_string()),
+            other => Self::BadRequest(other.to_string()),
+        }
+    }
 }
 
 impl SelectionError {
