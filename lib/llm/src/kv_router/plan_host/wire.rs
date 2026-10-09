@@ -201,20 +201,20 @@ impl KvRouterSetRouter {
         let work = plan
             .work_of(k)
             .ok_or_else(|| SelectionError::Internal(format!("plan has no stage {k}")))?;
-        // Accounting by the stage's work, as the core's `book_stage` does. A
-        // decode-only stage is load-only: no overlap credit, no KV reuse.
+        // Accounting by the stage's work, from the library's one definition.
+        // The gateway's decode always routes load-only, as its legacy
+        // decode override did.
         let mut config = body.router_config_override.take().unwrap_or_default();
-        config.track_prefill_tokens = Some(matches!(
-            work,
-            StageWork::PrefillAndDecode | StageWork::PrefillOnly
-        ));
-        match work {
-            StageWork::PrefillOnly => body.routing_mut().expected_output_tokens = Some(1),
-            StageWork::DecodeOnly => {
-                config.assume_kv_reuse = Some(false);
-                config.overlap_score_credit = Some(0.0);
-            }
-            StageWork::PrefillAndDecode | StageWork::None => {}
+        let mut expected_output_tokens = body
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.expected_output_tokens);
+        work.apply_to(&mut config, &mut expected_output_tokens);
+        if let Some(expected) = expected_output_tokens {
+            body.routing_mut().expected_output_tokens = Some(expected);
+        }
+        if work == StageWork::DecodeOnly {
+            config.overlap_score_credit = Some(0.0);
         }
         body.router_config_override = Some(config);
 
