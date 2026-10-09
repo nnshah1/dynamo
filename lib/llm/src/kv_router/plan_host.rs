@@ -13,6 +13,10 @@
 //! The router library sees bookings, placement and accounting. The host keeps
 //! dispatch, response streams, cleanup, affinity holds and cache tracking.
 
+/// A [`Router`] over a bare [`KvRouter`](crate::kv_router::KvRouter) for
+/// id-based hosts (the gateway EPP).
+pub mod wire;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -341,7 +345,7 @@ impl Router for HostSetRouter {
 
 /// The plan-level request for a frontend request: the prompt the selector
 /// hashes, the caller's constraints, and the class the scheduler queues under.
-pub(crate) fn routing_request(
+pub fn routing_request(
     request: &SingleIn<PreprocessedRequest>,
     partition: &RoutingPartitionId,
     policy_class: Option<String>,

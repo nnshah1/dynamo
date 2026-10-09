@@ -10,25 +10,40 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use anyhow::Result;
 use dashmap::DashMap;
+use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::config::{RouterConfigOverride, try_kv_router_config_from_dynamo_env};
+use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{RoutingConstraints, WorkerWithDpRank};
+use dynamo_kv_router::router::{
+    ClassTable, Constraint, Fallback, MultiStageRouter, Plan, PlanId, Router as PlanRouter, Stage,
+    StageList, StageWork, WorkerFacts,
+};
+use dynamo_kv_router::scheduling::KvSchedulerError;
+use dynamo_kv_router::services::selection::{
+    SelectAndReserveRequest, SelectRequest, SelectResponse, SelectionError,
+};
 use dynamo_llm::discovery::{ModelManager, WORKER_TYPE_DECODE};
+use dynamo_llm::kv_router::plan_host::routing_request;
+use dynamo_llm::kv_router::plan_host::wire::{KvRouterSetRouter, booking_id};
 use dynamo_llm::kv_router::prefill_router::PrefillReservation;
 use dynamo_llm::kv_router::{FindBestMatchOutcome, ManagedKvRouter, PrefillRouter};
 use dynamo_llm::model_card::ModelDeploymentCard;
 use dynamo_llm::preprocessor::OpenAIPreprocessor;
 use dynamo_llm::protocols::common::extensions::{NvExt, NvExtProvider, routing_constraints_to_kv};
+use dynamo_llm::protocols::common::llm_backend::PreprocessedRequest;
+use dynamo_llm::protocols::common::preprocessor::RoutingHints;
+use dynamo_llm::protocols::common::timing::RequestPhase;
 use dynamo_llm::types::openai::completions::NvCreateCompletionRequest;
 use dynamo_protocols::types::Prompt;
 use dynamo_runtime::discovery::{
     DiscoveryInstance, DiscoveryQuery, hash_container_name, hash_pod_name,
 };
-use dynamo_runtime::pipeline::RouterMode;
+use dynamo_runtime::pipeline::{Context, RouterMode, SingleIn, async_trait};
 use dynamo_runtime::{DistributedRuntime, Runtime};
 use uuid::Uuid;
 
@@ -105,6 +120,190 @@ fn cache_namespace_from_request<R: NvExtProvider>(
 
 /// Name of the inference-serving HTTP port on a Dynamo worker pod.
 const DYNAMO_CONTAINER_PORT_NAME: &str = "http";
+
+/// `DYN_ROUTER_PLAN_HOST` (default on): picks go through the Plan router with
+/// exported bookings. Set it falsey for the legacy query-then-`add_request`
+/// path.
+fn plan_host_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !dynamo_truthy::env_is_falsey("DYN_ROUTER_PLAN_HOST"))
+}
+
+/// Prefill then decode, falling back to decode alone when prefill has no
+/// worker to give (the legacy "aggregated mode" fallback). The prefill stage
+/// does no plan-side accounting: its reservation is the [`PrefillRouter`]'s
+/// own, parked beside the plan by [`PrefillReservationRouter`].
+fn gateway_stage_list() -> StageList {
+    let mut list = StageList::prefill_decode();
+    list.stages[0].work = Some(StageWork::None);
+    list.with_fallback(Fallback::Aggregated)
+}
+
+fn routing_failed(error: SelectionError) -> PickError {
+    PickError::RoutingFailed(error.to_string())
+}
+
+/// A prefill reservation error as the plan router reports it: a scheduler
+/// answer keeps its type; anything else (no prefill workers, router not yet
+/// active) reads as not ready, which the stage list falls back on, exactly
+/// where the legacy path fell back to aggregated mode.
+fn prefill_error(error: anyhow::Error) -> SelectionError {
+    match error.downcast::<KvSchedulerError>() {
+        Ok(scheduler) => SelectionError::Scheduler(scheduler),
+        Err(other) => SelectionError::NotReady(other.to_string()),
+    }
+}
+
+/// The EPP's prefill set as a Plan [`PlanRouter`]: a custom router over
+/// [`PrefillRouter::reserve_prefill_worker`], booked under the stage's wire
+/// id. The reservation is parked here until the pick moves it into
+/// `prefill_bookings`, where the response callbacks release it as they always
+/// have; the plan records the worker untracked.
+struct PrefillReservationRouter {
+    prefill_router: Arc<PrefillRouter>,
+    base: Context<PreprocessedRequest>,
+    reservations: Mutex<HashMap<usize, PrefillReservation>>,
+}
+
+impl PrefillReservationRouter {
+    fn new(prefill_router: Arc<PrefillRouter>, request: &SingleIn<PreprocessedRequest>) -> Self {
+        Self {
+            prefill_router,
+            base: request.fork(request.content().clone()),
+            reservations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn take_reservation(&self, k: usize) -> Option<PrefillReservation> {
+        self.reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&k)
+    }
+
+    /// Release every parked reservation: the pick is not going ahead.
+    async fn release_all(&self) {
+        let parked: Vec<PrefillReservation> = self
+            .reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .map(|(_, reservation)| reservation)
+            .collect();
+        for reservation in parked {
+            if let Err(error) = reservation.release().await {
+                tracing::debug!(%error, "Failed to release a prefill reservation of an abandoned pick");
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl PlanRouter for PrefillReservationRouter {
+    async fn select(&self, _req: SelectRequest) -> Result<SelectResponse, SelectionError> {
+        Err(SelectionError::NotReady(
+            "the gateway's prefill set has no advisory selection".to_string(),
+        ))
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        let mut stage = Stage::new(WorkerType::Prefill);
+        stage.work = Some(StageWork::None);
+        Plan::new(
+            PlanId::from(req.selection_id.clone().unwrap_or_default()),
+            RoutingPartitionId::new(req.model_name.clone(), req.routing_group.clone()),
+            vec![stage],
+        )
+        .map_err(|error| SelectionError::BadRequest(error.to_string()))
+    }
+
+    async fn schedule(
+        &self,
+        req: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        loop {
+            let next = plan.schedulable().find(|&k| {
+                plan.stage(k)
+                    .is_some_and(|stage| stage.set == WorkerType::Prefill)
+            });
+            let Some(k) = next else { break };
+            let body = self.base.content();
+            let routing = body.routing.as_ref();
+            // An exclusion narrows the caller's allowed set; without one the
+            // prefill router has no worker list to take the complement of.
+            let excluded: HashSet<u64> = plan
+                .stage(k)
+                .map(|stage| {
+                    stage
+                        .constraints
+                        .iter()
+                        .filter_map(|constraint| match constraint {
+                            Constraint::Exclude(worker_id) => Some(*worker_id),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let allowed_worker_ids = routing
+                .and_then(|hints| hints.allowed_worker_ids.clone())
+                .map(|ids| {
+                    ids.into_iter()
+                        .filter(|id| !excluded.contains(id))
+                        .collect::<HashSet<u64>>()
+                });
+            let id = booking_id(plan, k);
+            let reservation = self
+                .prefill_router
+                .reserve_prefill_worker(
+                    &id,
+                    &body.token_ids,
+                    None,
+                    None,
+                    routing.and_then(|hints| hints.cache_namespace.clone()),
+                    routing.and_then(|hints| hints.priority_jump).unwrap_or(0.0),
+                    routing.and_then(|hints| hints.strict_priority).unwrap_or(0),
+                    req.policy_class.clone(),
+                    allowed_worker_ids,
+                    routing
+                        .and_then(|hints| hints.routing_constraints.clone())
+                        .unwrap_or_default(),
+                )
+                .await
+                .map_err(prefill_error)?;
+            let worker =
+                WorkerWithDpRank::new(reservation.worker_id(), reservation.dp_rank().unwrap_or(0));
+            // A refused booking drops the reservation, which frees itself.
+            plan.book_untracked(k, worker, WorkerFacts::default())
+                .map_err(|error| SelectionError::Conflict(error.to_string()))?;
+            self.reservations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(k, reservation);
+        }
+        Ok(())
+    }
+}
+
+/// What a pick needs from the request to route it.
+struct RouteInputs<'a> {
+    tokens: &'a [u32],
+    cache_namespace: Option<String>,
+    priority_jump: f64,
+    strict_priority: u32,
+    policy_class: Option<String>,
+    allowed_worker_ids: Option<HashSet<u64>>,
+    routing_constraints: RoutingConstraints,
+}
+
+/// The workers a pick chose and the id its response callbacks drive.
+struct Picked {
+    decode_worker: WorkerWithDpRank,
+    /// The prefill worker and its rank, when the pick is disaggregated.
+    prefill_worker: Option<(u64, Option<u32>)>,
+    /// Keys `prefill_bookings` and names the decode booking in the router.
+    reservation_id: String,
+}
 
 /// Holds all router state needed for request routing.
 ///
@@ -633,6 +832,198 @@ impl Router {
         })
         .await
         .map_err(|_| anyhow::anyhow!("free_request timed out"))?
+    }
+
+    /// The legacy pick: reserve prefill (or fall back to aggregated mode),
+    /// query decode, then register the decode load under the reservation id.
+    async fn pick_legacy(&self, route: RouteInputs<'_>) -> Result<Picked, PickError> {
+        let reservation_id = Uuid::new_v4().to_string();
+
+        // Try prefill routing first (disaggregated mode).
+        //
+        // If the prefill router is not activated (no prefill workers discovered yet, or the inner
+        // router has been deactivated), fall back to aggregated routing.
+        let prefill_booking = self
+            .route_prefill(
+                &format!("epp-prefill/{reservation_id}"),
+                route.tokens,
+                route.cache_namespace.clone(),
+                route.priority_jump,
+                route.strict_priority,
+                route.policy_class.clone(),
+                route.allowed_worker_ids.clone(),
+                route.routing_constraints.clone(),
+            )
+            .await;
+
+        let is_disaggregated = match &prefill_booking {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "Prefill routing failed; falling back to aggregated mode"
+                );
+                false
+            }
+        };
+
+        let (decode_worker, _overlap) = self
+            .route_decode(
+                route.tokens,
+                is_disaggregated,
+                route.cache_namespace.clone(),
+                route.priority_jump,
+                route.strict_priority,
+                route.policy_class,
+                route.allowed_worker_ids,
+                route.routing_constraints,
+            )
+            .await
+            .map_err(|e| PickError::RoutingFailed(e.to_string()))?;
+
+        // Register the request with the router for bookkeeping (load tracking).
+        if let Err(e) = self
+            .add_request(
+                &reservation_id,
+                route.tokens,
+                decode_worker.worker_id,
+                decode_worker.dp_rank,
+                is_disaggregated,
+                route.cache_namespace,
+            )
+            .await
+        {
+            tracing::warn!(
+                reservation_id = %reservation_id,
+                error = %e,
+                "Failed to register request with router bookkeeping"
+            );
+        }
+
+        let prefill_worker = prefill_booking
+            .as_ref()
+            .ok()
+            .map(|booking| (booking.worker_id(), booking.dp_rank()));
+        if let Ok(booking) = prefill_booking {
+            self.prefill_bookings
+                .insert(reservation_id.clone(), booking);
+        }
+        Ok(Picked {
+            decode_worker,
+            prefill_worker,
+            reservation_id,
+        })
+    }
+
+    /// The Plan pick: one `MultiStageRouter` over the prefill set (the
+    /// `PrefillRouter`'s own reservation) and the decode set (the decode
+    /// `KvRouter`, booking in export mode) plans and books prefill then
+    /// decode, or decode alone when prefill has no worker to give.
+    ///
+    /// The decode booking is admitted under its wire id and retained by the
+    /// router's request-lease manager, so the response callbacks keep driving
+    /// it by id: `mark_prefill_complete(id)` and `free_request(id)` are
+    /// unchanged, and a request that never calls back is reaped on lease
+    /// expiry. The plan itself is dropped once read; it owns nothing.
+    async fn pick_planned(&self, route: RouteInputs<'_>) -> Result<Picked, PickError> {
+        let routing = RoutingHints {
+            cache_namespace: route.cache_namespace,
+            priority_jump: Some(route.priority_jump),
+            strict_priority: Some(route.strict_priority),
+            allowed_worker_ids: route.allowed_worker_ids,
+            routing_constraints: Some(route.routing_constraints),
+            ..Default::default()
+        };
+        let body = PreprocessedRequest::builder()
+            .model(self.served_model.clone())
+            .token_ids(route.tokens.to_vec())
+            .stop_conditions(Default::default())
+            .sampling_options(Default::default())
+            .output_options(Default::default())
+            .routing(Some(routing))
+            .build()
+            .map_err(|e| PickError::RoutingFailed(format!("routing request: {e}")))?;
+        let request =
+            Context::with_id_and_metadata(body, Uuid::new_v4().to_string(), Default::default());
+
+        let decode = KvRouterSetRouter::new(
+            self.decode_router.router().clone(),
+            WorkerType::Decode,
+            RequestPhase::Decode,
+            &request,
+        );
+        let partition = decode.partition();
+        let prefill = Arc::new(PrefillReservationRouter::new(
+            self.prefill_router.clone(),
+            &request,
+        ));
+        let router = MultiStageRouter::builder()
+            .set(
+                WorkerType::Prefill,
+                Arc::clone(&prefill) as Arc<dyn PlanRouter>,
+            )
+            .set(WorkerType::Decode, Arc::new(decode))
+            .classes(ClassTable::new(gateway_stage_list()))
+            .build()
+            .map_err(routing_failed)?;
+
+        let mut req = routing_request(&request, &partition, route.policy_class);
+        req.export_bookings = true;
+        let mut plan = router.plan(&req).map_err(routing_failed)?;
+        if let Err(error) = router.schedule(&req, &mut plan).await {
+            // Booked stages stay with the host on an error: free them.
+            prefill.release_all().await;
+            for k in 0..plan.stage_count() {
+                if let Some(booking) = plan.booking(k)
+                    && let Err(free_error) = self.decode_router.free(booking.id()).await
+                {
+                    tracing::debug!(
+                        booking_id = booking.id(),
+                        error = %free_error,
+                        "Failed to free a decode booking of a failed pick"
+                    );
+                }
+            }
+            return Err(routing_failed(error));
+        }
+
+        let stage_of = |set: WorkerType| {
+            (0..plan.stage_count()).find(|&k| plan.stage(k).is_some_and(|stage| stage.set == set))
+        };
+        let decode_stage = stage_of(WorkerType::Decode)
+            .ok_or_else(|| PickError::RoutingFailed("plan has no decode stage".to_string()))?;
+        let decode_worker = plan
+            .worker(decode_stage)
+            .ok_or_else(|| PickError::RoutingFailed("decode stage was not booked".to_string()))?;
+        let reservation_id = plan
+            .booking(decode_stage)
+            .ok_or_else(|| PickError::RoutingFailed("decode stage has no booking".to_string()))?
+            .id()
+            .to_string();
+        let prefill_worker = stage_of(WorkerType::Prefill).and_then(|k| {
+            let reservation = prefill.take_reservation(k)?;
+            let worker = (reservation.worker_id(), reservation.dp_rank());
+            self.prefill_bookings
+                .insert(reservation_id.clone(), reservation);
+            Some(worker)
+        });
+        Ok(Picked {
+            decode_worker,
+            prefill_worker,
+            reservation_id,
+        })
+    }
+
+    /// Free everything a pick booked when no response will call back for it.
+    async fn release_pick(&self, reservation_id: &str) {
+        release_prefill_booking(&self.prefill_bookings, reservation_id).await;
+        if let Err(error) = self.free_request(reservation_id).await {
+            tracing::debug!(
+                reservation_id,
+                %error,
+                "Failed to free the decode booking of an abandoned pick"
+            );
+        }
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -1447,53 +1838,29 @@ impl EndpointPicker for Router {
             .await
             .map_err(|e| PickError::InvalidRequest(e.to_string()))?;
         let policy_class = requested_policy_class(&req.headers)?;
-        let reservation_id = Uuid::new_v4().to_string();
-
-        // Try prefill routing first (disaggregated mode).
-        //
-        // If the prefill router is not activated (no prefill workers discovered yet, or the inner
-        // router has been deactivated), fall back to aggregated routing.
-        let prefill_booking = self
-            .route_prefill(
-                &format!("epp-prefill/{reservation_id}"),
-                &tokens,
-                cache_namespace.clone(),
-                priority_jump,
-                strict_priority,
-                policy_class.clone(),
-                allowed_worker_ids.clone(),
-                routing_constraints.clone(),
-            )
-            .await;
-
-        let is_disaggregated = match &prefill_booking {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "Prefill routing failed; falling back to aggregated mode"
-                );
-                false
-            }
+        let route = RouteInputs {
+            tokens: &tokens,
+            cache_namespace: cache_namespace.clone(),
+            priority_jump,
+            strict_priority,
+            policy_class,
+            allowed_worker_ids,
+            routing_constraints,
         };
-
-        let (decode_worker, _overlap) = self
-            .route_decode(
-                &tokens,
-                is_disaggregated,
-                cache_namespace.clone(),
-                priority_jump,
-                strict_priority,
-                policy_class,
-                allowed_worker_ids,
-                routing_constraints,
-            )
-            .await
-            .map_err(|e| PickError::RoutingFailed(e.to_string()))?;
+        let Picked {
+            decode_worker,
+            prefill_worker,
+            reservation_id,
+        } = if plan_host_enabled() {
+            self.pick_planned(route).await?
+        } else {
+            self.pick_legacy(route).await?
+        };
+        let is_disaggregated = prefill_worker.is_some();
 
         // TODO(epp-endpoint-reconciliation): Reconcile Dynamo discovery with the
         // pod reflector and retry selection when the chosen worker has no endpoint.
-        let endpoint = if worker_map.is_empty() {
+        let resolved = if worker_map.is_empty() {
             self.resolve_worker_endpoint(decode_worker.worker_id)
                 .ok_or_else(|| {
                     tracing::warn!(
@@ -1501,9 +1868,9 @@ impl EndpointPicker for Router {
                         "Selected worker has no resolved endpoint"
                     );
                     PickError::NoEndpoints
-                })?
+                })
         } else {
-            worker_map
+            Ok(worker_map
                 .iter()
                 .find(|(wid, _)| *wid == decode_worker.worker_id)
                 .map(|(_, ep)| ep.address_port())
@@ -1513,36 +1880,16 @@ impl EndpointPicker for Router {
                         "Selected worker not in endpoint list, using first available"
                     );
                     endpoints[0].address_port()
-                })
+                }))
         };
-
-        // Register the request with the router for bookkeeping (load tracking).
-        if let Err(e) = self
-            .add_request(
-                &reservation_id,
-                &tokens,
-                decode_worker.worker_id,
-                decode_worker.dp_rank,
-                is_disaggregated,
-                cache_namespace.clone(),
-            )
-            .await
-        {
-            tracing::warn!(
-                request_id = %req.request_id,
-                error = %e,
-                "Failed to register request with router bookkeeping"
-            );
-        }
-
-        let prefill_worker = prefill_booking
-            .as_ref()
-            .ok()
-            .map(|booking| (booking.worker_id(), booking.dp_rank()));
-        if let Ok(booking) = prefill_booking {
-            self.prefill_bookings
-                .insert(reservation_id.clone(), booking);
-        }
+        let endpoint = match resolved {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                // Nothing will call back for this pick: free what it booked.
+                self.release_pick(&reservation_id).await;
+                return Err(error);
+            }
+        };
 
         // Build routing headers: x-dynamo-worker-instance-id, x-dynamo-dp-rank,
         // x-dynamo-prefill-instance-id, x-dynamo-prefill-dp-rank, x-dynamo-routing-mode
