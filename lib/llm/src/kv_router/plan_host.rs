@@ -308,15 +308,18 @@ impl Router for HostSetRouter {
             let Some(k) = next else { break };
             let rendered = self.render(req, plan, k)?;
             let pending = self.pending_preview.lock().expect("preview lock").take();
+            // A previewed pin continues the preview's admission and budget. A
+            // caller's pin is on the rendered request's routing hints, where
+            // the host validates it as it does today.
             let route_plan = match (Self::previewed_worker(plan, k), pending) {
                 (Some(previewed), Some((worker, preview))) if worker == previewed => self
                     .host
                     .plan_kv_route_from_preview(&rendered, preview)
                     .await
                     .map_err(host_error)?,
-                (pinned, _) => self
+                (previewed, _) => self
                     .host
-                    .admit_kv_route(&rendered, self.phase, pinned, CleanupBudget::default())
+                    .admit_kv_route(&rendered, self.phase, previewed, CleanupBudget::default())
                     .await
                     .map_err(host_error)?,
             };
