@@ -4578,25 +4578,22 @@ async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan
     assert_eq!(active_requests_for(&released, worker_id, 0), 0);
 }
 
-#[tokio::test]
-async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
-    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
-    use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::router::{Budget, Plan, PlanId, Router, Stage};
-    use dynamo_kv_router::scheduling::KvSchedulerError;
-    use dynamo_kv_router::services::selection::SelectionError;
-
-    // Every request finds the worker busy (AIS load model, zero busy
-    // threshold) and the class has one queue slot per worker, so a stage is
-    // parked until its own wait budget says otherwise.
-    let policy = std::env::temp_dir().join(format!("plan-host-budget-{}.yaml", std::process::id()));
+/// A host whose one worker every request finds busy (AIS load model, zero
+/// busy threshold) under a class with `queue_limit` queue slots per worker.
+async fn saturated_plan_host(
+    namespace: &str,
+    queue_limit: u32,
+) -> (Arc<RoutingHost>, u64, Runtime, std::path::PathBuf) {
+    let policy = std::env::temp_dir().join(format!("{namespace}-{}.yaml", std::process::id()));
     std::fs::write(
         &policy,
-        "default_policy_family: regular\nuncached_isl_buckets:\n  - min_tokens: 0\n    bucket: all\npolicy_classes:\n  - name: saturated\n    policy_family: regular\n    cache_bucket: all\n    quantum: 1\n    prefill_busy_threshold_frac: 0.0\n    request_queue_limit_per_worker: 1\n",
+        format!(
+            "default_policy_family: regular\nuncached_isl_buckets:\n  - min_tokens: 0\n    bucket: all\npolicy_classes:\n  - name: saturated\n    policy_family: regular\n    cache_bucket: all\n    quantum: 1\n    prefill_busy_threshold_frac: 0.0\n    request_queue_limit_per_worker: {queue_limit}\n"
+        ),
     )
     .unwrap();
-    let (host, _dispatch, worker_id, _runtime) = router_with_recorded_dispatch_and_config(
-        "plan-host-budget",
+    let (host, _dispatch, worker_id, runtime) = router_with_recorded_dispatch_and_config(
+        namespace,
         None,
         KvRouterConfig {
             skip_initial_worker_wait: true,
@@ -4614,7 +4611,18 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
         },
     )
     .await;
-    let host = Arc::new(host);
+    (Arc::new(host), worker_id, runtime, policy)
+}
+
+#[tokio::test]
+async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
+    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Budget, Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::scheduling::KvSchedulerError;
+    use dynamo_kv_router::services::selection::SelectionError;
+
+    let (host, worker_id, _runtime, policy) = saturated_plan_host("plan-host-budget", 1).await;
     let prompt = || {
         let mut body = request();
         body.token_ids = Arc::new((1..=256).collect());
@@ -4735,6 +4743,104 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
         "the bounded stage waited for its budget: {elapsed:?}"
     );
     assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        1,
+        "only the held booking is charged"
+    );
+    held_side.plan.abort().await;
+    drop(held);
+    let _ = std::fs::remove_file(policy);
+}
+
+/// A class with no queue allowance answers with a structured queue
+/// rejection. It crosses the Router boundary as the typed scheduler variant
+/// and leaves the frontend as the same raw payload a direct admission
+/// reports, so the HTTP layer renders the same status and details.
+#[tokio::test]
+async fn a_queue_rejection_keeps_its_payload_through_the_plan_host() {
+    use crate::kv_router::plan_host::{
+        BusyThresholds, HostSetRouter, frontend_error, routing_request,
+    };
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::scheduling::{KvSchedulerError, QueueRejection};
+    use dynamo_kv_router::services::selection::SelectionError;
+
+    let (host, worker_id, _runtime, policy) =
+        saturated_plan_host("plan-host-queue-reject", 0).await;
+    let prompt = || {
+        let mut body = request();
+        body.token_ids = Arc::new((1..=256).collect());
+        Context::new(body)
+    };
+    let held_request = prompt();
+    let held_router = HostSetRouter::new(
+        Arc::clone(&host),
+        WorkerType::Aggregated,
+        RequestPhase::Aggregated,
+        &held_request,
+        false,
+        BusyThresholds::default(),
+    );
+    let held_req = routing_request(&held_request, &held_router.partition(), None);
+    let mut held = Plan::new(
+        PlanId::from("held"),
+        held_router.partition(),
+        vec![Stage::new(WorkerType::Aggregated)],
+    )
+    .unwrap();
+    held_router.schedule(&held_req, &mut held).await.unwrap();
+    let held_side = held_router.take_side(0).expect("held route");
+
+    let direct = host
+        .admit_kv_route(
+            &prompt(),
+            RequestPhase::Aggregated,
+            None,
+            CleanupBudget::default(),
+            None,
+        )
+        .await
+        .err()
+        .expect("a direct admission is rejected by the queue");
+    let payload_of = |error: &anyhow::Error| {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<QueueRejection>())
+            .cloned()
+            .unwrap_or_else(|| panic!("a structured queue rejection: {error:?}"))
+    };
+    let direct_payload = payload_of(&direct);
+
+    let request = prompt();
+    let set_router = HostSetRouter::new(
+        Arc::clone(&host),
+        WorkerType::Aggregated,
+        RequestPhase::Aggregated,
+        &request,
+        false,
+        BusyThresholds::default(),
+    );
+    let req = routing_request(&request, &set_router.partition(), None);
+    let mut plan = Plan::new(
+        PlanId::from(request.id()),
+        set_router.partition(),
+        vec![Stage::new(WorkerType::Aggregated)],
+    )
+    .unwrap();
+    let error = set_router.schedule(&req, &mut plan).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            SelectionError::Scheduler(KvSchedulerError::QueueRejected(rejection))
+                if *rejection == direct_payload
+        ),
+        "the typed answer carries the payload: {error:?}"
+    );
+    assert!(plan.state_of(0).unwrap().is_pending());
+    assert!(set_router.take_side(0).is_none(), "nothing was admitted");
+    assert_eq!(payload_of(&frontend_error(error)), direct_payload);
     assert_eq!(
         active_requests_for(&potential_loads(&host).await, worker_id, 0),
         1,

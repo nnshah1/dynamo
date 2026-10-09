@@ -24,7 +24,7 @@ use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::router::{
     Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageWork, WorkerFacts,
 };
-use dynamo_kv_router::scheduling::KvSchedulerError;
+use dynamo_kv_router::scheduling::{KvSchedulerError, QueueRejection};
 use dynamo_kv_router::services::overlap::MooncakeOverlapSummary;
 use dynamo_kv_router::services::selection::{
     PromptRequest, SelectAndReserveRequest, SelectRequest, SelectResponse, SelectionError,
@@ -414,10 +414,14 @@ pub(crate) fn routing_request(
 /// pair between the host's classification and the library's.
 pub(crate) fn host_error(error: Error, pinned: Option<WorkerId>) -> SelectionError {
     use dynamo_runtime::error::{ErrorType, match_error_chain};
-    // A scheduler answer the host passed through untouched (a queue rejection
-    // with its payload) keeps its type.
+    // A scheduler answer the host passed through untouched keeps its type; a
+    // queue rejection travels as the raw payload the HTTP layer renders.
     let error = match error.downcast::<KvSchedulerError>() {
         Ok(scheduler) => return SelectionError::Scheduler(scheduler),
+        Err(error) => error,
+    };
+    let error = match error.downcast::<QueueRejection>() {
+        Ok(rejection) => return SelectionError::Scheduler(rejection.into()),
         Err(error) => error,
     };
     let scheduler = if match_error_chain(error.as_ref(), &[ErrorType::DeadlineExceeded], &[]) {
@@ -445,6 +449,8 @@ pub(crate) fn host_error(error: Error, pinned: Option<WorkerId>) -> SelectionErr
 /// cause), so the HTTP status and metrics are those of a direct admission.
 pub(crate) fn frontend_error(error: SelectionError) -> Error {
     match error {
+        // The raw payload again, as a direct admission reports it.
+        SelectionError::Scheduler(KvSchedulerError::QueueRejected(rejection)) => rejection.into(),
         SelectionError::Scheduler(scheduler) => crate::kv_router::map_scheduler_error(scheduler),
         other => other.into(),
     }
