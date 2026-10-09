@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
+use dynamo_kv_router::conditional_disagg::ConditionalDisaggPolicy;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::router::{
     ClassTable, Constraint, Failure, MultiStageRouter, Outcome, Plan, Router, StageList, StageState,
@@ -50,6 +51,40 @@ use crate::protocols::common::{
     timing::{RequestPhase, RequestTracker},
 };
 use crate::session_affinity::AffinityTarget;
+
+/// What a [`PlanRouterFactory`] receives: one `Router` per worker set over
+/// this request's hosts, and the conditional-disaggregation policy with
+/// whether a decode-busy gate is configured. The factory returns the
+/// `Router` the frontend drives for the request; the default builds a
+/// `MultiStageRouter` over the class's stage list.
+pub struct PlanRouterParts {
+    pub prefill: Arc<dyn Router>,
+    pub decode: Arc<dyn Router>,
+    pub conditional: Option<(Arc<dyn ConditionalDisaggPolicy>, bool)>,
+}
+
+/// A compiled injection point for a custom `Router`: wrap or replace the
+/// default without changing the host's dispatch and lifecycle code. Set once
+/// at construction time with [`PrefillRouter::set_plan_router_factory`].
+pub type PlanRouterFactory = Arc<dyn Fn(PlanRouterParts) -> Result<Arc<dyn Router>> + Send + Sync>;
+
+/// The default: a `MultiStageRouter` over the plain or conditional
+/// prefill/decode list.
+pub fn default_plan_router(parts: PlanRouterParts) -> Result<Arc<dyn Router>> {
+    let list = if parts.conditional.is_some() {
+        StageList::conditional_prefill_decode()
+    } else {
+        StageList::prefill_decode()
+    };
+    let mut builder = MultiStageRouter::builder()
+        .set(WorkerType::Prefill, parts.prefill)
+        .set(WorkerType::Decode, parts.decode)
+        .classes(ClassTable::new(list));
+    if let Some((policy, has_decode_gate)) = parts.conditional {
+        builder = builder.conditional_disagg(policy, has_decode_gate);
+    }
+    Ok(Arc::new(builder.build()?))
+}
 
 pub(crate) fn plan_host_enabled() -> bool {
     #[cfg(test)]
@@ -206,31 +241,25 @@ enum Step {
 }
 
 impl PlannedFlow<'_> {
-    fn multistage(&self, conditional: bool) -> Result<MultiStageRouter> {
-        let list = if conditional {
-            StageList::conditional_prefill_decode()
-        } else {
-            StageList::prefill_decode()
+    /// The `Router` for this request: the configured factory's, or the
+    /// default `MultiStageRouter`, over this request's set routers.
+    fn plan_router(&self, conditional: bool) -> Result<Arc<dyn Router>> {
+        let parts = PlanRouterParts {
+            prefill: Arc::clone(&self.prefill_set) as Arc<dyn Router>,
+            decode: Arc::clone(&self.decode_set) as Arc<dyn Router>,
+            conditional: conditional.then(|| {
+                (
+                    Arc::clone(&self.router.conditional_disagg_policy),
+                    self.router
+                        .conditional_disagg_decode_busy_threshold
+                        .is_some(),
+                )
+            }),
         };
-        let mut builder = MultiStageRouter::builder()
-            .set(
-                WorkerType::Prefill,
-                Arc::clone(&self.prefill_set) as Arc<dyn Router>,
-            )
-            .set(
-                WorkerType::Decode,
-                Arc::clone(&self.decode_set) as Arc<dyn Router>,
-            )
-            .classes(ClassTable::new(list));
-        if conditional {
-            builder = builder.conditional_disagg(
-                Arc::clone(&self.router.conditional_disagg_policy),
-                self.router
-                    .conditional_disagg_decode_busy_threshold
-                    .is_some(),
-            );
+        match self.router.plan_router_factory.get() {
+            Some(factory) => factory(parts),
+            None => default_plan_router(parts),
         }
-        Ok(builder.build()?)
     }
 
     async fn run(
@@ -238,7 +267,7 @@ impl PlannedFlow<'_> {
         routing: &dynamo_kv_router::services::selection::SelectAndReserveRequest,
         conditional: bool,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
-        let multistage = self.multistage(conditional)?;
+        let multistage = self.plan_router(conditional)?;
         let mut plan = multistage.plan(routing)?;
         self.pin_caller_targets(&mut plan)?;
         let engine_ctx = self
@@ -428,10 +457,13 @@ impl PlannedFlow<'_> {
             .decode_request
             .take()
             .ok_or_else(|| anyhow!("decode stage executed twice"))?;
-        let local_prefill = (0..k).any(|j| {
+        // Decode prefills locally unless a prefill stage ran ahead of it: a
+        // skipped prefill (conditional bypass) or a plan with no prefill
+        // stage at all (a custom router's decode-only shape).
+        let local_prefill = !(0..k).any(|j| {
             plan.stage(j)
                 .is_some_and(|stage| stage.set == WorkerType::Prefill)
-                && plan.state_of(j) == Some(&StageState::Skipped)
+                && plan.state_of(j) != Some(&StageState::Skipped)
         });
         // In the bootstrap path this waits until the spawned prefill task
         // releases its phase barrier, keeping worker attribution correct.
@@ -593,6 +625,8 @@ mod tests {
             llm_backend::{FinishReason, LLMEngineOutput, PreprocessedRequest},
         },
     };
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Plan, Router};
 
     /// A worker that answers each request with the next scripted frame list
     /// and records what it was asked.
@@ -1071,6 +1105,134 @@ mod tests {
                 .any(|a| a == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
             "no bypass with an explicit prefill worker"
         );
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    /// A custom `Router` a deployment might install: prompts under a size go
+    /// straight to decode, which prefills them locally; everything else is
+    /// the default shape. It wraps the default and delegates scheduling.
+    struct ShortPromptRouter {
+        inner: Arc<dyn Router>,
+        partition: dynamo_kv_router::identity::RoutingPartitionId,
+        max_tokens: usize,
+    }
+
+    #[async_trait]
+    impl Router for ShortPromptRouter {
+        async fn select(
+            &self,
+            req: dynamo_kv_router::services::selection::SelectRequest,
+        ) -> Result<
+            dynamo_kv_router::services::selection::SelectResponse,
+            dynamo_kv_router::services::selection::SelectionError,
+        > {
+            self.inner.select(req).await
+        }
+
+        fn plan(
+            &self,
+            req: &dynamo_kv_router::services::selection::SelectAndReserveRequest,
+        ) -> Result<Plan, dynamo_kv_router::services::selection::SelectionError> {
+            let prompt = req.prompt.token_ids.as_ref().map_or(0, Vec::len);
+            if prompt < self.max_tokens {
+                Plan::new(
+                    dynamo_kv_router::router::PlanId::from(
+                        req.selection_id.clone().unwrap_or_default(),
+                    ),
+                    self.partition.clone(),
+                    vec![dynamo_kv_router::router::Stage::new(WorkerType::Decode)],
+                )
+                .map_err(|error| {
+                    dynamo_kv_router::services::selection::SelectionError::BadRequest(
+                        error.to_string(),
+                    )
+                })
+            } else {
+                self.inner.plan(req)
+            }
+        }
+
+        async fn schedule(
+            &self,
+            req: &dynamo_kv_router::services::selection::SelectAndReserveRequest,
+            plan: &mut Plan,
+        ) -> Result<(), dynamo_kv_router::services::selection::SelectionError> {
+            self.inner.schedule(req, plan).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_custom_router_installed_through_the_factory_drives_the_same_host_loop() {
+        let fixture = fixture("plan-host-custom-router").await;
+        let partition = fixture.decode.chooser.selection.partition_key().clone();
+        fixture
+            .router
+            .set_plan_router_factory(Arc::new(move |parts| {
+                let inner = super::default_plan_router(parts)?;
+                Ok(Arc::new(ShortPromptRouter {
+                    inner,
+                    partition: partition.clone(),
+                    max_tokens: 8,
+                }) as Arc<dyn Router>)
+            }))
+            .unwrap();
+
+        // Four tokens: the custom shape, decode only, prefilled locally.
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+        let mut short = request();
+        short.token_ids = Arc::new(vec![1, 2, 3, 4]);
+        let response = fixture
+            .router
+            .generate(Context::new(short), Arc::new(NeverNext))
+            .await
+            .expect("routed");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        assert!(
+            fixture.prefill.worker.seen().is_empty(),
+            "no prefill stage in the plan"
+        );
+        let decode_seen = fixture.decode.worker.seen();
+        assert_eq!(decode_seen.len(), 1);
+        assert!(
+            decode_seen[0]
+                .1
+                .annotations
+                .iter()
+                .any(|a| a == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
+            "decode prefills locally"
+        );
+        wait_until_released(&fixture).await;
+
+        // Sixty-four tokens: the default shape through the same loop.
+        fixture.prefill.worker.script(vec![bootstrap_frame()]);
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+        let response = fixture
+            .router
+            .generate(Context::new(request()), Arc::new(NeverNext))
+            .await
+            .expect("routed");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        assert_eq!(
+            fixture.prefill.worker.seen().len(),
+            1,
+            "prefill ran remotely"
+        );
+        assert_eq!(fixture.decode.worker.seen().len(), 2);
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();
     }
