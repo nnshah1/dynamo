@@ -807,3 +807,38 @@ fn a_plan_keeps_the_prompts_block_hashes_per_block_size() {
         "an empty prompt records nothing"
     );
 }
+
+#[test]
+fn stage_work_charges_a_booking_the_same_way_everywhere() {
+    use crate::scheduling::config::RouterConfigOverride;
+    let charge = |work: StageWork| {
+        let mut config = RouterConfigOverride {
+            track_prefill_tokens: Some(false),
+            ..Default::default()
+        };
+        let mut expected_output_tokens = Some(32);
+        work.apply_to(&mut config, &mut expected_output_tokens);
+        (
+            config.track_prefill_tokens,
+            config.assume_kv_reuse,
+            expected_output_tokens,
+            work.tracks_active_blocks(),
+        )
+    };
+    assert_eq!(
+        charge(StageWork::PrefillAndDecode),
+        (Some(true), None, Some(32), true)
+    );
+    assert_eq!(
+        charge(StageWork::PrefillOnly),
+        (Some(true), None, Some(1), true)
+    );
+    assert_eq!(
+        charge(StageWork::DecodeOnly),
+        (Some(false), Some(false), Some(32), true)
+    );
+    assert_eq!(
+        charge(StageWork::None),
+        (Some(false), None, Some(32), false)
+    );
+}

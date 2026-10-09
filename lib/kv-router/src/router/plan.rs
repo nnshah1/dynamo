@@ -21,6 +21,7 @@ use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
 use crate::kv_hints::KvHint;
 use crate::protocols::{KvTransferEnforcement, WorkerConfigLike, WorkerId, WorkerWithDpRank};
+use crate::scheduling::config::RouterConfigOverride;
 use crate::sequences::SequenceError;
 
 use super::booking::Booking;
@@ -140,6 +141,35 @@ pub enum StageWork {
     DecodeOnly,
     /// No scheduler accounting (an encoder).
     None,
+}
+
+impl StageWork {
+    /// What a booking for this work is charged for, in the scheduler's
+    /// request-level terms: prefill tracking follows the work, a
+    /// prefill-only stage projects one output token, a decode-only stage
+    /// assumes no KV reuse. This replaces the request's own override for
+    /// those fields, so every host charges a stage the same way the core
+    /// does.
+    pub fn apply_to(
+        self,
+        config: &mut RouterConfigOverride,
+        expected_output_tokens: &mut Option<u32>,
+    ) {
+        config.track_prefill_tokens = Some(matches!(
+            self,
+            StageWork::PrefillAndDecode | StageWork::PrefillOnly
+        ));
+        match self {
+            StageWork::PrefillOnly => *expected_output_tokens = Some(1),
+            StageWork::DecodeOnly => config.assume_kv_reuse = Some(false),
+            StageWork::PrefillAndDecode | StageWork::None => {}
+        }
+    }
+
+    /// Whether a booking for this work holds the prompt's KV blocks.
+    pub fn tracks_active_blocks(self) -> bool {
+        self != StageWork::None
+    }
 }
 
 /// When the router skips a stage instead of booking it.
