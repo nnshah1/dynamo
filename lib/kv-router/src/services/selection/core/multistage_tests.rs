@@ -14,7 +14,7 @@ use super::*;
 use crate::conditional_disagg::{ConditionalDisaggDecisionInput, ConditionalDisaggPolicy};
 use crate::protocols::PotentialLoad;
 use crate::router::{
-    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Outcome, Router, SkipRule,
+    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Outcome, Plan, Router, SkipRule,
     Stage, StageList, StageState, When, topology_taint,
 };
 use crate::scheduling::KvSchedulerError;
@@ -467,4 +467,163 @@ policy_classes:
     let classes = ClassTable::from_profile(&profile, StageList::decode_first()).unwrap();
     assert_eq!(classes.stages(None), &StageList::decode_first());
     assert_eq!(classes.stages(Some("direct")), &StageList::aggregated());
+}
+
+/// Record the whole prompt as cached on `worker_id` in the core's index.
+async fn seed_prompt(core: &SelectionCore, worker_id: WorkerId, tokens: &[u32]) {
+    use crate::indexer::KvIndexerInterface;
+    use crate::protocols::{
+        BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+        KvCacheStoreData, KvCacheStoredBlockData, RouterEvent, StorageTier,
+        compute_block_hash_for_seq, compute_seq_hash_for_block,
+    };
+    use crate::services::indexer::backend::Indexer;
+    let key = super::tests::default_key();
+    let block_size = core.entry(&key).expect("entry").block_size;
+    let local_hashes = compute_block_hash_for_seq(tokens, block_size, BlockHashOptions::default());
+    let sequence_hashes = compute_seq_hash_for_block(&local_hashes);
+    let blocks = local_hashes
+        .iter()
+        .zip(sequence_hashes.iter())
+        .map(|(&tokens_hash, &sequence_hash)| KvCacheStoredBlockData {
+            block_hash: ExternalSequenceBlockHash(sequence_hash),
+            tokens_hash,
+            mm_extra_info: None,
+        })
+        .collect();
+    let indexer = core.partition(&key).expect("partition").indexer().clone();
+    indexer
+        .apply_event_routed(RouterEvent::with_storage_tier(
+            worker_id,
+            KvCacheEvent {
+                event_id: 1,
+                data: KvCacheEventData::Stored(KvCacheStoreData {
+                    parent_hash: None,
+                    start_position: None,
+                    blocks,
+                }),
+                dp_rank: 0,
+            },
+            StorageTier::Device,
+        ))
+        .await
+        .expect("seed index");
+    if let Indexer::Single { primary, .. } = &indexer {
+        primary.flush().await;
+    }
+}
+
+/// The second stage selects with the block hashes the first stage left on
+/// the plan: with the real hashes it finds worker 2's cached prompt, with
+/// garbage on the plan it does not.
+#[tokio::test]
+async fn a_later_stage_sees_the_cached_prompt() {
+    let core = typed_core_with(WorkerType::Aggregated, test_config(false));
+    core.upsert_worker(worker(1)).await.unwrap();
+    core.upsert_worker(worker(2)).await.unwrap();
+    ready_for(&core, 2).await;
+    let key = super::tests::default_key();
+    let block_size = core.entry(&key).expect("entry").block_size;
+    let tokens: Vec<u32> = (1..=4 * block_size).collect();
+    seed_prompt(&core, 2, &tokens).await;
+
+    let router = MultiStageRouter::builder()
+        .set(WorkerType::Aggregated, core.clone() as Arc<dyn Router>)
+        .classes(ClassTable::new(StageList::new(vec![
+            Stage {
+                constraints: vec![Constraint::Pin(WorkerWithDpRank::new(1, 0))],
+                ..Stage::new(WorkerType::Aggregated)
+            },
+            Stage {
+                constraints: vec![Constraint::Exclude(1)],
+                ..Stage::new(WorkerType::Aggregated)
+            },
+        ])))
+        .build()
+        .unwrap();
+    let mut req = reserve_request("real");
+    req.prompt.token_ids = Some(tokens.clone());
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.worker(0).unwrap().worker_id, 1);
+    assert_eq!(plan.worker(1).unwrap().worker_id, 2);
+    assert_eq!(
+        prefill_tokens_of(&core, 1),
+        tokens.len(),
+        "worker 1 has nothing cached"
+    );
+    let charged_on_cached_worker = prefill_tokens_of(&core, 2);
+    assert!(
+        charged_on_cached_worker < tokens.len() / 2,
+        "the second stage finds worker 2's cached prompt: charged {charged_on_cached_worker}"
+    );
+    plan.release().await.unwrap();
+}
+
+/// The gateway's list: a prefill stage its own reservation router records
+/// untracked (no plan booking), then decode placed against it. Decode must
+/// read prefill's worker and facts through the untracked record.
+struct UntrackedPrefill;
+
+#[async_trait::async_trait]
+impl Router for UntrackedPrefill {
+    async fn select(
+        &self,
+        _req: crate::services::selection::SelectRequest,
+    ) -> Result<crate::services::selection::SelectResponse, SelectionError> {
+        Err(SelectionError::NotReady("no preview".to_string()))
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        let mut stage = Stage::new(WorkerType::Prefill);
+        stage.work = Some(crate::router::StageWork::None);
+        Ok(Plan::new(
+            crate::router::PlanId::from(req.selection_id.clone().unwrap_or_default()),
+            crate::identity::RoutingPartitionId::new(&req.model_name, &req.routing_group),
+            vec![stage],
+        )?)
+    }
+
+    async fn schedule(
+        &self,
+        _req: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        loop {
+            let next = plan
+                .schedulable()
+                .find(|&k| plan.stage(k).is_some_and(|s| s.set == WorkerType::Prefill));
+            let Some(k) = next else { break };
+            plan.book_untracked(k, WorkerWithDpRank::new(99, 0), Default::default())?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn decode_is_booked_after_an_untracked_prefill_selection() {
+    let decode = typed_core(WorkerType::Decode);
+    decode.upsert_worker(worker(1)).await.unwrap();
+    ready(&decode).await;
+    let mut list = StageList::prefill_decode();
+    list.stages[0].work = Some(crate::router::StageWork::None);
+    let router = MultiStageRouter::builder()
+        .set(
+            WorkerType::Prefill,
+            Arc::new(UntrackedPrefill) as Arc<dyn Router>,
+        )
+        .set(WorkerType::Decode, decode.clone() as Arc<dyn Router>)
+        .classes(ClassTable::new(
+            list.with_fallback(crate::router::Fallback::Aggregated),
+        ))
+        .build()
+        .unwrap();
+    let req = reserve_request("gateway-untracked-prefill");
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.worker(0).map(|w| w.worker_id), Some(99));
+    assert!(plan.booking(0).is_none(), "prefill is untracked");
+    assert_eq!(plan.state_of(1), Some(&StageState::Booked));
+    assert_eq!(plan.worker(1).map(|w| w.worker_id), Some(1));
+    plan.release().await.unwrap();
 }
