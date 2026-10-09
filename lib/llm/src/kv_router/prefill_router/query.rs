@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use anyhow::Result;
 use dynamo_kv_router::{
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
+    router::WorkerFacts,
     scheduling::queue::BookingHandle,
 };
 
@@ -21,6 +22,9 @@ use super::{PrefillError, PrefillLifecycleState, PrefillRouter};
 pub struct PrefillReservation {
     worker: WorkerWithDpRank,
     dp_rank: Option<u32>,
+    /// The worker's placement facts at reservation time, for a plan that
+    /// places later stages against it.
+    facts: WorkerFacts,
     booking: Option<BookingHandle>,
 }
 
@@ -31,6 +35,10 @@ impl PrefillReservation {
 
     pub fn dp_rank(&self) -> Option<u32> {
         self.dp_rank
+    }
+
+    pub fn facts(&self) -> &WorkerFacts {
+        &self.facts
     }
 
     /// Release this booking and wait for the scheduler to acknowledge it.
@@ -83,6 +91,7 @@ impl PrefillRouter {
             return Ok(PrefillReservation {
                 worker: WorkerWithDpRank::new(worker_id, 0),
                 dp_rank: None,
+                facts: WorkerFacts::default(),
                 booking: None,
             });
         };
@@ -113,9 +122,16 @@ impl PrefillRouter {
                 let Some(booking) = booking else {
                     anyhow::bail!("prefill reservation admission did not return a booking");
                 };
+                let facts = chooser
+                    .workers_with_configs
+                    .borrow()
+                    .get(&worker.worker_id)
+                    .map(WorkerFacts::from_config)
+                    .unwrap_or_default();
                 Ok(PrefillReservation {
                     worker,
                     dp_rank: Some(worker.dp_rank),
+                    facts,
                     booking: Some(booking),
                 })
             }

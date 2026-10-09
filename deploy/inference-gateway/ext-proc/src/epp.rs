@@ -21,7 +21,7 @@ use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{RoutingConstraints, WorkerWithDpRank};
 use dynamo_kv_router::router::{
     ClassTable, Constraint, Fallback, MultiStageRouter, Plan, PlanId, Router as PlanRouter, Stage,
-    StageList, StageWork, WorkerFacts,
+    StageList, StageWork,
 };
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::selection::{
@@ -273,9 +273,18 @@ impl PlanRouter for PrefillReservationRouter {
                 .map_err(prefill_error)?;
             let worker =
                 WorkerWithDpRank::new(reservation.worker_id(), reservation.dp_rank().unwrap_or(0));
-            // A refused booking drops the reservation, which frees itself.
-            plan.book_untracked(k, worker, WorkerFacts::default())
-                .map_err(|error| SelectionError::Conflict(error.to_string()))?;
+            // The reserved worker's actual placement facts, checked both ways
+            // before the plan records it. A refused reservation is released.
+            let facts = reservation.facts().clone();
+            if let Err(error) = plan
+                .check_placement(k, &facts)
+                .and_then(|()| plan.book_untracked(k, worker, facts))
+            {
+                if let Err(release_error) = reservation.release().await {
+                    tracing::debug!(%release_error, "Failed to release a prefill reservation the plan refused");
+                }
+                return Err(error.into());
+            }
             self.reservations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

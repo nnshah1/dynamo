@@ -279,7 +279,7 @@ impl Router for KvRouterSetRouter {
                 args.routing_constraints,
             )
             .await
-            .map_err(host_error)?;
+            .map_err(|error| host_error(error, pinned.map(|worker| worker.worker_id)))?;
         let worker_load = admitted.advisory_load.map(|load| SelectionWorkerLoad {
             active_prefill_tokens: load.active_prefill_tokens,
             prefill_token_capacity: load.prefill_token_capacity,
@@ -375,7 +375,7 @@ impl Router for KvRouterSetRouter {
                     hold_budget,
                 )
                 .await
-                .map_err(host_error)?;
+                .map_err(|error| host_error(error, pinned.map(|worker| worker.worker_id)))?;
             let (outcome, handle) = admitted.into_parts();
             let (worker, kv_hint) = match outcome {
                 FindBestMatchOutcome::Routed {
@@ -398,16 +398,18 @@ impl Router for KvRouterSetRouter {
             self.router
                 .enroll_public_request_attempt(handle, None)
                 .await?;
-            if let Err(error) = plan.book(
-                k,
-                Booking::Committed(descriptor),
-                self.facts(worker.worker_id),
-                kv_hint,
-            ) {
+            // The chosen worker's own requirement on its earlier peers is the
+            // one check the forward constraints it was selected under cannot
+            // make; a refused pair frees the exported booking by its id.
+            let facts = self.facts(worker.worker_id);
+            if let Err(error) = plan
+                .check_placement(k, &facts)
+                .and_then(|()| plan.book(k, Booking::Committed(descriptor), facts, kv_hint))
+            {
                 if let Err(free_error) = self.router.free(&id).await {
                     tracing::debug!(booking_id = %id, %free_error, "freeing a booking the plan refused");
                 }
-                return Err(SelectionError::Conflict(error.to_string()));
+                return Err(error.into());
             }
         }
         Ok(())
@@ -431,6 +433,13 @@ mod tests {
 
     /// A KV router over one process-local worker, with no event source.
     async fn kv_router(namespace: &str) -> (Arc<KvRouter>, u64, Runtime) {
+        kv_router_with(namespace, ModelRuntimeConfig::default()).await
+    }
+
+    async fn kv_router_with(
+        namespace: &str,
+        worker_config: ModelRuntimeConfig,
+    ) -> (Arc<KvRouter>, u64, Runtime) {
         let runtime = Runtime::from_current().unwrap();
         let distributed =
             DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
@@ -445,7 +454,7 @@ mod tests {
         let client = endpoint.client().await.unwrap();
         endpoint.register_endpoint_instance().await.unwrap();
         let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-        let workers = HashMap::from([(worker_id, ModelRuntimeConfig::default())]);
+        let workers = HashMap::from([(worker_id, worker_config)]);
         let (_workers_tx, workers) = watch::channel(workers);
         let config = KvRouterConfig {
             skip_initial_worker_wait: true,
@@ -632,5 +641,72 @@ mod tests {
             assert_eq!(active_requests(&router, worker_id).await, 0);
             plan.release().await.unwrap();
         }
+    }
+
+    /// The decode router's worker requires its KV-transfer peers in zone b;
+    /// the prefill router's worker publishes no zone. The wire adapter checks
+    /// the chosen worker's own requirement before recording it and frees the
+    /// exported booking it refused.
+    #[tokio::test]
+    async fn an_incompatible_transfer_pair_is_refused_and_its_export_freed() {
+        use std::collections::HashSet;
+
+        use dynamo_kv_router::protocols::KvTransferEnforcement;
+        use dynamo_kv_router::router::{ClassTable, MultiStageRouter, StageList};
+
+        let (prefill_router, prefill_worker, _prefill_runtime) =
+            kv_router("plan-wire-placement-prefill").await;
+        let (decode_router, decode_worker, _decode_runtime) = kv_router_with(
+            "plan-wire-placement-decode",
+            ModelRuntimeConfig {
+                taints: HashSet::from(["dynamo.topology/zone=b".to_string()]),
+                topology_domains: HashMap::from([("zone".to_string(), "b".to_string())]),
+                kv_transfer_domain: Some("zone".to_string()),
+                kv_transfer_enforcement: Some(KvTransferEnforcement::Required),
+                ..ModelRuntimeConfig::default()
+            },
+        )
+        .await;
+        let request = request((1..=40).collect());
+        let prefill = KvRouterSetRouter::new(
+            Arc::clone(&prefill_router),
+            WorkerType::Prefill,
+            RequestPhase::Prefill,
+            &request,
+        );
+        let decode = KvRouterSetRouter::new(
+            Arc::clone(&decode_router),
+            WorkerType::Decode,
+            RequestPhase::Decode,
+            &request,
+        );
+        let req = export_request(&request, &decode.partition());
+        let router = MultiStageRouter::builder()
+            .set(WorkerType::Prefill, Arc::new(prefill) as Arc<dyn Router>)
+            .set(WorkerType::Decode, Arc::new(decode) as Arc<dyn Router>)
+            .classes(ClassTable::new(StageList::prefill_decode()))
+            .build()
+            .unwrap();
+        let mut plan = router.plan(&req).unwrap();
+        let result = router.schedule(&req, &mut plan).await;
+        assert!(
+            matches!(result, Err(SelectionError::Conflict(_))),
+            "the pair is refused as a placement conflict: {result:?}"
+        );
+        assert!(
+            plan.state_of(1).unwrap().is_pending(),
+            "decode was not recorded"
+        );
+        assert_eq!(
+            active_requests(&decode_router, decode_worker).await,
+            0,
+            "the refused decode export was freed"
+        );
+        // Prefill's exported booking is the host's to free, as for any booked
+        // stage when a later one fails.
+        let prefill_id = plan.booking(0).expect("prefill booked").id().to_string();
+        prefill_router.free(&prefill_id).await.unwrap();
+        assert_eq!(active_requests(&prefill_router, prefill_worker).await, 0);
+        plan.release().await.unwrap();
     }
 }
