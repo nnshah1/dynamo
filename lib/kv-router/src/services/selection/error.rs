@@ -22,6 +22,10 @@ pub enum SelectionError {
     Conflict(String),
     #[error("{0}")]
     Internal(String),
+    /// The caller withdrew the request before it was placed. Not a failure
+    /// of the selection; a host reports it as the client's cancellation.
+    #[error("{0}")]
+    Cancelled(String),
     #[error(transparent)]
     Scheduler(#[from] KvSchedulerError),
     #[error(transparent)]
@@ -53,6 +57,8 @@ impl SelectionError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // nginx's "client closed request"; no standard status fits.
+            Self::Cancelled(_) => StatusCode::from_u16(499).expect("499 is a valid status code"),
             Self::Scheduler(error) => scheduler_error_status(error),
             Self::Sequence(error) => sequence_error_status(error),
             Self::Indexer(KvRouterError::IndexerOffline) => StatusCode::SERVICE_UNAVAILABLE,
@@ -74,6 +80,7 @@ impl SelectionError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::Internal(_) => "internal",
+            Self::Cancelled(_) => "cancelled",
             Self::Scheduler(_) => "scheduler",
             Self::Sequence(_) => "sequence",
             Self::Indexer(KvRouterError::IndexerOffline) => "not_ready",
