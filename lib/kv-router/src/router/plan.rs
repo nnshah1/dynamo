@@ -402,10 +402,6 @@ pub struct Plan {
     id: PlanId,
     partition: RoutingPartitionId,
     slots: Vec<Slot>,
-    /// The prompt's public block hashes as a set's selection computed them,
-    /// by block size: a later stage whose set shares the block size reuses
-    /// them instead of hashing the tokens again.
-    prompt_hashes: HashMap<u32, Vec<i64>>,
 }
 
 impl Plan {
@@ -449,27 +445,11 @@ impl Plan {
             id,
             partition,
             slots: stages.into_iter().map(Slot::new).collect(),
-            prompt_hashes: HashMap::new(),
         })
     }
 
     pub fn id(&self) -> &PlanId {
         &self.id
-    }
-
-    /// The prompt's block hashes for `block_size`, if a selection in this
-    /// plan already computed them.
-    pub fn prompt_hashes(&self, block_size: u32) -> Option<&[i64]> {
-        self.prompt_hashes.get(&block_size).map(Vec::as_slice)
-    }
-
-    /// Keep the block hashes a selection computed for `block_size`. The
-    /// first set to hash wins; a set with another block size hashes once
-    /// more and adds its own.
-    pub fn record_prompt_hashes(&mut self, block_size: u32, hashes: Vec<i64>) {
-        if !hashes.is_empty() {
-            self.prompt_hashes.entry(block_size).or_insert(hashes);
-        }
     }
 
     pub fn partition(&self) -> &RoutingPartitionId {
