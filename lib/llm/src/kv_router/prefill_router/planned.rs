@@ -696,6 +696,12 @@ mod tests {
     }
 
     async fn fixture(namespace: &str) -> Fixture {
+        fixture_with(namespace, false).await
+    }
+
+    /// `conditional`: the ISL-bounding policy is on, so an uncached prompt
+    /// still goes to remote prefill and a cached one bypasses it.
+    async fn fixture_with(namespace: &str, conditional: bool) -> Fixture {
         force_plan_host(true);
         let runtime = Runtime::from_current().unwrap();
         let distributed =
@@ -709,7 +715,29 @@ mod tests {
             component: "prefill".to_string(),
             name: "generate".to_string(),
         };
-        let router = PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+        let router = if conditional {
+            let (_activation_tx, activation_rx) = tokio::sync::oneshot::channel();
+            std::mem::forget(_activation_tx);
+            PrefillRouter::new(
+                activation_rx,
+                Arc::new(ModelManager::new()),
+                RouterMode::KV,
+                16,
+                Some(KvRouterConfig {
+                    conditional_disagg_enabled: true,
+                    ..Default::default()
+                }),
+                None,
+                None,
+                crate::session_affinity::SessionAffinityMode::Hard,
+                "model".to_string(),
+                namespace.to_string(),
+                crate::discovery::LoadThresholdHandle::new(Default::default()),
+                tokio_util::sync::CancellationToken::new(),
+            )
+        } else {
+            PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None)
+        };
         router.binding.store(Some(Arc::new(PrefillBinding {
             target_id: WorkerSetTargetId::Legacy(endpoint_id.clone()),
             endpoint_id,
@@ -919,6 +947,144 @@ mod tests {
             }
         };
         assert!(message.contains("prefill connection lost"), "{message}");
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn conditional_disagg_with_nothing_cached_still_runs_remote_prefill() {
+        let fixture = fixture_with("plan-host-conditional-remote", true).await;
+        fixture.prefill.worker.script(vec![bootstrap_frame()]);
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+
+        let response = fixture
+            .router
+            .generate(Context::new(request()), Arc::new(NeverNext))
+            .await
+            .expect("routed");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        assert_eq!(
+            fixture.prefill.worker.seen().len(),
+            1,
+            "the preview found no cache: remote prefill"
+        );
+        let decode_seen = fixture.decode.worker.seen();
+        assert_eq!(decode_seen.len(), 1);
+        let (_, decode_body) = &decode_seen[0];
+        assert!(
+            !decode_body
+                .annotations
+                .iter()
+                .any(|a| a == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
+            "no bypass annotation on the remote path"
+        );
+        // Conditional disaggregation leaves decode's overlap credit to the
+        // base config; plain disaggregation zeroes it.
+        let decode_override = decode_body
+            .router_config_override
+            .as_ref()
+            .expect("decode override");
+        assert_eq!(decode_override.overlap_score_credit, None);
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    /// Record the whole prompt as cached on `worker_id`, so the decode
+    /// preview sees a full prefix hit there.
+    async fn seed_prefix(set: &KvSet, tokens: &[u32]) {
+        use dynamo_kv_router::indexer::KvIndexerInterface;
+        use dynamo_kv_router::protocols::{
+            BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+            KvCacheStoreData, KvCacheStoredBlockData, RouterEvent, StorageTier,
+            compute_block_hash_for_seq, compute_seq_hash_for_block,
+        };
+        use dynamo_kv_router::services::indexer::backend::Indexer;
+        let local_hashes = compute_block_hash_for_seq(tokens, 16, BlockHashOptions::default());
+        let sequence_hashes = compute_seq_hash_for_block(&local_hashes);
+        let blocks = local_hashes
+            .iter()
+            .zip(sequence_hashes.iter())
+            .map(|(&tokens_hash, &sequence_hash)| KvCacheStoredBlockData {
+                block_hash: ExternalSequenceBlockHash(sequence_hash),
+                tokens_hash,
+                mm_extra_info: None,
+            })
+            .collect();
+        let indexer = set.chooser.indexer();
+        indexer
+            .apply_event_routed(RouterEvent::with_storage_tier(
+                set.worker_id,
+                KvCacheEvent {
+                    event_id: 1,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks,
+                    }),
+                    dp_rank: 0,
+                },
+                StorageTier::Device,
+            ))
+            .await
+            .expect("seed index");
+        if let Indexer::Single { primary, .. } = indexer {
+            primary.flush().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_disagg_with_the_prompt_cached_on_decode_bypasses_remote_prefill() {
+        let fixture = fixture_with("plan-host-conditional-bypass", true).await;
+        let tokens: Vec<u32> = (1..=64).collect();
+        seed_prefix(&fixture.decode, &tokens).await;
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+
+        let response = fixture
+            .router
+            .generate(Context::new(request()), Arc::new(NeverNext))
+            .await
+            .expect("routed");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        assert!(
+            frames[0]
+                .event
+                .as_deref()
+                .is_some_and(|event| event == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
+            "the bypass annotation leads the stream: {frames:?}"
+        );
+        assert!(
+            fixture.prefill.worker.seen().is_empty(),
+            "prefill was skipped"
+        );
+        let decode_seen = fixture.decode.worker.seen();
+        assert_eq!(decode_seen.len(), 1);
+        let (worker, decode_body) = &decode_seen[0];
+        assert_eq!(
+            *worker, fixture.decode.worker_id,
+            "decode went to the previewed worker"
+        );
+        assert!(
+            decode_body
+                .annotations
+                .iter()
+                .any(|a| a == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
+            "decode runs the prefill locally"
+        );
+        assert_eq!(decode_body.stop_conditions.max_tokens, Some(32));
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();
     }
