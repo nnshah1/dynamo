@@ -1650,6 +1650,26 @@ async fn router_with_recorded_dispatch_and_affinity(
     namespace: &str,
     session_affinity_ttl: Option<Duration>,
 ) -> (RoutingHost, Arc<PendingThenCompletedDispatch>, u64, Runtime) {
+    router_with_recorded_dispatch_and_config(
+        namespace,
+        session_affinity_ttl,
+        KvRouterConfig {
+            skip_initial_worker_wait: true,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            ..Default::default()
+        },
+        ModelRuntimeConfig::default(),
+    )
+    .await
+}
+
+async fn router_with_recorded_dispatch_and_config(
+    namespace: &str,
+    session_affinity_ttl: Option<Duration>,
+    config: KvRouterConfig,
+    worker_config: ModelRuntimeConfig,
+) -> (RoutingHost, Arc<PendingThenCompletedDispatch>, u64, Runtime) {
     let runtime = Runtime::from_current().unwrap();
     let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
         .await
@@ -1663,14 +1683,8 @@ async fn router_with_recorded_dispatch_and_affinity(
     let client = endpoint.client().await.unwrap();
     endpoint.register_endpoint_instance().await.unwrap();
     let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-    let workers = HashMap::from([(worker_id, ModelRuntimeConfig::default())]);
+    let workers = HashMap::from([(worker_id, worker_config)]);
     let (_workers_tx, workers) = watch::channel(workers);
-    let config = KvRouterConfig {
-        skip_initial_worker_wait: true,
-        use_kv_events: false,
-        router_track_active_blocks: false,
-        ..Default::default()
-    };
     let chooser = KvRouter::new(
         endpoint,
         client.clone(),
@@ -2075,7 +2089,7 @@ async fn planned_route_admission_classifies_and_carries_lifecycle() {
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 0, "preview is query-only");
     let mut plan = router
-        .plan_kv_route_from_preview(&request, preview)
+        .plan_kv_route_from_preview(&request, preview, None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -2358,7 +2372,7 @@ async fn plan_decode_route(
         .await
         .expect("decode preview should select one request");
     router
-        .plan_kv_route_from_preview(request, preview)
+        .plan_kv_route_from_preview(request, preview, None)
         .await
         .expect("decode plan should admit one request")
 }
@@ -2426,7 +2440,7 @@ async fn route_plan_from_preview_admits_the_previewed_worker() {
     let previewed_worker = preview.signals.worker;
 
     let plan = router
-        .plan_kv_route_from_preview(&request, preview)
+        .plan_kv_route_from_preview(&request, preview, None)
         .await
         .unwrap();
     assert_eq!(plan.signals.worker, previewed_worker);
@@ -2515,7 +2529,7 @@ async fn aborted_route_plan_drops_pending_affinity_initialization() {
         .await
         .unwrap();
     router
-        .plan_kv_route_from_preview(&request, preview)
+        .plan_kv_route_from_preview(&request, preview, None)
         .await
         .unwrap()
         .abort()
@@ -4016,7 +4030,7 @@ async fn conditional_route_stages_share_one_cleanup_budget() {
     tokio::time::sleep(waited).await;
 
     let plan = router
-        .plan_kv_route_from_preview(&request, preview)
+        .plan_kv_route_from_preview(&request, preview, None)
         .await
         .unwrap();
     let planned_budget = plan.cleanup_budget_remaining();
@@ -4309,7 +4323,10 @@ async fn explicit_worker_disappearing_after_preview_is_not_revalidated() {
         .unwrap();
     host.inner.client.override_discovered_instances(vec![]);
     // A failure after successful selection must keep its service-error classification.
-    let error = match host.plan_kv_route_from_preview(&request, preview).await {
+    let error = match host
+        .plan_kv_route_from_preview(&request, preview, None)
+        .await
+    {
         Ok(plan) => host.dispatch_kv_plan(request, plan).await.unwrap_err(),
         Err(error) => error,
     };
@@ -4559,4 +4576,145 @@ async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan
     side.plan.abort().await;
     let released = potential_loads(&host).await;
     assert_eq!(active_requests_for(&released, worker_id, 0), 0);
+}
+
+#[tokio::test]
+async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
+    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Budget, Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::scheduling::KvSchedulerError;
+    use dynamo_kv_router::services::selection::SelectionError;
+
+    // Every request finds the worker busy (AIS load model, zero busy
+    // threshold) and the class has one queue slot per worker, so a stage is
+    // parked until its own wait budget says otherwise.
+    let policy = std::env::temp_dir().join(format!("plan-host-budget-{}.yaml", std::process::id()));
+    std::fs::write(
+        &policy,
+        "default_policy_family: regular\nuncached_isl_buckets:\n  - min_tokens: 0\n    bucket: all\npolicy_classes:\n  - name: saturated\n    policy_family: regular\n    cache_bucket: all\n    quantum: 1\n    prefill_busy_threshold_frac: 0.0\n    request_queue_limit_per_worker: 1\n",
+    )
+    .unwrap();
+    let (host, _dispatch, worker_id, _runtime) = router_with_recorded_dispatch_and_config(
+        "plan-host-budget",
+        None,
+        KvRouterConfig {
+            skip_initial_worker_wait: true,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            router_policy_config: Some(policy.to_string_lossy().into_owned()),
+            router_prefill_load_model:
+                dynamo_kv_router::scheduling::config::RouterPrefillLoadModel::Ais,
+            ..Default::default()
+        },
+        ModelRuntimeConfig {
+            max_num_batched_tokens: Some(8192),
+            total_kv_blocks: Some(1_000_000),
+            ..ModelRuntimeConfig::default()
+        },
+    )
+    .await;
+    let host = Arc::new(host);
+    let prompt = || {
+        let mut body = request();
+        body.token_ids = Arc::new((1..=256).collect());
+        Context::new(body)
+    };
+
+    // Hold the worker with one full-budget booking (admitted: nothing is
+    // active yet).
+    let held_request = prompt();
+    let held_router = HostSetRouter::new(
+        Arc::clone(&host),
+        WorkerType::Aggregated,
+        RequestPhase::Aggregated,
+        &held_request,
+        false,
+        BusyThresholds::default(),
+    );
+    let held_req = routing_request(&held_request, &held_router.partition(), None);
+    let mut held = Plan::new(
+        PlanId::from("held"),
+        held_router.partition(),
+        vec![Stage::new(WorkerType::Aggregated)],
+    )
+    .unwrap();
+    held_router.schedule(&held_req, &mut held).await.unwrap();
+    let held_side = held_router.take_side(0).expect("held route");
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        1
+    );
+
+    let attempt = |wait: Budget| {
+        let host = Arc::clone(&host);
+        async move {
+            let request = prompt();
+            let set_router = HostSetRouter::new(
+                host,
+                WorkerType::Aggregated,
+                RequestPhase::Aggregated,
+                &request,
+                false,
+                BusyThresholds::default(),
+            );
+            let req = routing_request(&request, &set_router.partition(), None);
+            let mut plan = Plan::new(
+                PlanId::from(request.id()),
+                set_router.partition(),
+                vec![Stage {
+                    wait,
+                    ..Stage::new(WorkerType::Aggregated)
+                }],
+            )
+            .unwrap();
+            let started = Instant::now();
+            let result = set_router.schedule(&req, &mut plan).await;
+            let elapsed = started.elapsed();
+            assert!(plan.state_of(0).unwrap().is_pending());
+            assert!(set_router.take_side(0).is_none(), "nothing was admitted");
+            (result, elapsed)
+        }
+    };
+
+    // Immediate: admit on this pass or reject; no hold.
+    let (result, elapsed) = attempt(Budget::Immediate).await;
+    assert!(
+        matches!(
+            result,
+            Err(SelectionError::Scheduler(
+                KvSchedulerError::DeadlineExceeded
+            ))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "immediate did not hold: {elapsed:?}"
+    );
+
+    // Bounded: parked for its budget, then rejected.
+    let (result, elapsed) = attempt(Budget::Bounded(Duration::from_millis(400))).await;
+    assert!(
+        matches!(
+            result,
+            Err(SelectionError::Scheduler(
+                KvSchedulerError::DeadlineExceeded
+            ))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the bounded stage waited for its budget: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(3));
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        1,
+        "only the held booking is charged"
+    );
+    held_side.plan.abort().await;
+    drop(held);
+    let _ = std::fs::remove_file(policy);
 }

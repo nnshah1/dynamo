@@ -18,6 +18,7 @@ impl RoutingHost {
         planned_worker: Option<WorkerWithDpRank>,
         admission: FindBestMatchAdmission,
         budget: &CleanupBudget,
+        hold_budget: Option<Duration>,
     ) -> Result<SelectionOutcome, Error> {
         let context_id = request.context().id().to_string();
         let staged_kv = StagedKv::for_request(request.content());
@@ -36,6 +37,7 @@ impl RoutingHost {
                 phase,
                 is_query_only,
                 SelectionOptions {
+                    hold_budget,
                     pinned_target: match self.session_affinity_mode {
                         SessionAffinityMode::Hard => affinity_target,
                         SessionAffinityMode::Soft => None,
@@ -79,6 +81,7 @@ impl RoutingHost {
             None,
             FindBestMatchAdmission::WithAdmission,
             budget,
+            None,
         )
         .await?
         .into_result()
@@ -222,6 +225,7 @@ impl RoutingHost {
                     None,
                     FindBestMatchAdmission::WithoutAdmission,
                     &budget,
+                    None,
                 )
             })
             .await?;
@@ -240,6 +244,7 @@ impl RoutingHost {
         &self,
         request: &SingleIn<PreprocessedRequest>,
         preview: RoutePreview,
+        hold_budget: Option<Duration>,
     ) -> Result<RoutePlan, Error> {
         if request.context().id() != preview.request_id {
             return Err(anyhow::anyhow!(
@@ -255,6 +260,7 @@ impl RoutingHost {
             preview.phase,
             Some(preview.signals.worker),
             preview.budget,
+            hold_budget,
         )
         .await
     }
@@ -268,6 +274,7 @@ impl RoutingHost {
         phase: RequestPhase,
         planned_worker: Option<WorkerWithDpRank>,
         budget: CleanupBudget,
+        hold_budget: Option<Duration>,
     ) -> Result<RoutePlan, Error> {
         if self.kv_router_if_enabled().is_none() {
             return Err(anyhow::anyhow!("KV route plans require KV routing"));
@@ -290,6 +297,7 @@ impl RoutingHost {
                         planned_worker,
                         FindBestMatchAdmission::WithAdmission,
                         budget,
+                        hold_budget,
                     )
                     .await?
                     .into_result()
@@ -376,6 +384,7 @@ impl RoutingHost {
                     None,
                     FindBestMatchAdmission::WithoutAdmission,
                     &budget,
+                    None,
                 )
             })
             .await?;

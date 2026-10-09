@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use dynamo_kv_router::{
     RouterConfigOverride,
@@ -77,6 +78,8 @@ impl<'a> RoutingRequestParts<'a> {
 }
 
 pub(super) struct SelectionOptions {
+    /// How long the queue may hold the request; a planned stage's wait budget.
+    pub(super) hold_budget: Option<Duration>,
     pub(super) pinned_target: Option<AffinityTarget>,
     pub(super) affinity_target: Option<AffinityTarget>,
     pub(super) planned_worker: Option<WorkerWithDpRank>,
@@ -103,6 +106,7 @@ struct BestMatchArgs<'a> {
     allowed_worker_ids: Option<HashSet<WorkerId>>,
     routing_constraints: RoutingConstraints,
     admission: FindBestMatchAdmission,
+    hold_budget: Option<Duration>,
 }
 
 impl RoutingHost {
@@ -128,6 +132,7 @@ impl RoutingHost {
                 args.allowed_worker_ids,
                 args.routing_constraints,
                 args.admission,
+                args.hold_budget,
             )
             .await?;
         match admitted.outcome {
@@ -213,6 +218,7 @@ impl RoutingHost {
         let return_routing_hashes =
             !is_query_only && self.kv_router().indexer().records_routing_decisions();
         let SelectionOptions {
+            hold_budget,
             pinned_target,
             affinity_target,
             planned_worker,
@@ -280,6 +286,7 @@ impl RoutingHost {
                     context_id,
                     routing_parts,
                     router_config_override: request.router_config_override.as_ref(),
+                    hold_budget,
                     update_states: !is_query_only,
                     return_routing_hashes,
                     lora_name,
@@ -348,6 +355,7 @@ impl RoutingHost {
             context_id,
             routing_parts,
             router_config_override: request.router_config_override.as_ref(),
+            hold_budget,
             update_states: !is_query_only,
             return_routing_hashes,
             lora_name,

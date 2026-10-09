@@ -24,7 +24,7 @@ use dynamo_kv_router::config::RouterConfigOverride;
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    Booking, Constraint, Plan, PlanId, Router, Stage, StageAttempt, StageWork, WorkerFacts,
+    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageAttempt, StageWork, WorkerFacts,
 };
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::overlap::MooncakeOverlapSummary;
@@ -345,6 +345,12 @@ impl Router for KvRouterSetRouter {
             let Some(k) = next else { break };
             let body = self.render(req, plan, k)?;
             let id = booking_id(plan, k);
+            // The stage's wait is the queue's hold budget, as in the core.
+            let hold_budget = match plan.stage(k).expect("stage exists").wait {
+                Budget::Full => None,
+                Budget::Immediate => Some(std::time::Duration::ZERO),
+                Budget::Bounded(budget) => Some(budget),
+            };
             let pinned = self.pinned_worker(&body)?;
             let args = SelectionArgs::from_body(&body);
             let admitted = self
@@ -366,6 +372,7 @@ impl Router for KvRouterSetRouter {
                     pinned,
                     args.allowed_worker_ids,
                     args.routing_constraints,
+                    hold_budget,
                 )
                 .await
                 .map_err(host_error)?;
