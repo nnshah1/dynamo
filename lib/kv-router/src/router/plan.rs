@@ -749,19 +749,7 @@ impl Plan {
             return Err(PlanError::InputsNotReady { stage: k });
         }
         let worker = booking.worker();
-        let is_allowed =
-            self.slots[k]
-                .stage
-                .constraints
-                .iter()
-                .all(|constraint| match constraint {
-                    Constraint::Pin(pinned) | Constraint::Previewed(pinned) => *pinned == worker,
-                    Constraint::Exclude(excluded) => *excluded != worker.worker_id,
-                    Constraint::TransferCompatible(_) | Constraint::SameDomain { .. } => true,
-                });
-        if !is_allowed {
-            return Err(PlanError::ConstraintViolated { stage: k, worker });
-        }
+        self.check_worker(k, worker)?;
         let slot = &mut self.slots[k];
         slot.last_worker = Some(worker);
         slot.booking = Some(booking);
@@ -824,6 +812,7 @@ impl Plan {
         if !self.is_bookable(k) {
             return Err(PlanError::InputsNotReady { stage: k });
         }
+        self.check_worker(k, worker)?;
         let slot = &mut self.slots[k];
         slot.last_worker = Some(worker);
         slot.booking = None;
@@ -832,6 +821,26 @@ impl Plan {
         slot.booked_at = Some(Instant::now());
         slot.state = StageState::Booked;
         Ok(())
+    }
+
+    /// The stage's own placement rules: a pin names the worker, an exclusion
+    /// bars one. The same contract whether or not a scheduler booked it.
+    fn check_worker(&self, k: usize, worker: WorkerWithDpRank) -> Result<(), PlanError> {
+        let is_allowed =
+            self.slots[k]
+                .stage
+                .constraints
+                .iter()
+                .all(|constraint| match constraint {
+                    Constraint::Pin(pinned) | Constraint::Previewed(pinned) => *pinned == worker,
+                    Constraint::Exclude(excluded) => *excluded != worker.worker_id,
+                    Constraint::TransferCompatible(_) | Constraint::SameDomain { .. } => true,
+                });
+        if is_allowed {
+            Ok(())
+        } else {
+            Err(PlanError::ConstraintViolated { stage: k, worker })
+        }
     }
 
     pub fn skip(&mut self, k: usize) -> Result<(), PlanError> {
