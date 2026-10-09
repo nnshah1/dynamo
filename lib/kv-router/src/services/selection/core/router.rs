@@ -14,7 +14,7 @@ use super::super::types::resolve_session_context;
 use super::run::session_binding;
 use super::*;
 use crate::router::{
-    Booking, Budget, Constraint, Plan, PlanError, PlanId, Router, Stage, StageWork, WorkerFacts,
+    Booking, Budget, Constraint, Plan, PlanError, PlanId, Router, Stage, WorkerFacts,
 };
 
 #[async_trait]
@@ -123,20 +123,11 @@ impl SelectionCore {
         let work = plan.work_of(k).ok_or_else(no_such_stage)?;
         let mut router_config_override = req.router_config_override.clone();
         let mut expected_output_tokens = req.expected_output_tokens;
-        let config = router_config_override.get_or_insert_with(Default::default);
-        config.track_prefill_tokens = Some(matches!(
-            work,
-            StageWork::PrefillAndDecode | StageWork::PrefillOnly
-        ));
-        match work {
-            StageWork::PrefillAndDecode => {}
-            StageWork::PrefillOnly => expected_output_tokens = Some(1),
-            StageWork::DecodeOnly => config.assume_kv_reuse = Some(false),
-            StageWork::None => {}
-        }
-        // An encoder's booking is admission and lifecycle only: it holds no
-        // prompt KV blocks either.
-        let track_active_blocks = work != StageWork::None;
+        work.apply_to(
+            router_config_override.get_or_insert_with(Default::default),
+            &mut expected_output_tokens,
+        );
+        let track_active_blocks = work.tracks_active_blocks();
         let key = plan.partition().clone();
         let entry = self.ready_entry(&key)?;
         // The exclusion complement is the partition's workers at this instant;
@@ -288,6 +279,7 @@ mod tests {
     use super::*;
     use crate::RouterConfigOverride;
     use crate::protocols::KvTransferEnforcement;
+    use crate::router::StageWork;
     use crate::router::{Failure, StageState, topology_taint};
 
     fn zoned(worker_id: WorkerId, zone: &str) -> WorkerRequest {
