@@ -478,6 +478,22 @@ pub struct SelectAndReserveRequest {
     pub allowed_worker_ids: Option<HashSet<WorkerId>>,
     #[serde(default)]
     pub routing_constraints: RoutingConstraints,
+    /// The policy class whose queue settings and stage list apply; `None`
+    /// lets the classifier choose. The HTTP server fills it from the
+    /// `x-dynamo-meta-policy-class` header.
+    #[serde(default)]
+    pub policy_class: Option<String>,
+    /// Book every stage now, each with an immediate wait budget, or fail.
+    /// The out-of-process host's mode; the in-process host lets the class's
+    /// per-stage `when` and `wait` apply. One stage: the stage is `Immediate`.
+    #[serde(default)]
+    pub all_now: bool,
+    /// Book each stage through the core's reservation index under its
+    /// booking id, so an out-of-process host can complete and free it by id
+    /// (`/reservations/{id}/prefill_complete`, `DELETE /reservations/{id}`).
+    /// Off, the plan owns a lease and releases it.
+    #[serde(default)]
+    pub export_bookings: bool,
 }
 
 impl SelectAndReserveRequest {
@@ -540,7 +556,7 @@ impl From<SelectionSessionContext> for SessionContext {
     }
 }
 
-fn resolve_session_context(
+pub(super) fn resolve_session_context(
     session_context: Option<SelectionSessionContext>,
     session_id: Option<String>,
 ) -> Option<SessionContext> {

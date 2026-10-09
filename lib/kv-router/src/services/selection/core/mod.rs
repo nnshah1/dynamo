@@ -55,6 +55,7 @@ mod hint;
 mod operation;
 mod queries;
 mod reservations;
+mod router;
 mod run;
 #[cfg(test)]
 mod tests;

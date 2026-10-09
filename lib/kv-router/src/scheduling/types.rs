@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dynamo_tokens::SequenceHash;
 use rustc_hash::FxHashMap;
@@ -417,6 +418,11 @@ pub struct ScheduleRequest {
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
     pub shared_cache_hits: Option<SharedCacheHits>,
+    /// How long the queue may hold this request, counted from ingress.
+    /// `None` leaves it to the class's queue policy; `Some(0)` admits on the
+    /// arrival pass or rejects with `DeadlineExceeded`. Honoured on the
+    /// booking path.
+    pub hold_budget: Option<Duration>,
 }
 
 /// Actor-owned admission request.

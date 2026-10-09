@@ -73,7 +73,29 @@ struct QueuedRequest {
     lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
     enqueue_at: Instant,
     due_at: Option<Instant>,
+    /// A hold budget still open at enqueue; checked like `due_at` at pop.
+    hold_until: Option<Instant>,
+    /// A hold budget already spent at enqueue: admit on the arrival pass or
+    /// be swept by `reject_spent_holds`.
+    is_hold_spent: bool,
     block_hashes: Option<Vec<LocalBlockHash>>,
+}
+
+/// When a request arrived and how long its queue may hold it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdmissionTiming {
+    pub(crate) ingress_at: Instant,
+    /// See `ScheduleRequest::hold_budget`.
+    pub(crate) hold_budget: Option<Duration>,
+}
+
+impl AdmissionTiming {
+    pub(crate) fn now() -> Self {
+        Self {
+            ingress_at: Instant::now(),
+            hold_budget: None,
+        }
+    }
 }
 
 struct SelectedWorkerForRequest {
@@ -367,6 +389,9 @@ pub struct BookingHandle {
     booking: SchedulerBookingDescriptor,
     cleanup: SchedulerBookingCleanup,
     armed: bool,
+    /// State that lives exactly as long as the booking (a session-affinity
+    /// lease); dropped with the handle, and on `commit`.
+    released_with: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for BookingHandle {
@@ -383,6 +408,11 @@ impl BookingHandle {
     /// The booking this handle guards.
     pub fn descriptor(&self) -> &SchedulerBookingDescriptor {
         &self.booking
+    }
+
+    /// Attach state to release with the booking.
+    pub fn attach(&mut self, state: Box<dyn std::any::Any + Send + Sync>) {
+        self.released_with = Some(state);
     }
 
     /// Hand the booking to a longer-lived owner; the handle stops guarding it.
@@ -739,7 +769,7 @@ impl<
             lease,
             None,
             None,
-            Instant::now(),
+            AdmissionTiming::now(),
         )
         .await
     }
@@ -751,8 +781,12 @@ impl<
         lease: Option<Box<RequestLifecycleLease>>,
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         classified_request: Option<ClassifyRequest>,
-        ingress_at: Instant,
+        timing: AdmissionTiming,
     ) -> Option<Box<RequestLifecycleLease>> {
+        let AdmissionTiming {
+            ingress_at,
+            hold_budget,
+        } = timing;
         if self.capacity_updates.is_some()
             && lease.is_none()
             && request.mode.lifecycle_request_id().is_some()
@@ -767,13 +801,14 @@ impl<
             Some(classified) => self.validate_classification(&mut request, classified, ingress_at),
             None => Ok(self.default_queue_metadata(&request, ingress_at)),
         };
-        let queue_metadata = match queue_metadata {
+        let mut queue_metadata = match queue_metadata {
             Ok(metadata) => metadata,
             Err(error) => {
                 request.respond(Err(error));
                 return None;
             }
         };
+        queue_metadata.hold_until = hold_budget.map(|budget| ingress_at + budget);
 
         let eligibility = request.eligibility();
 
@@ -841,15 +876,16 @@ impl<
         classification
     }
 
-    /// Enqueue a request with `due_at` for actor-expiry tests.
+    /// Enqueue with the default metadata, adjusted by `adjust`, for
+    /// deadline and hold-budget tests.
     #[cfg(test)]
-    pub(crate) async fn enqueue_with_due_at_for_test(
+    pub(crate) async fn enqueue_with_metadata_for_test(
         &self,
         request: SchedulingRequest,
-        due_at: Instant,
+        adjust: impl FnOnce(&mut QueueMetadata),
     ) {
         let mut queue_metadata = self.default_queue_metadata(&request, Instant::now());
-        queue_metadata.due_at = Some(due_at);
+        adjust(&mut queue_metadata);
         let (ack_tx, ack_rx) = oneshot::channel();
         let command = AdmissionCommand::Enqueue {
             request,
@@ -889,6 +925,7 @@ impl<
             class_index,
             snapshot,
             due_at: None,
+            hold_until: None,
             // "Arrival" is the router ingress time, stamped before the
             // admission channel — one basis for classified and unclassified
             // requests alike, so time spent in a classifier does not reorder
@@ -979,6 +1016,7 @@ impl<
             booking,
             cleanup: self.booking_cleanup(),
             armed: true,
+            released_with: None,
         }
     }
 
@@ -1127,18 +1165,27 @@ impl<
                     let lifecycle_transfer = lease
                         .as_ref()
                         .and_then(|lease| lease.transfer.as_ref().map(Arc::clone));
+                    let now = Instant::now();
+                    let is_hold_spent = queue_metadata
+                        .hold_until
+                        .is_some_and(|hold_until| hold_until <= now);
+                    let class_index = queue_metadata.class_index;
                     let enqueue_ready = self.handle_enqueue(
                         request,
                         attempt_tx,
                         lifecycle_transfer,
                         block_hashes,
                         queue_metadata,
+                        now,
                     );
                     let cleanup_ready = drain_cleanup && self.drain_cleanup();
                     if cleanup_ready {
                         self.handle_update().await;
                     } else if enqueue_ready {
                         self.handle_enqueued().await;
+                    }
+                    if is_hold_spent {
+                        self.reject_spent_holds(class_index);
                     }
                     let _ = ack_tx.send(lease);
                 }
@@ -1192,19 +1239,29 @@ impl<
         attempt_tx: Option<oneshot::Sender<AttemptId>>,
         lifecycle_transfer: Option<Arc<AdmissionLifecycleTransfer>>,
         block_hashes: Option<Vec<LocalBlockHash>>,
-        queue_metadata: QueueMetadata,
+        mut queue_metadata: QueueMetadata,
+        decay_now: Instant,
     ) -> bool {
         let class_index = queue_metadata.class_index;
         self.class_counters[class_index]
             .received_total
             .fetch_add(1, AtomicOrdering::Relaxed);
-        let decay_now = Instant::now();
         if queue_metadata
             .due_at
             .is_some_and(|due_at| due_at <= decay_now)
         {
             self.reject_due_time_passed(class_index, &mut request);
             return false;
+        }
+        // A hold budget bounds parking, not arrival. One still open expires
+        // through the queue's timer; one already spent is swept after this
+        // request's own admission pass, so it still admits when a worker is
+        // free now.
+        let is_hold_spent = queue_metadata
+            .hold_until
+            .is_some_and(|hold_until| hold_until <= decay_now);
+        if is_hold_spent {
+            queue_metadata.hold_until = None;
         }
         let snapshot = queue_metadata.snapshot;
         let class = self.profile.class(class_index);
@@ -1252,6 +1309,8 @@ impl<
             lifecycle_transfer: lifecycle_transfer.clone(),
             enqueue_at: decay_now,
             due_at: queue_metadata.due_at,
+            hold_until: queue_metadata.hold_until,
+            is_hold_spent,
             block_hashes,
         };
         let worker_count = self.workers_with_configs.borrow().len();
@@ -1287,6 +1346,20 @@ impl<
     fn reject_expired(&mut self, now: Instant) {
         for entry in self.pending.take_expired(now) {
             let class_index = entry.class_index();
+            self.subtract_pending_counters(class_index, entry.snapshot());
+            let mut request = entry.into_payload().request;
+            self.reject_due_time_passed(class_index, &mut request);
+        }
+    }
+
+    /// Reject the requests of `class_index` still parked with a spent hold
+    /// budget. Called after the admission pass of an enqueue that carried
+    /// one, so only that class is scanned and only when asked.
+    fn reject_spent_holds(&mut self, class_index: usize) {
+        let (entries, _) = self
+            .pending
+            .take_if_in_class(class_index, |queued| queued.is_hold_spent);
+        for entry in entries {
             self.subtract_pending_counters(class_index, entry.snapshot());
             let mut request = entry.into_payload().request;
             self.reject_due_time_passed(class_index, &mut request);
@@ -1558,7 +1631,12 @@ impl<
             // a stalled refresh delays their rejection by at most one refresh,
             // and an expired entry is never popped into a refresh of its own.
             self.reject_expired(Instant::now());
-            if queued.due_at.is_some_and(|due_at| due_at <= Instant::now()) {
+            let now = Instant::now();
+            if queued.due_at.is_some_and(|due_at| due_at <= now)
+                || queued
+                    .hold_until
+                    .is_some_and(|hold_until| hold_until <= now)
+            {
                 // The pop already charged this entry's scheduling cost against
                 // the class deficit; the credit is intentionally not refunded,
                 // matching every other post-pop terminal outcome.
@@ -2822,7 +2900,9 @@ policy_classes:
         queue.select_without_admission(probe).await.unwrap();
         let (request, response_rx) = make_request("expired-on-arrival", 64);
         queue
-            .enqueue_with_due_at_for_test(request, Instant::now())
+            .enqueue_with_metadata_for_test(request, |metadata| {
+                metadata.due_at = Some(Instant::now())
+            })
             .await;
         assert!(matches!(
             response_rx.await.unwrap(),
@@ -2833,6 +2913,82 @@ policy_classes:
         let stats = queue.class_queue_stats(0).unwrap();
         assert_eq!(stats.received_total, 1);
         assert_eq!(stats.rejected_due_time_passed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn zero_hold_budget_admits_on_the_arrival_pass_or_rejects() {
+        let (queue, _slots) = make_queue(1, 16, 64, Some(0.0));
+        let (first, first_rx) = make_request("hold-first", 64);
+        queue
+            .enqueue_with_metadata_for_test(first, |metadata| {
+                metadata.hold_until = Some(Instant::now() + Duration::ZERO);
+            })
+            .await;
+        first_rx.await.unwrap().unwrap();
+
+        // The worker is now busy: a zero budget is rejected instead of parked.
+        let (second, second_rx) = make_request("hold-second", 64);
+        queue
+            .enqueue_with_metadata_for_test(second, |metadata| {
+                metadata.hold_until = Some(Instant::now() + Duration::ZERO);
+            })
+            .await;
+        assert!(matches!(
+            second_rx.await.unwrap(),
+            Err(KvSchedulerError::DeadlineExceeded)
+        ));
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_hold_sweep_leaves_other_parked_requests_alone() {
+        let (queue, _slots) = make_queue(1, 16, 64, Some(0.0));
+        let (active, active_rx) = make_request("active", 64);
+        queue.enqueue(active).await;
+        active_rx.await.unwrap().unwrap();
+        let (parked, parked_rx) = make_request("parked", 64);
+        queue.enqueue(parked).await;
+        let (bounded, bounded_rx) = make_request("bounded", 64);
+        queue
+            .enqueue_with_metadata_for_test(bounded, |metadata| {
+                metadata.hold_until = Some(Instant::now() + Duration::from_secs(60));
+            })
+            .await;
+        assert_eq!(queue.pending_count(), 2);
+
+        let (immediate, immediate_rx) = make_request("immediate", 64);
+        queue
+            .enqueue_with_metadata_for_test(immediate, |metadata| {
+                metadata.hold_until = Some(Instant::now());
+            })
+            .await;
+        assert!(matches!(
+            immediate_rx.await.unwrap(),
+            Err(KvSchedulerError::DeadlineExceeded)
+        ));
+        assert_eq!(queue.pending_count(), 2, "the parked requests stay");
+        drop((parked_rx, bounded_rx));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_hold_budget_parks_then_expires() {
+        let (queue, _slots) = make_queue(1, 16, 64, Some(0.0));
+        let (active, active_rx) = make_request("active", 64);
+        queue.enqueue(active).await;
+        active_rx.await.unwrap().unwrap();
+
+        let (parked, parked_rx) = make_request("parked-hold", 64);
+        queue
+            .enqueue_with_metadata_for_test(parked, |metadata| {
+                metadata.hold_until = Some(Instant::now() + Duration::from_secs(2));
+            })
+            .await;
+        assert_eq!(queue.pending_count(), 1);
+        assert!(matches!(
+            parked_rx.await.unwrap(),
+            Err(KvSchedulerError::DeadlineExceeded)
+        ));
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2846,7 +3002,9 @@ policy_classes:
         // timer must fire at due_at and reject it without any further command.
         let (parked, parked_rx) = make_request("parked-deadline", 64);
         queue
-            .enqueue_with_due_at_for_test(parked, Instant::now() + Duration::from_secs(5))
+            .enqueue_with_metadata_for_test(parked, |metadata| {
+                metadata.due_at = Some(Instant::now() + Duration::from_secs(5))
+            })
             .await;
         assert_eq!(queue.pending_count(), 1);
 
@@ -2949,7 +3107,10 @@ policy_classes:
                     None,
                     None,
                     Some(classified),
-                    ingress_at,
+                    AdmissionTiming {
+                        ingress_at,
+                        hold_budget: None,
+                    },
                 )
                 .await;
             receivers.push(queued_rx);
@@ -3214,7 +3375,10 @@ policy_classes:
                         None,
                         Some(attempt_tx),
                         None,
-                        Instant::now(),
+                        AdmissionTiming {
+                            ingress_at: Instant::now(),
+                            hold_budget: None,
+                        },
                     )
                     .await;
                 let worker = active_rx.await.unwrap().unwrap().best_worker;
@@ -3305,14 +3469,14 @@ policy_classes:
 
             let (active, mut active_rx) = make_request("active", 64);
             let metadata = queue.default_queue_metadata(&active, Instant::now());
-            assert!(actor.handle_enqueue(active, None, None, None, metadata));
+            assert!(actor.handle_enqueue(active, None, None, None, metadata, Instant::now()));
             actor.handle_enqueued().await;
             assert_eq!(active_rx.try_recv().unwrap().unwrap().best_worker, worker);
 
             let (mut older, mut older_rx) = make_request("older-pinned", 64);
             older.pinned_worker = Some(worker);
             let metadata = queue.default_queue_metadata(&older, Instant::now());
-            assert!(actor.handle_enqueue(older, None, None, None, metadata));
+            assert!(actor.handle_enqueue(older, None, None, None, metadata, Instant::now()));
             actor.handle_enqueued().await;
             assert!(older_rx.try_recv().is_err());
 
@@ -3322,7 +3486,7 @@ policy_classes:
             }
             let (later, mut later_rx) = make_request("later-shared", 64);
             let metadata = queue.default_queue_metadata(&later, Instant::now());
-            assert!(actor.handle_enqueue(later, None, None, None, metadata));
+            assert!(actor.handle_enqueue(later, None, None, None, metadata, Instant::now()));
             // Force enqueue processing before the capacity select branch.
             actor.handle_enqueued().await;
             assert_eq!(older_rx.try_recv().unwrap().unwrap().best_worker, worker);
