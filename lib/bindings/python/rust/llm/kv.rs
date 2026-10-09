@@ -2489,6 +2489,7 @@ impl KvRouter {
                     None,
                     None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
                     routing_constraints.map(Into::into).unwrap_or_default(),
+                    None, // hold_budget: class-policy admission without a stage hold cap
                 )
                 .await
                 .map_err(to_pyerr)?;
