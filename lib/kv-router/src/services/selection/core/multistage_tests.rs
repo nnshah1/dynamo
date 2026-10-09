@@ -14,7 +14,7 @@ use super::*;
 use crate::conditional_disagg::{ConditionalDisaggDecisionInput, ConditionalDisaggPolicy};
 use crate::protocols::PotentialLoad;
 use crate::router::{
-    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Outcome, Router, SkipRule,
+    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Outcome, Plan, Router, SkipRule,
     Stage, StageList, StageState, When, topology_taint,
 };
 use crate::scheduling::KvSchedulerError;
@@ -557,5 +557,73 @@ async fn a_later_stage_sees_the_cached_prompt() {
         charged_on_cached_worker < tokens.len() / 2,
         "the second stage finds worker 2's cached prompt: charged {charged_on_cached_worker}"
     );
+    plan.release().await.unwrap();
+}
+
+/// The gateway's list: a prefill stage its own reservation router records
+/// untracked (no plan booking), then decode placed against it. Decode must
+/// read prefill's worker and facts through the untracked record.
+struct UntrackedPrefill;
+
+#[async_trait::async_trait]
+impl Router for UntrackedPrefill {
+    async fn select(
+        &self,
+        _req: crate::services::selection::SelectRequest,
+    ) -> Result<crate::services::selection::SelectResponse, SelectionError> {
+        Err(SelectionError::NotReady("no preview".to_string()))
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        let mut stage = Stage::new(WorkerType::Prefill);
+        stage.work = Some(crate::router::StageWork::None);
+        Ok(Plan::new(
+            crate::router::PlanId::from(req.selection_id.clone().unwrap_or_default()),
+            crate::identity::RoutingPartitionId::new(&req.model_name, &req.routing_group),
+            vec![stage],
+        )?)
+    }
+
+    async fn schedule(
+        &self,
+        _req: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        loop {
+            let next = plan
+                .schedulable()
+                .find(|&k| plan.stage(k).is_some_and(|s| s.set == WorkerType::Prefill));
+            let Some(k) = next else { break };
+            plan.book_untracked(k, WorkerWithDpRank::new(99, 0), Default::default())?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn decode_is_booked_after_an_untracked_prefill_selection() {
+    let decode = typed_core(WorkerType::Decode);
+    decode.upsert_worker(worker(1)).await.unwrap();
+    ready(&decode).await;
+    let mut list = StageList::prefill_decode();
+    list.stages[0].work = Some(crate::router::StageWork::None);
+    let router = MultiStageRouter::builder()
+        .set(
+            WorkerType::Prefill,
+            Arc::new(UntrackedPrefill) as Arc<dyn Router>,
+        )
+        .set(WorkerType::Decode, decode.clone() as Arc<dyn Router>)
+        .classes(ClassTable::new(
+            list.with_fallback(crate::router::Fallback::Aggregated),
+        ))
+        .build()
+        .unwrap();
+    let req = reserve_request("gateway-untracked-prefill");
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.worker(0).map(|w| w.worker_id), Some(99));
+    assert!(plan.booking(0).is_none(), "prefill is untracked");
+    assert_eq!(plan.state_of(1), Some(&StageState::Booked));
+    assert_eq!(plan.worker(1).map(|w| w.worker_id), Some(1));
     plan.release().await.unwrap();
 }
