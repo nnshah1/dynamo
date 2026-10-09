@@ -135,7 +135,7 @@ impl PrefillRouter {
 
         if bypass {
             let plan = decode_host
-                .plan_kv_route_from_preview(request, preview)
+                .plan_kv_route_from_preview(request, preview, None)
                 .await?;
             return Ok(Some(ConditionalDisaggDecodeDecision {
                 plan,

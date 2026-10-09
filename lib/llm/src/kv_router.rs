@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -62,6 +62,7 @@ pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
 pub(crate) mod metrics_subscriber;
+pub(crate) mod plan_host;
 pub mod plugins;
 pub mod prefill_router;
 pub mod publisher;
@@ -531,7 +532,9 @@ pub const ACTIVE_SEQUENCES_SUBJECT: &str = "active_sequences_events";
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
 
-fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
+/// The frontend's canonical form of a scheduler answer: the error type the
+/// HTTP layer and metrics classify on, with the queue-deadline reason.
+pub(crate) fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
     // Keep the two overload cases apart. A single overloaded worker can be
     // retried elsewhere; a pool with no free worker cannot, and migrating it
     // would just bounce the request around. A filter rejection is unavailable,
@@ -1247,6 +1250,7 @@ impl KvRouter {
                 pinned_worker,
                 allowed_worker_ids,
                 routing_constraints,
+                None,
             )
             .await?;
         if let Some(booking) = admitted.booking {
@@ -1278,6 +1282,7 @@ impl KvRouter {
         pinned_worker: Option<WorkerWithDpRank>,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
+        hold_budget: Option<Duration>,
     ) -> anyhow::Result<AdmittedFindBestMatchOutcome> {
         self.find_best_match_details_with_policy_class_inner(
             context_id,
@@ -1298,6 +1303,7 @@ impl KvRouter {
             allowed_worker_ids,
             routing_constraints,
             FindBestMatchAdmission::WithAdmission,
+            hold_budget,
         )
         .await
     }
@@ -1323,6 +1329,9 @@ impl KvRouter {
         allowed_worker_ids: Option<HashSet<WorkerId>>,
         routing_constraints: RoutingConstraints,
         admission: FindBestMatchAdmission,
+        // How long the queue may hold the request: a planned stage's wait
+        // budget. `None` keeps the class policy, as the direct paths do.
+        hold_budget: Option<Duration>,
     ) -> anyhow::Result<AdmittedFindBestMatchOutcome> {
         let start = Instant::now();
         if update_states && context_id.is_none() {
@@ -1381,8 +1390,7 @@ impl KvRouter {
                 track_active_blocks: self.kv_router_config.router_track_active_blocks,
                 return_routing_hashes: return_routing_hashes || session_index_context.is_some(),
                 replay_id: None,
-                // The frontend's queue policy is unchanged: hold as today.
-                hold_budget: None,
+                hold_budget,
             })
             .await;
         if lookup.is_some_and(|lookup| lookup.shared_cache_error)
@@ -2749,6 +2757,7 @@ mod tests {
                     None,
                     RoutingConstraints::default(),
                     admission,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2934,6 +2943,7 @@ mod tests {
                     None,
                     RoutingConstraints::default(),
                     FindBestMatchAdmission::WithAdmission,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -3082,6 +3092,7 @@ mod tests {
                 None,
                 RoutingConstraints::default(),
                 FindBestMatchAdmission::WithAdmission,
+                None,
             )
             .await
             .unwrap();

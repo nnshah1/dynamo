@@ -18,6 +18,7 @@ impl RoutingHost {
         planned_worker: Option<WorkerWithDpRank>,
         admission: FindBestMatchAdmission,
         budget: &CleanupBudget,
+        hold_budget: Option<Duration>,
     ) -> Result<SelectionOutcome, Error> {
         let context_id = request.context().id().to_string();
         let staged_kv = StagedKv::for_request(request.content());
@@ -36,6 +37,7 @@ impl RoutingHost {
                 phase,
                 is_query_only,
                 SelectionOptions {
+                    hold_budget,
                     pinned_target: match self.session_affinity_mode {
                         SessionAffinityMode::Hard => affinity_target,
                         SessionAffinityMode::Soft => None,
@@ -79,6 +81,7 @@ impl RoutingHost {
             None,
             FindBestMatchAdmission::WithAdmission,
             budget,
+            None,
         )
         .await?
         .into_result()
@@ -222,6 +225,7 @@ impl RoutingHost {
                     None,
                     FindBestMatchAdmission::WithoutAdmission,
                     &budget,
+                    None,
                 )
             })
             .await?;
@@ -240,13 +244,8 @@ impl RoutingHost {
         &self,
         request: &SingleIn<PreprocessedRequest>,
         preview: RoutePreview,
+        hold_budget: Option<Duration>,
     ) -> Result<RoutePlan, Error> {
-        // Inherited, not restarted: this stage continues the route the preview
-        // opened.
-        let budget = preview.budget;
-        if self.kv_router_if_enabled().is_none() {
-            return Err(anyhow::anyhow!("KV route plans require KV routing"));
-        }
         if request.context().id() != preview.request_id {
             return Err(anyhow::anyhow!(
                 "KV route preview belongs to request {}, not {}",
@@ -254,11 +253,38 @@ impl RoutingHost {
                 request.context().id(),
             ));
         }
+        // Inherited, not restarted: this stage continues the route the preview
+        // opened, pinned to the worker it previewed.
+        self.admit_kv_route(
+            request,
+            preview.phase,
+            Some(preview.signals.worker),
+            preview.budget,
+            hold_budget,
+        )
+        .await
+    }
 
-        let phase = preview.phase;
+    /// Admit a KV route with no preview: the same admission
+    /// [`Self::plan_kv_route_from_preview`] performs, optionally pinned to
+    /// `planned_worker`, drawing on `budget`.
+    pub(crate) async fn admit_kv_route(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        planned_worker: Option<WorkerWithDpRank>,
+        budget: CleanupBudget,
+        hold_budget: Option<Duration>,
+    ) -> Result<RoutePlan, Error> {
+        if self.kv_router_if_enabled().is_none() {
+            return Err(anyhow::anyhow!("KV route plans require KV routing"));
+        }
+        if planned_worker.is_none() {
+            self.validate_explicit_worker(request.content(), phase)?;
+        }
+
         let phase_label = phase.to_string();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
-        let planned_worker = preview.signals.worker;
         let select = || {
             self.select_with_session_affinity(request, phase, false, &budget, |target| {
                 let budget = &budget;
@@ -268,9 +294,10 @@ impl RoutingHost {
                         phase,
                         false,
                         target,
-                        Some(planned_worker),
+                        planned_worker,
                         FindBestMatchAdmission::WithAdmission,
                         budget,
+                        hold_budget,
                     )
                     .await?
                     .into_result()
@@ -357,6 +384,7 @@ impl RoutingHost {
                     None,
                     FindBestMatchAdmission::WithoutAdmission,
                     &budget,
+                    None,
                 )
             })
             .await?;

@@ -104,6 +104,7 @@ impl PrefillRouter {
                 None,
                 allowed_worker_ids,
                 routing_constraints,
+                None,
             )
             .await?;
         let (outcome, booking) = admitted.into_parts();
