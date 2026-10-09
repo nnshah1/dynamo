@@ -785,3 +785,25 @@ fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
     plan.book_untracked(0, worker(4), WorkerFacts::default())
         .unwrap();
 }
+
+#[test]
+fn a_plan_keeps_the_prompts_block_hashes_per_block_size() {
+    let mut plan = plan(prefill_decode(When::Now, Budget::Full));
+    assert!(plan.prompt_hashes(16).is_none());
+    plan.record_prompt_hashes(16, vec![1, 2, 3]);
+    plan.record_prompt_hashes(16, vec![9, 9, 9]);
+    assert_eq!(
+        plan.prompt_hashes(16),
+        Some(&[1, 2, 3][..]),
+        "the first set to hash wins"
+    );
+    assert!(
+        plan.prompt_hashes(32).is_none(),
+        "another block size hashes for itself"
+    );
+    plan.record_prompt_hashes(32, Vec::new());
+    assert!(
+        plan.prompt_hashes(32).is_none(),
+        "an empty prompt records nothing"
+    );
+}
