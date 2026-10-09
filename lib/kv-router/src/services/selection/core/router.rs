@@ -183,11 +183,11 @@ impl SelectionCore {
                 routing_constraints,
                 admission: if req.export_bookings {
                     SelectionAdmission::Book {
-                        selection_id: booking_id,
+                        selection_id: booking_id.clone(),
                     }
                 } else {
                     SelectionAdmission::Lease {
-                        request_id: booking_id,
+                        request_id: booking_id.clone(),
                     }
                 },
                 track_active_blocks,
@@ -227,9 +227,37 @@ impl SelectionCore {
             }
         };
         let worker = selected.response.best_worker;
+        let is_exported = matches!(booking, Booking::Committed(_));
+        let recorded = Self::record_stage(plan, k, &entry, booking, worker, selected.kv_hint);
+        // Until the plan holds it, the booking is this call's to roll back. A
+        // leased handle freed itself when `booking` dropped above; an
+        // exported one sits in the reservation index and is freed here.
+        if recorded.is_err()
+            && is_exported
+            && let Err(error) = self.free_reservation(&booking_id).await
+        {
+            tracing::warn!(
+                booking_id,
+                %error,
+                "exported booking rejected by the plan could not be freed"
+            );
+        }
+        recorded
+    }
+
+    /// Read the booked worker's facts, check placement against the stages it
+    /// reads, and hand the booking to the plan. Consumes the booking either
+    /// way: on an error the caller rolls it back.
+    fn record_stage(
+        plan: &mut Plan,
+        k: usize,
+        entry: &SelectionEntry,
+        booking: Booking,
+        worker: WorkerWithDpRank,
+        kv_hint: Option<crate::kv_hints::KvHint>,
+    ) -> Result<(), SelectionError> {
         // The worker was in the snapshot the selector read an instant ago;
         // missing now means it just left, and a booking on it is useless.
-        // `handle` drops on this path and frees the booking.
         let facts = entry
             .workers_tx
             .borrow()
@@ -242,7 +270,7 @@ impl SelectionCore {
                 ))
             })?;
         plan.check_placement(k, &facts).map_err(placement_error)?;
-        plan.book(k, booking, facts, selected.kv_hint)
+        plan.book(k, booking, facts, kv_hint)
             .map_err(|error| SelectionError::Internal(error.to_string()))
     }
 }
@@ -539,6 +567,56 @@ mod tests {
         .await;
         assert!(entry.scheduler.has_request("rev/0/0"));
         plan.abort();
+    }
+
+    #[tokio::test]
+    async fn an_exported_booking_the_plan_rejects_is_freed_from_the_index() {
+        let core = local_core(test_config(false));
+        core.upsert_worker(zoned(2, "b")).await.unwrap();
+        core.upsert_worker(transfer_zoned(1, "a", KvTransferEnforcement::Required))
+            .await
+            .unwrap();
+        let entry = core.entry(&default_key()).expect("entry");
+
+        let mut req = reserve_request("rev-export");
+        req.export_bookings = true;
+        let mut plan = two_stage_plan(
+            "rev-export",
+            2,
+            Stage {
+                constraints: vec![Constraint::TransferCompatible(0), Constraint::Exclude(2)],
+                ..Stage::new(WorkerType::Aggregated)
+            },
+        );
+        let error = Router::schedule(&core, &req, &mut plan)
+            .await
+            .expect_err("the pair cannot transfer KV");
+        assert!(matches!(error, SelectionError::Conflict(_)), "{error}");
+        assert!(plan.state_of(1).unwrap().is_pending());
+        assert!(plan.booking(1).is_none());
+        // The rejected stage's exported reservation is gone, not orphaned.
+        wait_until("rejected export release", || {
+            !entry.scheduler.has_request("rev-export/1/0")
+        })
+        .await;
+        assert!(
+            core.free_reservation("rev-export/1/0").await.is_err(),
+            "nothing left to free by id"
+        );
+        wait_until("no load on the rejected worker", || {
+            core.loads(None, None).iter().all(|model| {
+                model
+                    .loads
+                    .iter()
+                    .filter(|load| load.worker_id == 1)
+                    .all(|load| load.active_requests == 0)
+            })
+        })
+        .await;
+        // The earlier stage keeps its exported booking under the host's id.
+        assert!(entry.scheduler.has_request("rev-export/0/0"));
+        core.free_reservation("rev-export/0/0").await.unwrap();
+        plan.release().await.unwrap();
     }
 
     #[tokio::test]
