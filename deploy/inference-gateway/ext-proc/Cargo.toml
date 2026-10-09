@@ -25,6 +25,7 @@ dynamo-kv-router = { workspace = true, features = [
 ] }
 dynamo-protocols = { workspace = true }
 dynamo-runtime = { workspace = true }
+dynamo-truthy = { workspace = true }
 
 anyhow = { workspace = true }
 axum = { workspace = true }

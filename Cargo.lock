@@ -2590,6 +2590,7 @@ dependencies = [
  "dynamo-llm",
  "dynamo-protocols",
  "dynamo-runtime",
+ "dynamo-truthy",
  "futures",
  "hyper-util",
  "k8s-openapi",
