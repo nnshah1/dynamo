@@ -749,6 +749,52 @@ fn handoff_is_fenced_by_attempt_and_state() {
 }
 
 #[test]
+fn a_placement_read_needs_the_peers_facts_not_its_booking() {
+    // An untracked encoder has worker and facts but no booking; a stage
+    // reading its placement is schedulable once it is booked.
+    let mut plan = plan(vec![
+        Stage::new(WorkerType::Encode),
+        Stage {
+            constraints: vec![Constraint::TransferCompatible(0)],
+            ..Stage::new(WorkerType::Prefill)
+        },
+    ]);
+    assert_eq!(vec_of(plan.schedulable()), vec![0]);
+    plan.book_untracked(0, worker(31), zone("b")).unwrap();
+    assert_eq!(vec_of(plan.schedulable()), vec![1]);
+    let releases = Arc::new(AtomicUsize::new(0));
+    plan.book(1, booking("b-1", worker(2), &releases), zone("b"), None)
+        .unwrap();
+    assert_eq!(state(&plan, 1), &StageState::Booked);
+
+    // A booking the host took keeps the stage's worker and facts; a dependent
+    // placed after the handoff still reads them.
+    let transferred = new_plan(vec![
+        Stage::new(WorkerType::Prefill),
+        Stage {
+            when: When::After(0),
+            constraints: vec![Constraint::TransferCompatible(0)],
+            ..Stage::new(WorkerType::Decode)
+        },
+    ]);
+    let mut transferred = transferred.unwrap();
+    transferred
+        .book(0, booking("b-0", worker(1), &releases), zone("a"), None)
+        .unwrap();
+    let taken = transferred.take_booking(0).unwrap();
+    let attempt = transferred.dispatch(0).unwrap();
+    assert!(
+        vec_of(transferred.schedulable()).is_empty(),
+        "decode waits for the handoff"
+    );
+    transferred.handoff(0, attempt).unwrap();
+    assert_eq!(transferred.worker(0), Some(worker(1)));
+    assert_eq!(transferred.facts(0), Some(&zone("a")));
+    assert_eq!(vec_of(transferred.schedulable()), vec![1]);
+    drop(taken);
+}
+
+#[test]
 fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
     let encode = |constraint: Constraint| {
         vec![Stage {
