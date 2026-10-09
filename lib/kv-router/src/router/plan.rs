@@ -608,7 +608,10 @@ impl Plan {
                 .iter()
                 .filter_map(Constraint::reads)
                 .all(|j| {
-                    self.slots[j].booking.is_some() || self.slots[j].state == StageState::Skipped
+                    // A placement read wants the peer's worker and facts, which
+                    // a stage keeps while it is booked or running whether the
+                    // scheduler, the host or nobody holds its booking.
+                    self.slots[j].facts.is_some() || self.slots[j].state == StageState::Skipped
                 })
     }
 
