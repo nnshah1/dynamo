@@ -747,3 +747,41 @@ fn handoff_is_fenced_by_attempt_and_state() {
     plan.handoff(0, attempt).unwrap();
     plan.handoff(0, attempt).unwrap();
 }
+
+#[test]
+fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
+    let encode = |constraint: Constraint| {
+        vec![Stage {
+            constraints: vec![constraint],
+            ..Stage::new(WorkerType::Encode)
+        }]
+    };
+    // Pinned to worker 2: worker 3 is refused and nothing changes.
+    let mut plan = new_plan(encode(Constraint::Pin(worker(2)))).unwrap();
+    assert_eq!(
+        plan.book_untracked(0, worker(3), WorkerFacts::default()),
+        Err(PlanError::ConstraintViolated {
+            stage: 0,
+            worker: worker(3)
+        })
+    );
+    assert_eq!(state(&plan, 0), &StageState::Pending);
+    assert_eq!(plan.worker(0), None);
+    // The pin names a DP rank too.
+    assert!(matches!(
+        plan.book_untracked(0, WorkerWithDpRank::new(2, 1), WorkerFacts::default()),
+        Err(PlanError::ConstraintViolated { .. })
+    ));
+    plan.book_untracked(0, worker(2), WorkerFacts::default())
+        .unwrap();
+    assert_eq!(plan.worker(0), Some(worker(2)));
+    // An exclusion bars the worker.
+    let mut plan = new_plan(encode(Constraint::Exclude(3))).unwrap();
+    assert!(matches!(
+        plan.book_untracked(0, worker(3), WorkerFacts::default()),
+        Err(PlanError::ConstraintViolated { .. })
+    ));
+    assert_eq!(state(&plan, 0), &StageState::Pending);
+    plan.book_untracked(0, worker(4), WorkerFacts::default())
+        .unwrap();
+}
