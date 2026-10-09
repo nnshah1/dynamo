@@ -22,8 +22,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
+use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::router::{
-    ClassTable, Failure, MultiStageRouter, Outcome, Plan, Router, StageList, StageState,
+    ClassTable, Constraint, Failure, MultiStageRouter, Outcome, Plan, Router, StageList, StageState,
 };
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
@@ -239,6 +240,7 @@ impl PlannedFlow<'_> {
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
         let multistage = self.multistage(conditional)?;
         let mut plan = multistage.plan(routing)?;
+        self.pin_caller_targets(&mut plan)?;
         let engine_ctx = self
             .decode_request
             .as_ref()
@@ -269,6 +271,43 @@ impl PlannedFlow<'_> {
                 return Ok(response);
             }
         }
+    }
+
+    /// A worker the caller named for a phase pins that phase's stage, so the
+    /// conditional decision keeps remote prefill for an explicit prefill
+    /// worker (as the legacy path does) and the host still validates the
+    /// target. Each pin goes to its own set only.
+    fn pin_caller_targets(&self, plan: &mut Plan) -> Result<()> {
+        let body = self
+            .decode_request
+            .as_ref()
+            .ok_or_else(|| anyhow!("decode request already consumed"))?
+            .content();
+        let Some(routing) = body.routing.as_ref() else {
+            return Ok(());
+        };
+        let pins = [
+            (
+                WorkerType::Prefill,
+                routing.prefill_worker_id,
+                routing.prefill_dp_rank,
+            ),
+            (
+                WorkerType::Decode,
+                routing.decode_worker_id,
+                routing.dp_rank,
+            ),
+        ];
+        for (set, worker_id, dp_rank) in pins {
+            let Some(worker_id) = worker_id else { continue };
+            let worker = WorkerWithDpRank::new(worker_id, dp_rank.unwrap_or(0));
+            for k in 0..plan.stage_count() {
+                if plan.stage(k).is_some_and(|stage| stage.set == set) {
+                    plan.constrain(k, Constraint::Pin(worker))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn run_prefill(
@@ -992,6 +1031,46 @@ mod tests {
             .as_ref()
             .expect("decode override");
         assert_eq!(decode_override.overlap_score_credit, None);
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_explicit_prefill_pin_keeps_remote_prefill_even_with_decode_cached() {
+        let fixture = fixture_with("plan-host-pinned-prefill", true).await;
+        seed_prefix(&fixture.decode, &(1..=64).collect::<Vec<u32>>()).await;
+        fixture.prefill.worker.script(vec![bootstrap_frame()]);
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+        let mut body = request();
+        body.routing_mut().prefill_worker_id = Some(fixture.prefill.worker_id);
+        body.routing_mut().prefill_dp_rank = Some(0);
+
+        let response = fixture
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await
+            .expect("routed");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        let prefill_seen = fixture.prefill.worker.seen();
+        assert_eq!(prefill_seen.len(), 1, "the named prefill worker ran once");
+        assert_eq!(prefill_seen[0].0, fixture.prefill.worker_id);
+        let decode_seen = fixture.decode.worker.seen();
+        assert_eq!(decode_seen.len(), 1);
+        assert!(
+            !decode_seen[0]
+                .1
+                .annotations
+                .iter()
+                .any(|a| a == super::BYPASS_REMOTE_PREFILL_ANNOTATION),
+            "no bypass with an explicit prefill worker"
+        );
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();
     }
