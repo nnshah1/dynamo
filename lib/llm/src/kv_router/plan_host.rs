@@ -22,7 +22,7 @@ use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    Booking, Constraint, Plan, PlanId, Router, Stage, StageWork, WorkerFacts,
+    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageWork, WorkerFacts,
 };
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::overlap::MooncakeOverlapSummary;
@@ -303,6 +303,12 @@ impl Router for HostSetRouter {
                 .find(|&k| plan.stage(k).is_some_and(|stage| stage.set == self.set));
             let Some(k) = next else { break };
             let rendered = self.render(req, plan, k)?;
+            // The stage's wait is the queue's hold budget, as in the core.
+            let hold_budget = match plan.stage(k).expect("stage exists").wait {
+                Budget::Full => None,
+                Budget::Immediate => Some(std::time::Duration::ZERO),
+                Budget::Bounded(budget) => Some(budget),
+            };
             let pending = self.pending_preview.lock().expect("preview lock").take();
             // A previewed pin continues the preview's admission and budget. A
             // caller's pin is on the rendered request's routing hints, where
@@ -310,12 +316,18 @@ impl Router for HostSetRouter {
             let route_plan = match (Self::previewed_worker(plan, k), pending) {
                 (Some(previewed), Some((worker, preview))) if worker == previewed => self
                     .host
-                    .plan_kv_route_from_preview(&rendered, preview)
+                    .plan_kv_route_from_preview(&rendered, preview, hold_budget)
                     .await
                     .map_err(host_error)?,
                 (previewed, _) => self
                     .host
-                    .admit_kv_route(&rendered, self.phase, previewed, CleanupBudget::default())
+                    .admit_kv_route(
+                        &rendered,
+                        self.phase,
+                        previewed,
+                        CleanupBudget::default(),
+                        hold_budget,
+                    )
                     .await
                     .map_err(host_error)?,
             };
@@ -378,11 +390,28 @@ pub(crate) fn routing_request(
     }
 }
 
-/// A host error as the router library reports it: capacity answers keep their
-/// type so `Fallback` and retry logic see them; the rest are internal.
+/// A host error as the router library reports it. The frontend types the
+/// scheduler's answers as `BackendError`s, so the error type is what carries
+/// them through the chain; the plan sees the scheduler variant again, and
+/// `Fallback`, retry logic and budget semantics keep working. Anything else
+/// is internal.
 fn host_error(error: Error) -> SelectionError {
-    match error.downcast::<KvSchedulerError>() {
-        Ok(scheduler) => SelectionError::Scheduler(scheduler),
-        Err(other) => SelectionError::Internal(other.to_string()),
+    use dynamo_runtime::error::{ErrorType, match_error_chain};
+    let scheduler = if match_error_chain(error.as_ref(), &[ErrorType::DeadlineExceeded], &[]) {
+        Some(KvSchedulerError::DeadlineExceeded)
+    } else if match_error_chain(error.as_ref(), &[ErrorType::Unavailable], &[]) {
+        Some(KvSchedulerError::AllEligibleWorkersFiltered)
+    } else if match_error_chain(
+        error.as_ref(),
+        &[ErrorType::ResourceExhausted, ErrorType::WorkerOverloaded],
+        &[],
+    ) {
+        Some(KvSchedulerError::AllEligibleWorkersOverloaded)
+    } else {
+        None
+    };
+    match scheduler {
+        Some(scheduler) => SelectionError::Scheduler(scheduler),
+        None => SelectionError::Internal(error.to_string()),
     }
 }
