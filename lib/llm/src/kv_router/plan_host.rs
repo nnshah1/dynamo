@@ -424,6 +424,13 @@ pub(crate) fn host_error(error: Error, pinned: Option<WorkerId>) -> SelectionErr
         Ok(rejection) => return SelectionError::Scheduler(rejection.into()),
         Err(error) => error,
     };
+    // The two answers that are the client's, not the scheduler's.
+    if match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[]) {
+        return SelectionError::Cancelled(error.to_string());
+    }
+    if match_error_chain(error.as_ref(), &[ErrorType::InvalidArgument], &[]) {
+        return SelectionError::BadRequest(error.to_string());
+    }
     let scheduler = if match_error_chain(error.as_ref(), &[ErrorType::DeadlineExceeded], &[]) {
         Some(KvSchedulerError::DeadlineExceeded)
     } else if match_error_chain(error.as_ref(), &[ErrorType::Unavailable], &[]) {
@@ -448,10 +455,20 @@ pub(crate) fn host_error(error: Error, pinned: Option<WorkerId>) -> SelectionErr
 /// the host's one classification (type, queue-deadline reason, overload
 /// cause), so the HTTP status and metrics are those of a direct admission.
 pub(crate) fn frontend_error(error: SelectionError) -> Error {
+    use dynamo_runtime::error::{DynamoError, ErrorType};
+    let classified = |error_type: ErrorType, message: String| -> Error {
+        DynamoError::builder()
+            .error_type(error_type)
+            .message(message)
+            .build()
+            .into()
+    };
     match error {
         // The raw payload again, as a direct admission reports it.
         SelectionError::Scheduler(KvSchedulerError::QueueRejected(rejection)) => rejection.into(),
         SelectionError::Scheduler(scheduler) => crate::kv_router::map_scheduler_error(scheduler),
+        SelectionError::Cancelled(message) => classified(ErrorType::Cancelled, message),
+        SelectionError::BadRequest(message) => classified(ErrorType::InvalidArgument, message),
         other => other.into(),
     }
 }

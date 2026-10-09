@@ -4753,6 +4753,102 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
     let _ = std::fs::remove_file(policy);
 }
 
+/// The two answers that are the client's: a request withdrawn before it was
+/// placed, and a pin on a worker the set does not have. Each crosses the
+/// Router boundary typed and leaves the frontend with the class a direct
+/// admission reports (499 and 400 at the HTTP layer).
+#[tokio::test]
+async fn client_cancellation_and_validation_keep_their_class_through_the_plan_host() {
+    use crate::kv_router::plan_host::{
+        BusyThresholds, HostSetRouter, frontend_error, routing_request,
+    };
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::router::{Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::services::selection::SelectionError;
+    use dynamo_runtime::error::DynamoError;
+
+    let (host, _dispatch, worker_id, _runtime) =
+        router_with_recorded_dispatch("plan-host-client-errors").await;
+    let host = Arc::new(host);
+    let class_of = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<DynamoError>()
+            .unwrap_or_else(|| panic!("a canonical frontend error: {error:?}"))
+            .error_type()
+    };
+    let planned = |request: Context<PreprocessedRequest>| {
+        let host = Arc::clone(&host);
+        async move {
+            let set_router = HostSetRouter::new(
+                host,
+                WorkerType::Aggregated,
+                RequestPhase::Aggregated,
+                &request,
+                false,
+                BusyThresholds::default(),
+            );
+            let req = routing_request(&request, &set_router.partition(), None);
+            let mut plan = Plan::new(
+                PlanId::from(request.id()),
+                set_router.partition(),
+                vec![Stage::new(WorkerType::Aggregated)],
+            )
+            .unwrap();
+            let error = set_router.schedule(&req, &mut plan).await.unwrap_err();
+            assert!(plan.state_of(0).unwrap().is_pending());
+            assert!(set_router.take_side(0).is_none(), "nothing was admitted");
+            error
+        }
+    };
+    let direct = |request: Context<PreprocessedRequest>| {
+        let host = Arc::clone(&host);
+        async move {
+            host.admit_kv_route(
+                &request,
+                RequestPhase::Aggregated,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await
+            .err()
+            .expect("the direct admission is refused")
+        }
+    };
+
+    // Withdrawn before placement.
+    let cancelled = || {
+        let request = Context::new(request());
+        request.context().stop();
+        request
+    };
+    let error = planned(cancelled()).await;
+    assert!(matches!(error, SelectionError::Cancelled(_)), "{error:?}");
+    assert_eq!(
+        class_of(&frontend_error(error)),
+        class_of(&direct(cancelled()).await)
+    );
+
+    // Pinned to a worker the set does not have.
+    let unknown = || {
+        let mut body = request();
+        body.routing_mut().decode_worker_id = Some(worker_id + 1_000);
+        body.routing_mut().dp_rank = Some(0);
+        Context::new(body)
+    };
+    let error = planned(unknown()).await;
+    assert!(matches!(error, SelectionError::BadRequest(_)), "{error:?}");
+    assert_eq!(
+        class_of(&frontend_error(error)),
+        class_of(&direct(unknown()).await)
+    );
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        0,
+        "nothing was charged"
+    );
+}
+
 /// A class with no queue allowance answers with a structured queue
 /// rejection. It crosses the Router boundary as the typed scheduler variant
 /// and leaves the frontend as the same raw payload a direct admission
