@@ -532,7 +532,9 @@ pub const ACTIVE_SEQUENCES_SUBJECT: &str = "active_sequences_events";
 // for worker-local kvindexer query
 pub const WORKER_KV_INDEXER_BUFFER_SIZE: usize = 1024; // store 1024 most recent events in worker buffer
 
-fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
+/// The frontend's canonical form of a scheduler answer: the error type the
+/// HTTP layer and metrics classify on, with the queue-deadline reason.
+pub(crate) fn map_scheduler_error(error: scheduling::KvSchedulerError) -> anyhow::Error {
     // Keep the two overload cases apart. A single overloaded worker can be
     // retried elsewhere; a pool with no free worker cannot, and migrating it
     // would just bounce the request around. A filter rejection is unavailable,

@@ -129,6 +129,18 @@ impl HostSetRouter {
         }
     }
 
+    /// The worker the rendered request pins for this phase, by the host's
+    /// own hint precedence; an overload on it is that worker's, not the set's.
+    fn pinned_worker_id(&self, body: &PreprocessedRequest) -> Option<WorkerId> {
+        let routing = body.routing.as_ref()?;
+        match self.phase {
+            RequestPhase::Prefill => routing.prefill_worker_id.or(routing.backend_instance_id),
+            RequestPhase::Decode | RequestPhase::Aggregated => {
+                routing.decode_worker_id.or(routing.backend_instance_id)
+            }
+        }
+    }
+
     fn exclude(&self, body: &mut PreprocessedRequest, excluded: &HashSet<WorkerId>) {
         if excluded.is_empty() {
             return;
@@ -164,21 +176,20 @@ impl HostSetRouter {
         let work = plan
             .work_of(k)
             .ok_or_else(|| SelectionError::Internal(format!("plan has no stage {k}")))?;
-        // Accounting by the stage's work, as the core's `book_stage` does.
+        // Accounting by the stage's work, from the library's one definition.
         let mut config = body.router_config_override.take().unwrap_or_default();
-        config.track_prefill_tokens = Some(matches!(
-            work,
-            StageWork::PrefillAndDecode | StageWork::PrefillOnly
-        ));
-        match work {
-            StageWork::PrefillOnly => body.routing_mut().expected_output_tokens = Some(1),
-            StageWork::DecodeOnly => {
-                config.assume_kv_reuse = Some(false);
-                if !self.allow_decode_overlap_affinity {
-                    config.overlap_score_credit = Some(0.0);
-                }
-            }
-            StageWork::PrefillAndDecode | StageWork::None => {}
+        let mut expected_output_tokens = body
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.expected_output_tokens);
+        work.apply_to(&mut config, &mut expected_output_tokens);
+        if let Some(expected) = expected_output_tokens {
+            body.routing_mut().expected_output_tokens = Some(expected);
+        }
+        // Normal disaggregation keeps decode routing load-only; conditional
+        // disaggregation lets the base overlap credit apply.
+        if work == StageWork::DecodeOnly && !self.allow_decode_overlap_affinity {
+            config.overlap_score_credit = Some(0.0);
         }
         body.router_config_override = Some(config);
 
@@ -236,7 +247,7 @@ impl Router for HostSetRouter {
             .host
             .preview_kv_route(&rendered, self.phase)
             .await
-            .map_err(host_error)?;
+            .map_err(|error| host_error(error, self.pinned_worker_id(rendered.content())))?;
         let signals = preview.signals;
         let prompt_tokens = req.prompt.token_ids.as_ref().map_or(0, Vec::len);
         let decode_busy = self
@@ -313,12 +324,13 @@ impl Router for HostSetRouter {
             // A previewed pin continues the preview's admission and budget. A
             // caller's pin is on the rendered request's routing hints, where
             // the host validates it as it does today.
+            let pinned = self.pinned_worker_id(rendered.content());
             let route_plan = match (Self::previewed_worker(plan, k), pending) {
                 (Some(previewed), Some((worker, preview))) if worker == previewed => self
                     .host
                     .plan_kv_route_from_preview(&rendered, preview, hold_budget)
                     .await
-                    .map_err(host_error)?,
+                    .map_err(|error| host_error(error, pinned))?,
                 (previewed, _) => self
                     .host
                     .admit_kv_route(
@@ -329,25 +341,26 @@ impl Router for HostSetRouter {
                         hold_budget,
                     )
                     .await
-                    .map_err(host_error)?,
+                    .map_err(|error| host_error(error, pinned))?,
             };
             let descriptor = route_plan.booking_descriptor().ok_or_else(|| {
                 SelectionError::Internal("admitted route has no booking".to_string())
             })?;
-            let worker = route_plan.worker();
+            // The chosen worker's own requirement on its earlier peers is the
+            // one check the forward constraints it was selected under cannot
+            // make; a refused pair is aborted before the host keeps it.
+            let facts = self.facts(route_plan.worker().worker_id);
+            if let Err(error) = plan
+                .check_placement(k, &facts)
+                .and_then(|()| plan.book(k, Booking::Committed(descriptor), facts, None))
+            {
+                route_plan.abort().await;
+                return Err(error.into());
+            }
             let side = StageSide {
                 signals: route_plan.signals,
                 plan: route_plan,
             };
-            if let Err(error) = plan.book(
-                k,
-                Booking::Committed(descriptor),
-                self.facts(worker.worker_id),
-                None,
-            ) {
-                side.plan.abort().await;
-                return Err(SelectionError::Conflict(error.to_string()));
-            }
             self.sidecar.lock().expect("sidecar lock").insert(k, side);
         }
         Ok(())
@@ -395,17 +408,28 @@ pub(crate) fn routing_request(
 /// them through the chain; the plan sees the scheduler variant again, and
 /// `Fallback`, retry logic and budget semantics keep working. Anything else
 /// is internal.
-fn host_error(error: Error) -> SelectionError {
+/// The host's canonical error as the Router contract's typed answer, so the
+/// multi-stage router's fallback and queue logic read it as they read the
+/// core's. [`frontend_error`] is the inverse: the two are the one conversion
+/// pair between the host's classification and the library's.
+pub(crate) fn host_error(error: Error, pinned: Option<WorkerId>) -> SelectionError {
     use dynamo_runtime::error::{ErrorType, match_error_chain};
+    // A scheduler answer the host passed through untouched (a queue rejection
+    // with its payload) keeps its type.
+    let error = match error.downcast::<KvSchedulerError>() {
+        Ok(scheduler) => return SelectionError::Scheduler(scheduler),
+        Err(error) => error,
+    };
     let scheduler = if match_error_chain(error.as_ref(), &[ErrorType::DeadlineExceeded], &[]) {
         Some(KvSchedulerError::DeadlineExceeded)
     } else if match_error_chain(error.as_ref(), &[ErrorType::Unavailable], &[]) {
         Some(KvSchedulerError::AllEligibleWorkersFiltered)
-    } else if match_error_chain(
-        error.as_ref(),
-        &[ErrorType::ResourceExhausted, ErrorType::WorkerOverloaded],
-        &[],
-    ) {
+    } else if match_error_chain(error.as_ref(), &[ErrorType::WorkerOverloaded], &[]) {
+        Some(match pinned {
+            Some(worker_id) => KvSchedulerError::PinnedWorkerOverloaded { worker_id },
+            None => KvSchedulerError::AllEligibleWorkersOverloaded,
+        })
+    } else if match_error_chain(error.as_ref(), &[ErrorType::ResourceExhausted], &[]) {
         Some(KvSchedulerError::AllEligibleWorkersOverloaded)
     } else {
         None
@@ -413,5 +437,15 @@ fn host_error(error: Error) -> SelectionError {
     match scheduler {
         Some(scheduler) => SelectionError::Scheduler(scheduler),
         None => SelectionError::Internal(error.to_string()),
+    }
+}
+
+/// A Router error at the frontend's exit: a scheduler answer goes back through
+/// the host's one classification (type, queue-deadline reason, overload
+/// cause), so the HTTP status and metrics are those of a direct admission.
+pub(crate) fn frontend_error(error: SelectionError) -> Error {
+    match error {
+        SelectionError::Scheduler(scheduler) => crate::kv_router::map_scheduler_error(scheduler),
+        other => other.into(),
     }
 }

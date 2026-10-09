@@ -4692,6 +4692,32 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
         elapsed < Duration::from_millis(500),
         "immediate did not hold: {elapsed:?}"
     );
+    // At the frontend's exit the typed answer goes back through the host's
+    // one classification: the same error type and queue-deadline reason a
+    // direct immediate admission reports (which the HTTP layer maps to 429).
+    {
+        use crate::kv_router::plan_host::frontend_error;
+        use dynamo_runtime::error::DynamoError;
+        let planned = frontend_error(result.unwrap_err());
+        let direct = host
+            .admit_kv_route(
+                &prompt(),
+                RequestPhase::Aggregated,
+                None,
+                CleanupBudget::default(),
+                Some(Duration::ZERO),
+            )
+            .await
+            .err()
+            .expect("a direct immediate admission is rejected too");
+        let classify = |error: &anyhow::Error| {
+            let dynamo = error
+                .downcast_ref::<DynamoError>()
+                .unwrap_or_else(|| panic!("a canonical frontend error: {error:?}"));
+            (dynamo.error_type(), dynamo.reason().clone())
+        };
+        assert_eq!(classify(&planned), classify(&direct));
+    }
 
     // Bounded: parked for its budget, then rejected.
     let (result, elapsed) = attempt(Budget::Bounded(Duration::from_millis(400))).await;

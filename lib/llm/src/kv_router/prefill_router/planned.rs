@@ -23,7 +23,6 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::conditional_disagg::ConditionalDisaggPolicy;
-use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::router::{
     ClassTable, Constraint, Failure, MultiStageRouter, Outcome, Plan, Router, StageList, StageState,
 };
@@ -43,7 +42,10 @@ use super::{
     strip_terminal_disaggregated_params,
 };
 use crate::kv_router::RoutingHost;
-use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, frontend_error, routing_request};
+use crate::kv_router::routing_host::kv_selection::{
+    pinned_worker_hint, resolve_pinned_worker_rank,
+};
 use crate::protocols::common::{
     extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
     llm_backend::{LLMEngineOutput, PreprocessedRequest},
@@ -277,7 +279,7 @@ impl PlannedFlow<'_> {
             .context();
         loop {
             if let Err(error) = multistage.schedule(routing, &mut plan).await {
-                return Err(self.routing_error(error.into()));
+                return Err(self.routing_error(frontend_error(error)));
             }
             let Some(k) = plan.ready().next() else {
                 return Err(anyhow!(
@@ -305,31 +307,32 @@ impl PlannedFlow<'_> {
     /// A worker the caller named for a phase pins that phase's stage, so the
     /// conditional decision keeps remote prefill for an explicit prefill
     /// worker (as the legacy path does) and the host still validates the
-    /// target. Each pin goes to its own set only.
+    /// target. The hint precedence and the rank resolution are the host's
+    /// own: an omitted rank is the worker's unique rank or a rejection, never
+    /// an invented zero. Each pin goes to its own set only.
     fn pin_caller_targets(&self, plan: &mut Plan) -> Result<()> {
         let body = self
             .decode_request
             .as_ref()
             .ok_or_else(|| anyhow!("decode request already consumed"))?
             .content();
-        let Some(routing) = body.routing.as_ref() else {
-            return Ok(());
-        };
-        let pins = [
+        let routing = body.routing.as_ref();
+        let phases = [
             (
                 WorkerType::Prefill,
-                routing.prefill_worker_id,
-                routing.prefill_dp_rank,
+                RequestPhase::Prefill,
+                &self.binding.router,
             ),
-            (
-                WorkerType::Decode,
-                routing.decode_worker_id,
-                routing.dp_rank,
-            ),
+            (WorkerType::Decode, RequestPhase::Decode, self.decode_host),
         ];
-        for (set, worker_id, dp_rank) in pins {
-            let Some(worker_id) = worker_id else { continue };
-            let worker = WorkerWithDpRank::new(worker_id, dp_rank.unwrap_or(0));
+        for (set, phase, host) in phases {
+            let Some((worker_id, dp_rank)) = pinned_worker_hint(phase, routing) else {
+                continue;
+            };
+            let unique_rank = host
+                .kv_router_if_enabled()
+                .and_then(|router| router.unique_dp_rank_for_worker(worker_id));
+            let worker = resolve_pinned_worker_rank(worker_id, dp_rank, unique_rank)?;
             for k in 0..plan.stage_count() {
                 if plan.stage(k).is_some_and(|stage| stage.set == set) {
                     plan.constrain(k, Constraint::Pin(worker))?;
@@ -707,6 +710,7 @@ mod tests {
         distributed: &DistributedRuntime,
         namespace: &str,
         role: &'static str,
+        worker_config: ModelRuntimeConfig,
     ) -> KvSet {
         let endpoint = distributed
             .namespace(namespace.to_string())
@@ -717,8 +721,7 @@ mod tests {
         let client = endpoint.client().await.unwrap();
         endpoint.register_endpoint_instance().await.unwrap();
         let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-        let (_workers_tx, workers) =
-            watch::channel(HashMap::from([(worker_id, ModelRuntimeConfig::default())]));
+        let (_workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
         let config = KvRouterConfig {
             skip_initial_worker_wait: true,
             use_kv_events: false,
@@ -775,14 +778,29 @@ mod tests {
     /// `conditional`: the ISL-bounding policy is on, so an uncached prompt
     /// still goes to remote prefill and a cached one bypasses it.
     async fn fixture_with(namespace: &str, conditional: bool) -> Fixture {
+        fixture_configs(
+            namespace,
+            conditional,
+            ModelRuntimeConfig::default(),
+            ModelRuntimeConfig::default(),
+        )
+        .await
+    }
+
+    async fn fixture_configs(
+        namespace: &str,
+        conditional: bool,
+        prefill_config: ModelRuntimeConfig,
+        decode_config: ModelRuntimeConfig,
+    ) -> Fixture {
         force_plan_host(true);
         let runtime = Runtime::from_current().unwrap();
         let distributed =
             DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
                 .await
                 .unwrap();
-        let prefill = kv_set(&distributed, namespace, "prefill").await;
-        let decode = kv_set(&distributed, namespace, "decode").await;
+        let prefill = kv_set(&distributed, namespace, "prefill", prefill_config).await;
+        let decode = kv_set(&distributed, namespace, "decode", decode_config).await;
         let endpoint_id = dynamo_runtime::protocols::EndpointId {
             namespace: namespace.to_string(),
             component: "prefill".to_string(),
@@ -1239,6 +1257,133 @@ mod tests {
 
     /// Record the whole prompt as cached on `worker_id`, so the decode
     /// preview sees a full prefix hit there.
+    /// The decode worker requires its KV-transfer peers in zone b; the
+    /// prefill worker publishes no zone. The forward constraints prefill
+    /// was selected under cannot see decode's requirement, so the host checks
+    /// the pair before recording decode and aborts the refused route.
+    #[tokio::test]
+    async fn an_incompatible_transfer_pair_is_refused_and_nothing_is_kept() {
+        use dynamo_kv_router::protocols::KvTransferEnforcement;
+        use dynamo_kv_router::router::{ClassTable, MultiStageRouter, StageList};
+        use dynamo_kv_router::services::selection::SelectionError;
+        use std::collections::HashSet;
+
+        use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+        use crate::protocols::common::timing::RequestPhase;
+
+        let fixture = fixture_configs(
+            "plan-host-reverse-transfer",
+            false,
+            ModelRuntimeConfig::default(),
+            ModelRuntimeConfig {
+                taints: HashSet::from(["dynamo.topology/zone=b".to_string()]),
+                topology_domains: HashMap::from([("zone".to_string(), "b".to_string())]),
+                kv_transfer_domain: Some("zone".to_string()),
+                kv_transfer_enforcement: Some(KvTransferEnforcement::Required),
+                ..ModelRuntimeConfig::default()
+            },
+        )
+        .await;
+        let request = Context::new(request());
+        let prefill = Arc::new(HostSetRouter::new(
+            Arc::clone(&fixture.prefill.host),
+            WorkerType::Prefill,
+            RequestPhase::Prefill,
+            &request,
+            false,
+            BusyThresholds::default(),
+        ));
+        let decode = Arc::new(HostSetRouter::new(
+            Arc::clone(&fixture.decode.host),
+            WorkerType::Decode,
+            RequestPhase::Decode,
+            &request,
+            false,
+            BusyThresholds::default(),
+        ));
+        let req = routing_request(&request, &decode.partition(), None);
+        let router = MultiStageRouter::builder()
+            .set(WorkerType::Prefill, Arc::clone(&prefill) as Arc<dyn Router>)
+            .set(WorkerType::Decode, Arc::clone(&decode) as Arc<dyn Router>)
+            .classes(ClassTable::new(StageList::prefill_decode()))
+            .build()
+            .unwrap();
+        let mut plan = router.plan(&req).unwrap();
+        let result = router.schedule(&req, &mut plan).await;
+        assert!(
+            matches!(result, Err(SelectionError::Conflict(_))),
+            "the pair is refused as a placement conflict: {result:?}"
+        );
+        assert!(
+            plan.state_of(1).unwrap().is_pending(),
+            "decode was not recorded"
+        );
+        assert!(
+            decode.take_side(1).is_none(),
+            "the refused route was not kept"
+        );
+        // Prefill's admitted route stays with the host for the caller to
+        // abort, as any booked stage does when a later one fails.
+        prefill
+            .take_side(0)
+            .expect("prefill route")
+            .plan
+            .abort()
+            .await;
+        plan.release().await.unwrap();
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    /// A caller naming a prefill worker without a rank gets that worker's
+    /// unique rank, as the legacy preview resolves it; rank 0 does not exist
+    /// on this worker.
+    #[tokio::test]
+    async fn a_worker_only_prefill_pin_resolves_the_workers_unique_rank() {
+        let fixture = fixture_configs(
+            "plan-host-pin-rank",
+            false,
+            ModelRuntimeConfig {
+                data_parallel_size: 1,
+                data_parallel_start_rank: 3,
+                ..ModelRuntimeConfig::default()
+            },
+            ModelRuntimeConfig::default(),
+        )
+        .await;
+        fixture.prefill.worker.script(vec![bootstrap_frame()]);
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+        let mut body = request();
+        body.routing_mut().prefill_worker_id = Some(fixture.prefill.worker_id);
+
+        let response = fixture
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await
+            .expect("the unique rank is resolved");
+        let frames: Vec<_> = response.collect().await;
+        assert!(
+            frames.iter().all(|frame| frame.err().is_none()),
+            "{frames:?}"
+        );
+        let prefill_seen = fixture.prefill.worker.seen();
+        assert_eq!(prefill_seen.len(), 1, "the named prefill worker ran once");
+        assert_eq!(
+            prefill_seen[0]
+                .1
+                .routing
+                .as_ref()
+                .and_then(|r| r.prefill_dp_rank),
+            Some(3),
+            "the pin carries the worker's own rank"
+        );
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
     async fn seed_prefix(set: &KvSet, tokens: &[u32]) {
         use dynamo_kv_router::indexer::KvIndexerInterface;
         use dynamo_kv_router::protocols::{
