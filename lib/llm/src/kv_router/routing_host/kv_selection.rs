@@ -390,7 +390,7 @@ fn merge_affinity_pin(
     }
 }
 
-fn resolve_pinned_worker_rank(
+pub(crate) fn resolve_pinned_worker_rank(
     worker_id: WorkerId,
     requested_dp_rank: Option<u32>,
     unique_dp_rank: Option<u32>,
@@ -404,7 +404,7 @@ fn resolve_pinned_worker_rank(
     Ok(WorkerWithDpRank::new(worker_id, dp_rank))
 }
 
-fn pinned_worker_hint(
+pub(crate) fn pinned_worker_hint(
     phase: RequestPhase,
     routing: Option<&RoutingHints>,
 ) -> Option<(u64, Option<u32>)> {

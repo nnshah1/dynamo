@@ -48,7 +48,7 @@ use crate::{
 mod builtin;
 mod cancellation;
 mod kv;
-mod kv_selection;
+pub(crate) mod kv_selection;
 mod occupancy;
 mod request_guard;
 
