@@ -209,7 +209,7 @@ impl SelectionCore {
         };
         let worker = selected.response.best_worker;
         let is_exported = matches!(booking, Booking::Committed(_));
-        let recorded = Self::record_stage(plan, k, &entry, booking, worker, selected.kv_hint);
+        let recorded = Self::record_stage(plan, k, &entry, booking, worker);
         // Until the plan holds it, the booking is this call's to roll back. A
         // leased handle freed itself when `booking` dropped above; an
         // exported one sits in the reservation index and is freed here.
@@ -235,7 +235,6 @@ impl SelectionCore {
         entry: &SelectionEntry,
         booking: Booking,
         worker: WorkerWithDpRank,
-        kv_hint: Option<crate::kv_hints::KvHint>,
     ) -> Result<(), SelectionError> {
         // The worker was in the snapshot the selector read an instant ago;
         // missing now means it just left, and a booking on it is useless.
@@ -251,7 +250,7 @@ impl SelectionCore {
                 ))
             })?;
         plan.check_placement(k, &config)?;
-        plan.book(k, booking, config, kv_hint)
+        plan.book(k, booking, config)
             .map_err(|error| SelectionError::Internal(error.to_string()))
     }
 }
