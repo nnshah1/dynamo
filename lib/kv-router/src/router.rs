@@ -21,7 +21,7 @@ pub use booking::Booking;
 pub use placement::{TOPOLOGY_TAINT_PREFIX, topology_taint};
 pub use plan::{
     Budget, Constraint, DomainMode, Failure, Plan, PlanError, PlanId, PlanState, Retry, SkipRule,
-    Stage, StageAttempt, StageState, StageWork, When, WorkerConfig,
+    Stage, StageAttempt, StageScoring, StageState, StageWork, When, WorkerConfig,
 };
 
 #[cfg(feature = "standalone-selection")]

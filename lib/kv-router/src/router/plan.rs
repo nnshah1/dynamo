@@ -174,6 +174,28 @@ impl StageWork {
     }
 }
 
+/// How a stage's set scores its candidates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StageScoring {
+    /// The set's configured cache credit applies.
+    CacheAware,
+    /// Load alone: the prompt's KV comes from elsewhere, so a candidate's
+    /// cache of it earns no credit.
+    LoadOnly,
+}
+
+impl StageScoring {
+    /// The scorer's cache credit for a stage, in the scheduler's
+    /// request-level terms. Like [`StageWork::apply_to`], this replaces the
+    /// request's own override for that field.
+    pub fn apply_to(self, config: &mut RouterConfigOverride) {
+        config.overlap_score_credit = match self {
+            StageScoring::CacheAware => None,
+            StageScoring::LoadOnly => Some(0.0),
+        };
+    }
+}
+
 /// When the router skips a stage instead of booking it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipRule {
@@ -256,6 +278,8 @@ pub struct Stage {
     pub skip: Option<SkipRule>,
     /// Overrides the accounting derived from the set; see [`Plan::work_of`].
     pub work: Option<StageWork>,
+    /// Overrides the scoring derived from the work; see [`Plan::scoring_of`].
+    pub scoring: Option<StageScoring>,
 }
 
 impl Stage {
@@ -268,6 +292,7 @@ impl Stage {
             constraints: Vec::new(),
             skip: None,
             work: None,
+            scoring: None,
         }
     }
 
@@ -566,6 +591,23 @@ impl Plan {
                 } else {
                     StageWork::PrefillAndDecode
                 }
+            }
+        })
+    }
+
+    /// How stage `k`'s set scores its candidates: the stage's own `scoring`,
+    /// else by work. A stage that only decodes receives its prompt's KV from
+    /// the prefill stage, so it is placed on load alone; every other stage
+    /// keeps its set's configured cache credit.
+    pub fn scoring_of(&self, k: usize) -> Option<StageScoring> {
+        let slot = self.slots.get(k)?;
+        if let Some(scoring) = slot.stage.scoring {
+            return Some(scoring);
+        }
+        Some(match self.work_of(k)? {
+            StageWork::DecodeOnly => StageScoring::LoadOnly,
+            StageWork::PrefillAndDecode | StageWork::PrefillOnly | StageWork::None => {
+                StageScoring::CacheAware
             }
         })
     }
