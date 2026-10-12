@@ -162,7 +162,7 @@ fn prompt() -> PromptRequest {
     }
 }
 
-fn select_request() -> SelectRequest {
+pub(super) fn select_request() -> SelectRequest {
     SelectRequest {
         model_name: "model".to_string(),
         routing_group: "default".to_string(),
