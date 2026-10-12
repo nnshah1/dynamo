@@ -581,8 +581,9 @@ impl Plan {
         if slot.state != StageState::Booked {
             return None;
         }
+        slot.booked_at.map(|booked_at| booked_at.elapsed())
+    }
 
-    /// The worker stage `k` is booked on.
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {

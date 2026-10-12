@@ -14,8 +14,8 @@ use super::*;
 use crate::conditional_disagg::{ConditionalDisaggDecisionInput, ConditionalDisaggPolicy};
 use crate::protocols::PotentialLoad;
 use crate::router::{
-    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Outcome, Plan, Router, SkipRule,
-    Stage, StageList, StageState, When, topology_taint,
+    ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Plan, Router, SkipRule, Stage,
+    StageList, StageState, When, topology_taint,
 };
 use crate::scheduling::KvSchedulerError;
 
@@ -114,15 +114,7 @@ fn same_zone_as(stage: usize) -> Constraint {
 fn run(plan: &mut crate::router::Plan, k: usize) {
     let attempt = plan.dispatch(k).expect("ready to dispatch");
     let worker = plan.worker(k).expect("booked");
-    plan.complete(
-        k,
-        attempt,
-        Outcome {
-            worker,
-            kv_hint: None,
-        },
-    )
-    .expect("complete");
+    plan.complete(k, attempt, worker).expect("complete");
 }
 
 #[tokio::test]
