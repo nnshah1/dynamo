@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
-use crate::kv_hints::KvHint;
 use std::sync::Arc;
 
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
@@ -177,8 +176,6 @@ impl StageWork {
 pub enum SkipRule {
     /// No multimodal input (an encode stage).
     NoMultimodal,
-    /// The decode worker already holds the prefix (a prefill stage).
-    DecodeHoldsPrefix,
     /// The stage's worker set is busier than this fraction.
     SetBusy(f64),
     /// The conditional-disaggregation policy and decode-busy gate.
@@ -189,14 +186,6 @@ pub enum SkipRule {
 /// booking so a later stage's placement rules (taints, topology domains,
 /// KV-transfer domain) can still read it if the worker has left discovery.
 pub type WorkerConfig = Arc<dyn WorkerConfigLike + Send + Sync>;
-
-/// Routing facts a host records when a stage completes. Engine-opaque data
-/// never enters the plan.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Outcome {
-    pub worker: WorkerWithDpRank,
-    pub kv_hint: Option<KvHint>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
@@ -220,7 +209,8 @@ pub enum StageState {
     /// Dispatched, and it has produced what its dependents need (bootstrap
     /// info, a first output) while it is still running.
     HandedOff(StageAttempt),
-    Completed(Outcome),
+    /// Finished on this worker.
+    Completed(WorkerWithDpRank),
     Failed(StageAttempt, Failure),
     Skipped,
 }
@@ -297,7 +287,6 @@ struct Slot {
     state: StageState,
     booking: Option<Booking>,
     config: Option<WorkerConfig>,
-    kv_hint: Option<KvHint>,
     attempt: StageAttempt,
     /// Attempts the host reported failed and retried; a limit counts these,
     /// not re-placements caused by another stage's failure.
@@ -313,7 +302,6 @@ impl std::fmt::Debug for Slot {
             .field("state", &self.state)
             .field("booking", &self.booking)
             .field("has_config", &self.config.is_some())
-            .field("kv_hint", &self.kv_hint)
             .field("attempt", &self.attempt)
             .field("failures", &self.failures)
             .field("last_worker", &self.last_worker)
@@ -328,7 +316,6 @@ impl Slot {
             state: StageState::Pending,
             booking: None,
             config: None,
-            kv_hint: None,
             attempt: StageAttempt::FIRST,
             failures: 0,
             last_worker: None,
@@ -338,7 +325,6 @@ impl Slot {
     fn reset(&mut self, state: StageState) -> Option<Booking> {
         self.state = state;
         self.config = None;
-        self.kv_hint = None;
         self.booking.take()
     }
 }
@@ -453,10 +439,6 @@ impl Plan {
         self.slots.len()
     }
 
-    pub fn stages(&self) -> impl Iterator<Item = &Stage> {
-        self.slots.iter().map(|slot| &slot.stage)
-    }
-
     pub fn stage(&self, k: usize) -> Option<&Stage> {
         self.slots.get(k).map(|slot| &slot.stage)
     }
@@ -485,19 +467,6 @@ impl Plan {
         self.slots.get(k)?.config.as_deref()
     }
 
-    /// The KV hint the router attached to stage `k`'s booking; the host
-    /// forwards it with the request.
-    pub fn kv_hint(&self, k: usize) -> Option<&KvHint> {
-        self.slots.get(k)?.kv_hint.as_ref()
-    }
-
-    pub fn outcome(&self, k: usize) -> Option<&Outcome> {
-        match &self.slots.get(k)?.state {
-            StageState::Completed(outcome) => Some(outcome),
-            _ => None,
-        }
-    }
-
     /// The worker stage `k` is booked on.
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
@@ -521,10 +490,6 @@ impl Plan {
             }
         }
         state
-    }
-
-    pub fn has_pending(&self) -> bool {
-        self.slots.iter().any(|slot| slot.state.is_pending())
     }
 
     /// Pending stages the router can book on this `schedule` call: their
@@ -636,9 +601,8 @@ impl Plan {
         }
     }
 
-    /// Record the booking the router made for stage `k`, the worker's
-    /// configuration a later stage's placement rules read, and the KV hint
-    /// the host forwards. `Pin`
+    /// Record the booking the router made for stage `k` and the worker's
+    /// configuration a later stage's placement rules read. `Pin`
     /// and `Exclude` are enforced here. A rejected booking drops and
     /// releases itself.
     pub fn book(
@@ -646,7 +610,6 @@ impl Plan {
         k: usize,
         booking: Booking,
         config: WorkerConfig,
-        kv_hint: Option<KvHint>,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
         if !self.slots[k].state.is_pending() {
@@ -661,7 +624,6 @@ impl Plan {
         slot.last_worker = Some(worker);
         slot.booking = Some(booking);
         slot.config = Some(config);
-        slot.kv_hint = kv_hint;
         slot.state = StageState::Booked;
         Ok(())
     }
@@ -704,7 +666,6 @@ impl Plan {
         slot.last_worker = Some(worker);
         slot.booking = None;
         slot.config = Some(config);
-        slot.kv_hint = None;
         slot.state = StageState::Booked;
         Ok(())
     }
@@ -767,13 +728,13 @@ impl Plan {
         Ok(())
     }
 
-    /// Stage `k`'s attempt finished with routing facts. The booking stays
-    /// held until `release`. Idempotent for the current attempt.
+    /// Stage `k`'s attempt finished on `worker`. The booking stays held
+    /// until `release`. Idempotent for the current attempt.
     pub fn complete(
         &mut self,
         k: usize,
         attempt: StageAttempt,
-        outcome: Outcome,
+        worker: WorkerWithDpRank,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
         self.check_attempt(k, attempt)?;
@@ -787,8 +748,8 @@ impl Plan {
                 return Err(self.invalid_transition(k, "complete"));
             }
         }
-        debug_assert_eq!(self.slots[k].last_worker, Some(outcome.worker));
-        self.slots[k].state = StageState::Completed(outcome);
+        debug_assert_eq!(self.slots[k].last_worker, Some(worker));
+        self.slots[k].state = StageState::Completed(worker);
         Ok(())
     }
 
