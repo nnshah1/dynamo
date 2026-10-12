@@ -189,7 +189,7 @@ fn a_deferred_stage_is_booked_only_after_its_input_completes() {
         Some(PlanError::InputsNotReady { stage: 1 })
     );
 
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
     assert_eq!(p.state(), PlanState::Dispatched);
     assert_eq!(vec_of(p.ready()), Vec::<usize>::new());
     p.complete(0, attempt, worker(11)).unwrap();
@@ -243,11 +243,11 @@ fn booking_order_and_execution_order_are_independent() {
     .unwrap();
     assert_eq!(vec_of(p.ready()), vec![0]);
     assert_eq!(
-        p.dispatch(1).err(),
+        p.mark_dispatched(1).err(),
         Some(PlanError::InputsNotReady { stage: 1 }),
         "decode waits for prefill's outcome"
     );
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
     p.complete(0, attempt, worker(11)).unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
 
@@ -277,7 +277,7 @@ fn booking_order_and_execution_order_are_independent() {
     )
     .unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
-    let attempt = p.dispatch(1).unwrap();
+    let attempt = p.mark_dispatched(1).unwrap();
     p.complete(1, attempt, worker(11)).unwrap();
     assert_eq!(vec_of(p.ready()), vec![0]);
 
@@ -347,7 +347,7 @@ fn fail_releases_the_stage_and_every_booked_stage_that_reads_it() {
         None,
     )
     .unwrap();
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
 
     p.fail(0, attempt, failure(true)).unwrap();
     assert_eq!(
@@ -387,9 +387,9 @@ fn fail_releases_the_stage_and_every_booked_stage_that_reads_it() {
         None,
     )
     .unwrap();
-    let prefill = p.dispatch(1).unwrap();
+    let prefill = p.mark_dispatched(1).unwrap();
     p.complete(1, prefill, worker(11)).unwrap();
-    let decode = p.dispatch(0).unwrap();
+    let decode = p.mark_dispatched(0).unwrap();
     // The host reports the prefill KV lost after decode started; only
     // decode could still read it and decode is already dispatched.
     assert_eq!(
@@ -422,7 +422,7 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         None,
     )
     .unwrap();
-    let first = p.dispatch(0).unwrap();
+    let first = p.mark_dispatched(0).unwrap();
     p.fail(0, first, failure(true)).unwrap();
 
     assert_eq!(
@@ -462,7 +462,7 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         None,
     )
     .unwrap();
-    let second = p.dispatch(0).unwrap();
+    let second = p.mark_dispatched(0).unwrap();
     assert_eq!(second, first.next());
 
     let stale = PlanError::StaleAttempt {
@@ -499,7 +499,7 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         None,
     )
     .unwrap();
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
     p.fail(0, attempt, failure(true)).unwrap();
     assert!(matches!(
         p.retry(0),
@@ -527,7 +527,7 @@ fn fail_follows_inputs_that_point_forward() {
         p.book(k, booking("b", worker(w), &releases), zone("a"), None, None)
             .unwrap();
     }
-    let attempt = p.dispatch(2).unwrap();
+    let attempt = p.mark_dispatched(2).unwrap();
     p.fail(2, attempt, failure(true)).unwrap();
     assert!(state(&p, 1).is_pending());
     assert!(
@@ -592,7 +592,7 @@ fn terminal_events_are_idempotent_for_the_current_attempt_and_otherwise_rejected
         ),
         "a booked stage was never dispatched"
     );
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
     p.complete(0, attempt, worker(11)).unwrap();
     p.complete(0, attempt, worker(11)).unwrap();
     assert!(matches!(
@@ -654,7 +654,7 @@ async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
         None,
     )
     .unwrap();
-    let attempt = p.dispatch(0).unwrap();
+    let attempt = p.mark_dispatched(0).unwrap();
     p.complete(0, attempt, worker(11)).unwrap();
     p.release().await.unwrap();
     assert_eq!(
@@ -693,7 +693,7 @@ async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
             None,
         )
         .unwrap();
-        let _ = p.dispatch(0).unwrap();
+        let _ = p.mark_dispatched(0).unwrap();
     }
     assert_eq!(releases.load(Ordering::SeqCst), 6);
 
@@ -742,12 +742,12 @@ fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
         None,
     )
     .unwrap();
-    let prefill = p.dispatch(1).unwrap();
+    let prefill = p.mark_dispatched(1).unwrap();
     // Cancellation arrives here. Nothing on the plan changes.
     assert_eq!(state(&p, 0), &StageState::Booked);
     p.complete(1, prefill, worker(11)).unwrap();
     assert_eq!(vec_of(p.ready()), vec![0]);
-    let decode = p.dispatch(0).unwrap();
+    let decode = p.mark_dispatched(0).unwrap();
     p.complete(0, decode, worker(21)).unwrap();
     drop(p);
     assert_eq!(releases.load(Ordering::SeqCst), 2);
@@ -769,7 +769,7 @@ fn a_taken_booking_belongs_to_the_host_and_is_released_once() {
     );
     assert_eq!(state(&plan, 0), &StageState::Booked);
     // Failing the stage afterwards must not touch the moved booking.
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     plan.fail(0, attempt, failure(true)).unwrap();
     assert_eq!(releases.load(Ordering::SeqCst), 0);
     drop(plan);
@@ -818,7 +818,7 @@ fn an_untracked_booking_records_the_worker_without_a_handle() {
         plan.take_booking(0),
         Err(PlanError::InvalidTransition { .. })
     ));
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     plan.complete(0, attempt, worker(31)).unwrap();
     assert!(plan.ready().next().is_none(), "prefill is not booked yet");
     // Only a stage that does no scheduler work may be untracked.
@@ -835,7 +835,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
     plan.book(0, booking("p", worker(1), &releases), plain(), None, None)
         .unwrap();
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     // A rejected booking drops and releases itself; count it apart.
     let rejected = Arc::new(AtomicUsize::new(0));
     assert!(
@@ -851,7 +851,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     plan.book(1, booking("d", worker(2), &releases), plain(), None, None)
         .unwrap();
     assert_eq!(vec_of(plan.ready()), vec![1]);
-    let decode_attempt = plan.dispatch(1).unwrap();
+    let decode_attempt = plan.mark_dispatched(1).unwrap();
     assert_eq!(plan.state(), PlanState::Dispatched);
     // Late prefill failure: decode is running on a worker; it is not reset.
     plan.fail(0, attempt, failure(false)).unwrap();
@@ -867,7 +867,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     let mut ok = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
     ok.book(0, booking("p", worker(1), &releases), plain(), None, None)
         .unwrap();
-    let a = ok.dispatch(0).unwrap();
+    let a = ok.mark_dispatched(0).unwrap();
     ok.handoff(0, a).unwrap();
     ok.complete(0, a, worker(1)).unwrap();
     assert!(matches!(state(&ok, 0), StageState::Completed(_)));
@@ -886,7 +886,7 @@ fn handoff_is_fenced_by_attempt_and_state() {
         ),
         "not dispatched yet"
     );
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     assert!(matches!(
         plan.handoff(0, attempt.next()),
         Err(PlanError::StaleAttempt { .. })
@@ -941,7 +941,7 @@ fn a_placement_read_needs_the_peers_facts_not_its_booking() {
         )
         .unwrap();
     let taken = transferred.take_booking(0).unwrap();
-    let attempt = transferred.dispatch(0).unwrap();
+    let attempt = transferred.mark_dispatched(0).unwrap();
     assert!(
         vec_of(transferred.schedulable()).is_empty(),
         "decode waits for the handoff"
@@ -985,7 +985,7 @@ fn the_kv_hint_travels_with_the_booking_and_clears_with_the_attempt() {
 
     // A failed attempt loses its placement and its hint; the replacement
     // attempt's booking carries its own.
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     plan.fail(0, attempt, failure(true)).unwrap();
     assert!(plan.kv_hint(0).is_none(), "a failed attempt's hint is gone");
     plan.retry(0).unwrap();
@@ -1036,7 +1036,7 @@ fn the_schedulers_answer_is_kept_with_the_booking_and_clears_with_it() {
         plan.scheduling(0).map(|r| r.potential_decode_blocks),
         Some(7)
     );
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     plan.fail(0, attempt, failure(true)).unwrap();
     assert!(
         plan.scheduling(0).is_none(),

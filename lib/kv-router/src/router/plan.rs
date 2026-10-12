@@ -780,10 +780,10 @@ impl Plan {
     }
 
     /// The host forwarded stage `k`. Returns the attempt its events must name.
-    pub fn dispatch(&mut self, k: usize) -> Result<StageAttempt, PlanError> {
+    pub fn mark_dispatched(&mut self, k: usize) -> Result<StageAttempt, PlanError> {
         self.check_index(k)?;
         if self.slots[k].state != StageState::Booked {
-            return Err(self.invalid_transition(k, "dispatch"));
+            return Err(self.invalid_transition(k, "mark dispatched"));
         }
         if !self.inputs_settled(k) {
             return Err(PlanError::InputsNotReady { stage: k });
