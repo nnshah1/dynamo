@@ -384,10 +384,8 @@ impl Router for KvRouterSetRouter {
                 .await
                 .map_err(|error| host_error(error, pinned.map(|worker| worker.worker_id)))?;
             let (outcome, handle) = admitted.into_parts();
-            let (worker, kv_hint) = match outcome {
-                FindBestMatchOutcome::Routed {
-                    worker, kv_hint, ..
-                } => (worker, kv_hint),
+            let worker = match outcome {
+                FindBestMatchOutcome::Routed { worker, .. } => worker,
                 FindBestMatchOutcome::QueueRejected { rejection } => {
                     // Nothing was booked; a handle, if any, frees itself on drop.
                     drop(handle);
@@ -410,7 +408,7 @@ impl Router for KvRouterSetRouter {
             // make; a refused pair frees the exported booking by its id.
             let recorded = self.worker_config(worker.worker_id).and_then(|config| {
                 plan.check_placement(k, &config)?;
-                plan.book(k, Booking::Committed(descriptor), config, kv_hint)?;
+                plan.book(k, Booking::Committed(descriptor), config)?;
                 Ok(())
             });
             if let Err(error) = recorded {
