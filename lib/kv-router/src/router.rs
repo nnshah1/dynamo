@@ -22,8 +22,8 @@ pub use booking::Booking;
 pub use class_table::{ClassTable, DEFAULT_DEFERRED_WAIT, Fallback, StageList};
 pub use placement::{TOPOLOGY_TAINT_PREFIX, topology_taint};
 pub use plan::{
-    Budget, Constraint, DomainMode, Failure, Outcome, Plan, PlanError, PlanId, PlanState, Retry,
-    SkipRule, Stage, StageAttempt, StageState, StageWork, When, WorkerConfig,
+    Budget, Constraint, DomainMode, Failure, Plan, PlanError, PlanId, PlanState, Retry, SkipRule,
+    Stage, StageAttempt, StageState, StageWork, When, WorkerConfig,
 };
 
 #[cfg(all(feature = "standalone-selection", any(test, feature = "testing")))]
