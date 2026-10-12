@@ -112,9 +112,9 @@ fn same_zone_as(stage: usize) -> Constraint {
 
 /// Forward stage `k` and report its outcome.
 fn run(plan: &mut crate::router::Plan, k: usize) {
-    let attempt = plan.dispatch(k).expect("ready to dispatch");
+    let attempt = plan.mark_dispatched(k).expect("ready to dispatch");
     let worker = plan.worker(k).expect("booked");
-    plan.complete(k, attempt, worker).expect("complete");
+    plan.mark_completed(k, attempt, worker).expect("complete");
 }
 
 #[tokio::test]
@@ -205,8 +205,8 @@ async fn a_decode_core_that_does_not_track_prefill_still_pays_for_a_bypass() {
     );
 
     // Retried onto the other, uncached worker: the charge moves with it.
-    let attempt = plan.dispatch(1).unwrap();
-    plan.fail(
+    let attempt = plan.mark_dispatched(1).unwrap();
+    plan.mark_failed(
         1,
         attempt,
         Failure {

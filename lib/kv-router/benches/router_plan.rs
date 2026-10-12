@@ -179,9 +179,9 @@ async fn drive(router: &dyn Router, req: &SelectAndReserveRequest) -> Plan {
             break;
         }
         for k in ready {
-            let attempt = plan.dispatch(k).expect("dispatch");
+            let attempt = plan.mark_dispatched(k).expect("dispatch");
             let worker = plan.worker(k).expect("worker");
-            plan.complete(k, attempt, worker).expect("complete");
+            plan.mark_completed(k, attempt, worker).expect("complete");
         }
     }
     assert!(!plan.has_pending(), "a stage was never booked");
