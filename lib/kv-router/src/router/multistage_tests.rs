@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The DEP #15457 request flows, placement rules and failure matrix over
-//! the fake per-set router: one test per row of tmonty12/dynamo's
-//! `coordinator_tests.rs`, same names and order, then the rows the Plan adds.
+//! The disaggregated request flows, placement rules and failure matrix over
+//! the fake per-set router: admission, handoff, cancellation, retry, fallback
+//! and placement, one test per row, then the rows the Plan adds.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -239,7 +239,7 @@ fn run(plan: &mut Plan, k: usize) -> StageAttempt {
 }
 
 // ---------------------------------------------------------------------------
-// Request flows (DEP §5)
+// Request flows
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -516,7 +516,7 @@ async fn encode_prefill_decode_skips_encode_without_multimodal_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-stage constraints (DEP §4.5)
+// Cross-stage constraints
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -606,7 +606,7 @@ async fn caller_restrictions_apply_only_to_the_named_stage() {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle and correctness (DEP §6) and the failure-injection matrix
+// Lifecycle and correctness, and the failure-injection matrix
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -990,7 +990,7 @@ async fn preview_is_refused_for_a_stage_without_preview_support() {
 }
 
 #[tokio::test]
-async fn registry_built_policies_drive_the_coordinator() {
+async fn registry_built_policies_drive_the_multistage_router() {
     let fixture = Fixture::new();
     let config = RouterPolicyConfig::from_yaml(
         r#"
