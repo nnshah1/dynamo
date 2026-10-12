@@ -105,14 +105,23 @@ impl HostSetRouter {
         self.host.kv_router().selection.partition_key().clone()
     }
 
-    fn facts(&self, worker_id: WorkerId) -> WorkerFacts {
+    /// The admitted worker's placement facts, captured now for the stages
+    /// placed against it later. The worker was in the set an instant ago;
+    /// missing now means it just left, and a booking on it is useless, so
+    /// the stage is refused rather than recorded as a worker with no
+    /// placement requirements (as the core does).
+    pub(crate) fn facts(&self, worker_id: WorkerId) -> Result<WorkerFacts, SelectionError> {
         self.host
             .kv_router()
             .workers_with_configs
             .borrow()
             .get(&worker_id)
             .map(WorkerFacts::from_config)
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                SelectionError::Internal(format!(
+                    "selected worker {worker_id} left the set before it could be booked"
+                ))
+            })
     }
 
     fn pin(&self, body: &mut PreprocessedRequest, worker: WorkerWithDpRank) {
@@ -349,13 +358,14 @@ impl Router for HostSetRouter {
             // The chosen worker's own requirement on its earlier peers is the
             // one check the forward constraints it was selected under cannot
             // make; a refused pair is aborted before the host keeps it.
-            let facts = self.facts(route_plan.worker().worker_id);
-            if let Err(error) = plan
-                .check_placement(k, &facts)
-                .and_then(|()| plan.book(k, Booking::Committed(descriptor), facts, None))
-            {
+            let recorded = self.facts(route_plan.worker().worker_id).and_then(|facts| {
+                plan.check_placement(k, &facts)?;
+                plan.book(k, Booking::Committed(descriptor), facts, None)?;
+                Ok(())
+            });
+            if let Err(error) = recorded {
                 route_plan.abort().await;
-                return Err(error.into());
+                return Err(error);
             }
             let side = StageSide {
                 signals: route_plan.signals,
