@@ -165,13 +165,13 @@ fn a_deferred_stage_is_booked_only_after_its_input_completes() {
     assert_eq!(p.state(), PlanState::Planned);
     assert_eq!(vec_of(p.schedulable()), vec![0]);
 
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(p.state(), PlanState::Booked);
     assert_eq!(vec_of(p.ready()), vec![0]);
     assert_eq!(vec_of(p.schedulable()), Vec::<usize>::new());
     assert_eq!(
-        p.book(1, booking("early", worker(21), &releases), zone("a"))
+        p.book(1, booking("early", worker(21), &releases), zone("a"), None)
             .err(),
         Some(PlanError::InputsNotReady { stage: 1 })
     );
@@ -183,7 +183,7 @@ fn a_deferred_stage_is_booked_only_after_its_input_completes() {
     assert_eq!(vec_of(p.schedulable()), vec![1]);
     assert_eq!(zone_of(&p, 0).as_deref(), Some("a"));
 
-    p.book(1, booking("d", worker(21), &releases), zone("a"))
+    p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
     assert!(!p.has_pending());
@@ -205,10 +205,10 @@ fn booking_order_and_execution_order_are_independent() {
         vec![0],
         "decode reads prefill's worker"
     );
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.schedulable()), vec![1]);
-    p.book(1, booking("d", worker(21), &releases), zone("a"))
+    p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.ready()), vec![0]);
     assert_eq!(
@@ -223,7 +223,7 @@ fn booking_order_and_execution_order_are_independent() {
     // Decode first: booked first, forwarded last.
     let mut p = plan(decode_first());
     assert_eq!(vec_of(p.schedulable()), vec![0]);
-    p.book(0, booking("d", worker(21), &releases), zone("a"))
+    p.book(0, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.schedulable()), vec![1]);
     assert_eq!(
@@ -231,7 +231,7 @@ fn booking_order_and_execution_order_are_independent() {
         Vec::<usize>::new(),
         "decode waits for prefill"
     );
-    p.book(1, booking("p", worker(11), &releases), zone("a"))
+    p.book(1, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
     let attempt = p.dispatch(1).unwrap();
@@ -251,7 +251,7 @@ fn booking_order_and_execution_order_are_independent() {
     ]);
     p.skip(0).unwrap();
     assert_eq!(vec_of(p.schedulable()), vec![1]);
-    p.book(1, booking("p", worker(11), &releases), zone("a"))
+    p.book(1, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
 }
@@ -274,11 +274,11 @@ fn fail_releases_the_stage_and_every_booked_stage_that_reads_it() {
             ..Stage::new(WorkerType::Decode)
         },
     ]);
-    p.book(0, booking("e", worker(31), &releases), zone("a"))
+    p.book(0, booking("e", worker(31), &releases), zone("a"), None)
         .unwrap();
-    p.book(1, booking("p", worker(11), &releases), zone("a"))
+    p.book(1, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
-    p.book(2, booking("d", worker(21), &releases), zone("a"))
+    p.book(2, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     let attempt = p.dispatch(0).unwrap();
 
@@ -304,9 +304,9 @@ fn fail_releases_the_stage_and_every_booked_stage_that_reads_it() {
 
     // A dispatched dependent is in flight and is kept.
     let mut p = plan(decode_first());
-    p.book(0, booking("d", worker(21), &releases), zone("a"))
+    p.book(0, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
-    p.book(1, booking("p", worker(11), &releases), zone("a"))
+    p.book(1, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     let prefill = p.dispatch(1).unwrap();
     p.complete(1, prefill, worker(11)).unwrap();
@@ -335,7 +335,7 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         p.retry(0),
         Err(PlanError::InvalidTransition { .. })
     ));
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     let first = p.dispatch(0).unwrap();
     p.fail(0, first, failure(true)).unwrap();
@@ -356,14 +356,14 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         "the router's own pin to the failed worker is dropped with it"
     );
     assert_eq!(
-        p.book(0, booking("again", worker(11), &releases), zone("a"))
+        p.book(0, booking("again", worker(11), &releases), zone("a"), None)
             .err(),
         Some(PlanError::ConstraintViolated {
             stage: 0,
             worker: worker(11)
         })
     );
-    p.book(0, booking("p2", worker(12), &releases), zone("a"))
+    p.book(0, booking("p2", worker(12), &releases), zone("a"), None)
         .unwrap();
     let second = p.dispatch(0).unwrap();
     assert_eq!(second, first.next());
@@ -394,7 +394,7 @@ fn retry_excludes_the_failed_worker_and_fences_the_old_attempt() {
         constraints: vec![Constraint::Pin(worker(11))],
         ..Stage::new(WorkerType::Prefill)
     }]);
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     let attempt = p.dispatch(0).unwrap();
     p.fail(0, attempt, failure(true)).unwrap();
@@ -421,7 +421,7 @@ fn fail_follows_inputs_that_point_forward() {
         Stage::new(WorkerType::Encode),
     ]);
     for (k, w) in [(0, 21), (1, 11), (2, 31)] {
-        p.book(k, booking("b", worker(w), &releases), zone("a"))
+        p.book(k, booking("b", worker(w), &releases), zone("a"), None)
             .unwrap();
     }
     let attempt = p.dispatch(2).unwrap();
@@ -455,7 +455,7 @@ fn work_follows_the_set_unless_the_prefill_was_skipped() {
         "no remote prefill: decode does it"
     );
     assert_eq!(p.due().collect::<Vec<_>>(), vec![1]);
-    p.book(1, booking("d", worker(21), &releases), zone("a"))
+    p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     let explicit = plan(vec![Stage {
         work: Some(StageWork::None),
@@ -468,7 +468,7 @@ fn work_follows_the_set_unless_the_prefill_was_skipped() {
 fn terminal_events_are_idempotent_for_the_current_attempt_and_otherwise_rejected() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut p = plan(vec![Stage::new(WorkerType::Prefill)]);
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert!(
         matches!(
@@ -487,7 +487,7 @@ fn terminal_events_are_idempotent_for_the_current_attempt_and_otherwise_rejected
 
     // The host may decline to dispatch a booked stage: that is a failure.
     let mut p = plan(vec![Stage::new(WorkerType::Prefill)]);
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     let attempt = p.attempt(0).unwrap();
     p.fail(0, attempt, failure(false)).unwrap();
@@ -503,17 +503,17 @@ fn terminal_events_are_idempotent_for_the_current_attempt_and_otherwise_rejected
 async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut p = plan(prefill_decode(When::Now, Budget::Immediate));
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     assert!(
         matches!(
-            p.book(0, booking("dup", worker(12), &releases), zone("a")),
+            p.book(0, booking("dup", worker(12), &releases), zone("a"), None),
             Err(PlanError::InvalidTransition { .. })
         ),
         "a held stage keeps its booking"
     );
     assert_eq!(p.worker(0), Some(worker(11)));
-    p.book(1, booking("d", worker(21), &releases), zone("a"))
+    p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     let attempt = p.dispatch(0).unwrap();
     p.complete(0, attempt, worker(11)).unwrap();
@@ -525,16 +525,16 @@ async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
     );
 
     let mut p = plan(prefill_decode(When::Now, Budget::Immediate));
-    p.book(0, booking("p", worker(11), &releases), zone("a"))
+    p.book(0, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     p.abort();
     assert_eq!(releases.load(Ordering::SeqCst), 4);
 
     {
         let mut p = plan(prefill_decode(When::Now, Budget::Immediate));
-        p.book(0, booking("p", worker(11), &releases), zone("a"))
+        p.book(0, booking("p", worker(11), &releases), zone("a"), None)
             .unwrap();
-        p.book(1, booking("d", worker(21), &releases), zone("a"))
+        p.book(1, booking("d", worker(21), &releases), zone("a"), None)
             .unwrap();
         let _ = p.dispatch(0).unwrap();
     }
@@ -548,8 +548,8 @@ async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
         attempt_id: AttemptId::new(1),
     });
     assert!(!committed.is_owned());
-    p.book(0, committed, zone("a")).unwrap();
-    p.book(1, booking("d", worker(21), &releases), zone("a"))
+    p.book(0, committed, zone("a"), None).unwrap();
+    p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
     assert_eq!(p.booking(0).unwrap().id(), "sel-1");
     p.release().await.unwrap();
@@ -563,9 +563,9 @@ fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
     // forwards decode when its input settles, then releases everything.
     let releases = Arc::new(AtomicUsize::new(0));
     let mut p = plan(decode_first());
-    p.book(0, booking("d", worker(21), &releases), zone("a"))
+    p.book(0, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
-    p.book(1, booking("p", worker(11), &releases), zone("a"))
+    p.book(1, booking("p", worker(11), &releases), zone("a"), None)
         .unwrap();
     let prefill = p.dispatch(1).unwrap();
     // Cancellation arrives here. Nothing on the plan changes.
@@ -582,7 +582,7 @@ fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
 fn a_taken_booking_belongs_to_the_host_and_is_released_once() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
-    plan.book(0, booking("p", worker(1), &releases), plain())
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
         .unwrap();
     let taken = plan.take_booking(0).unwrap();
     assert_eq!(taken.worker(), worker(1));
@@ -658,14 +658,14 @@ fn an_untracked_booking_records_the_worker_without_a_handle() {
 fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
-    plan.book(0, booking("p", worker(1), &releases), plain())
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
         .unwrap();
     let attempt = plan.dispatch(0).unwrap();
     // A rejected booking drops and releases itself; count it apart.
     let rejected = Arc::new(AtomicUsize::new(0));
     assert!(
         matches!(
-            plan.book(1, booking("d", worker(2), &rejected), plain()),
+            plan.book(1, booking("d", worker(2), &rejected), plain(), None),
             Err(PlanError::InputsNotReady { stage: 1 })
         ),
         "decode waits for the handoff"
@@ -673,7 +673,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     assert_eq!(rejected.load(Ordering::SeqCst), 1);
     plan.handoff(0, attempt).unwrap();
     assert_eq!(state(&plan, 0), &StageState::HandedOff(attempt));
-    plan.book(1, booking("d", worker(2), &releases), plain())
+    plan.book(1, booking("d", worker(2), &releases), plain(), None)
         .unwrap();
     assert_eq!(vec_of(plan.ready()), vec![1]);
     let decode_attempt = plan.dispatch(1).unwrap();
@@ -690,7 +690,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
 
     // Completing after a handoff is also fine.
     let mut ok = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
-    ok.book(0, booking("p", worker(1), &releases), plain())
+    ok.book(0, booking("p", worker(1), &releases), plain(), None)
         .unwrap();
     let a = ok.dispatch(0).unwrap();
     ok.handoff(0, a).unwrap();
@@ -702,7 +702,7 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
 fn handoff_is_fenced_by_attempt_and_state() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(vec![Stage::new(WorkerType::Prefill)]);
-    plan.book(0, booking("p", worker(1), &releases), plain())
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
         .unwrap();
     assert!(
         matches!(
@@ -735,7 +735,7 @@ fn a_placement_read_needs_the_peers_facts_not_its_booking() {
     plan.book_untracked(0, worker(31), zone("b")).unwrap();
     assert_eq!(vec_of(plan.schedulable()), vec![1]);
     let releases = Arc::new(AtomicUsize::new(0));
-    plan.book(1, booking("b-1", worker(2), &releases), zone("b"))
+    plan.book(1, booking("b-1", worker(2), &releases), zone("b"), None)
         .unwrap();
     assert_eq!(state(&plan, 1), &StageState::Booked);
 
@@ -751,7 +751,7 @@ fn a_placement_read_needs_the_peers_facts_not_its_booking() {
     ]);
     let mut transferred = transferred.unwrap();
     transferred
-        .book(0, booking("b-0", worker(1), &releases), zone("a"))
+        .book(0, booking("b-0", worker(1), &releases), zone("a"), None)
         .unwrap();
     let taken = transferred.take_booking(0).unwrap();
     let attempt = transferred.dispatch(0).unwrap();
