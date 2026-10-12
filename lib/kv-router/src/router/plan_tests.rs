@@ -12,13 +12,14 @@ use std::time::Duration;
 use super::booking::Booking;
 use super::plan::{
     Budget, Constraint, Failure, Outcome, Plan, PlanError, PlanId, PlanState, Retry, SkipRule,
-    Stage, StageAttempt, StageState, StageWork, When, WorkerFacts,
+    Stage, StageAttempt, StageState, StageWork, When, WorkerConfig,
 };
 use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
 use crate::protocols::WorkerWithDpRank;
 use crate::scheduling::AttemptId;
 use crate::scheduling::queue::SchedulerBookingDescriptor;
+use crate::test_utils::SimpleWorkerConfig;
 
 fn worker(id: u64) -> WorkerWithDpRank {
     WorkerWithDpRank::new(id, 0)
@@ -42,12 +43,23 @@ fn failure(is_retryable: bool) -> Failure {
     }
 }
 
-fn zone(name: &str) -> WorkerFacts {
-    WorkerFacts {
+fn zone(name: &str) -> WorkerConfig {
+    Arc::new(SimpleWorkerConfig {
         kv_transfer_domain: Some("zone".to_string()),
         topology_domains: HashMap::from([("zone".to_string(), name.to_string())]),
-        ..WorkerFacts::default()
-    }
+        ..SimpleWorkerConfig::default()
+    })
+}
+
+fn plain() -> WorkerConfig {
+    Arc::new(SimpleWorkerConfig::default())
+}
+
+fn zone_of(plan: &Plan, k: usize) -> Option<String> {
+    plan.worker_config(k)?
+        .topology_domains()?
+        .get("zone")
+        .cloned()
 }
 
 fn new_plan(stages: Vec<Stage>) -> Result<Plan, PlanError> {
@@ -176,7 +188,7 @@ fn a_deferred_stage_is_booked_only_after_its_input_completes() {
     assert_eq!(vec_of(p.ready()), Vec::<usize>::new());
     p.complete(0, attempt, outcome(worker(11))).unwrap();
     assert_eq!(vec_of(p.schedulable()), vec![1]);
-    assert_eq!(p.facts(0).unwrap().topology_value("zone"), Some("a"));
+    assert_eq!(zone_of(&p, 0).as_deref(), Some("a"));
 
     p.book(1, booking("d", worker(21), &releases), zone("a"), None)
         .unwrap();
@@ -580,13 +592,8 @@ fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
 fn a_taken_booking_belongs_to_the_host_and_is_released_once() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
-    plan.book(
-        0,
-        booking("p", worker(1), &releases),
-        WorkerFacts::default(),
-        None,
-    )
-    .unwrap();
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
+        .unwrap();
     let taken = plan.take_booking(0).unwrap();
     assert_eq!(taken.worker(), worker(1));
     assert!(plan.booking(0).is_none(), "the plan no longer holds it");
@@ -641,7 +648,7 @@ fn an_untracked_booking_records_the_worker_without_a_handle() {
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(plan.worker(0), Some(worker(31)));
     assert!(plan.booking(0).is_none());
-    assert_eq!(plan.facts(0), Some(&zone("b")));
+    assert_eq!(zone_of(&plan, 0), Some("b".to_string()));
     assert!(matches!(
         plan.take_booking(0),
         Err(PlanError::InvalidTransition { .. })
@@ -652,7 +659,7 @@ fn an_untracked_booking_records_the_worker_without_a_handle() {
     // Only a stage that does no scheduler work may be untracked.
     let mut other = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
     assert!(matches!(
-        other.book_untracked(0, worker(1), WorkerFacts::default()),
+        other.book_untracked(0, worker(1), plain()),
         Err(PlanError::InvalidTransition { .. })
     ));
 }
@@ -661,24 +668,14 @@ fn an_untracked_booking_records_the_worker_without_a_handle() {
 fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(prefill_decode(When::After(0), Budget::Full));
-    plan.book(
-        0,
-        booking("p", worker(1), &releases),
-        WorkerFacts::default(),
-        None,
-    )
-    .unwrap();
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
+        .unwrap();
     let attempt = plan.dispatch(0).unwrap();
     // A rejected booking drops and releases itself; count it apart.
     let rejected = Arc::new(AtomicUsize::new(0));
     assert!(
         matches!(
-            plan.book(
-                1,
-                booking("d", worker(2), &rejected),
-                WorkerFacts::default(),
-                None
-            ),
+            plan.book(1, booking("d", worker(2), &rejected), plain(), None),
             Err(PlanError::InputsNotReady { stage: 1 })
         ),
         "decode waits for the handoff"
@@ -686,13 +683,8 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
     assert_eq!(rejected.load(Ordering::SeqCst), 1);
     plan.handoff(0, attempt).unwrap();
     assert_eq!(state(&plan, 0), &StageState::HandedOff(attempt));
-    plan.book(
-        1,
-        booking("d", worker(2), &releases),
-        WorkerFacts::default(),
-        None,
-    )
-    .unwrap();
+    plan.book(1, booking("d", worker(2), &releases), plain(), None)
+        .unwrap();
     assert_eq!(vec_of(plan.ready()), vec![1]);
     let decode_attempt = plan.dispatch(1).unwrap();
     assert_eq!(plan.state(), PlanState::Dispatched);
@@ -708,13 +700,8 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
 
     // Completing after a handoff is also fine.
     let mut ok = new_plan(vec![Stage::new(WorkerType::Prefill)]).unwrap();
-    ok.book(
-        0,
-        booking("p", worker(1), &releases),
-        WorkerFacts::default(),
-        None,
-    )
-    .unwrap();
+    ok.book(0, booking("p", worker(1), &releases), plain(), None)
+        .unwrap();
     let a = ok.dispatch(0).unwrap();
     ok.handoff(0, a).unwrap();
     ok.complete(0, a, outcome(worker(1))).unwrap();
@@ -725,13 +712,8 @@ fn a_handed_off_prefill_unblocks_decode_and_still_accepts_a_late_failure() {
 fn handoff_is_fenced_by_attempt_and_state() {
     let releases = Arc::new(AtomicUsize::new(0));
     let mut plan = plan(vec![Stage::new(WorkerType::Prefill)]);
-    plan.book(
-        0,
-        booking("p", worker(1), &releases),
-        WorkerFacts::default(),
-        None,
-    )
-    .unwrap();
+    plan.book(0, booking("p", worker(1), &releases), plain(), None)
+        .unwrap();
     assert!(
         matches!(
             plan.handoff(0, StageAttempt::FIRST),
@@ -789,7 +771,7 @@ fn a_placement_read_needs_the_peers_facts_not_its_booking() {
     );
     transferred.handoff(0, attempt).unwrap();
     assert_eq!(transferred.worker(0), Some(worker(1)));
-    assert_eq!(transferred.facts(0), Some(&zone("a")));
+    assert_eq!(zone_of(&transferred, 0), Some("a".to_string()));
     assert_eq!(vec_of(transferred.schedulable()), vec![1]);
     drop(taken);
 }
@@ -805,7 +787,7 @@ fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
     // Pinned to worker 2: worker 3 is refused and nothing changes.
     let mut plan = new_plan(encode(Constraint::Pin(worker(2)))).unwrap();
     assert_eq!(
-        plan.book_untracked(0, worker(3), WorkerFacts::default()),
+        plan.book_untracked(0, worker(3), plain()),
         Err(PlanError::ConstraintViolated {
             stage: 0,
             worker: worker(3)
@@ -815,21 +797,19 @@ fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
     assert_eq!(plan.worker(0), None);
     // The pin names a DP rank too.
     assert!(matches!(
-        plan.book_untracked(0, WorkerWithDpRank::new(2, 1), WorkerFacts::default()),
+        plan.book_untracked(0, WorkerWithDpRank::new(2, 1), plain()),
         Err(PlanError::ConstraintViolated { .. })
     ));
-    plan.book_untracked(0, worker(2), WorkerFacts::default())
-        .unwrap();
+    plan.book_untracked(0, worker(2), plain()).unwrap();
     assert_eq!(plan.worker(0), Some(worker(2)));
     // An exclusion bars the worker.
     let mut plan = new_plan(encode(Constraint::Exclude(3))).unwrap();
     assert!(matches!(
-        plan.book_untracked(0, worker(3), WorkerFacts::default()),
+        plan.book_untracked(0, worker(3), plain()),
         Err(PlanError::ConstraintViolated { .. })
     ));
     assert_eq!(state(&plan, 0), &StageState::Pending);
-    plan.book_untracked(0, worker(4), WorkerFacts::default())
-        .unwrap();
+    plan.book_untracked(0, worker(4), plain()).unwrap();
 }
 
 #[test]
