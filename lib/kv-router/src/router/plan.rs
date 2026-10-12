@@ -14,13 +14,14 @@
 //! - A failed stage takes every booked stage that reads it back to `Pending`,
 //!   transitively.
 
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
 use crate::kv_hints::KvHint;
-use crate::protocols::{KvTransferEnforcement, WorkerConfigLike, WorkerId, WorkerWithDpRank};
+use std::sync::Arc;
+
+use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
 use crate::scheduling::config::RouterConfigOverride;
 use crate::sequences::SequenceError;
 
@@ -185,32 +186,10 @@ pub enum SkipRule {
     ConditionalDisagg,
 }
 
-/// What a later stage's placement rules read about a booked worker. Captured
-/// at booking so the plan still has them if the worker leaves discovery.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct WorkerFacts {
-    pub taints: HashSet<String>,
-    pub topology_domains: HashMap<String, String>,
-    pub kv_transfer_domain: Option<String>,
-    pub kv_transfer_enforcement: Option<KvTransferEnforcement>,
-    pub kv_transfer_preferred_weight: Option<f32>,
-}
-
-impl WorkerFacts {
-    pub fn from_config<C: WorkerConfigLike + ?Sized>(config: &C) -> Self {
-        Self {
-            taints: config.taints().clone(),
-            topology_domains: config.topology_domains().cloned().unwrap_or_default(),
-            kv_transfer_domain: config.kv_transfer_domain().map(str::to_string),
-            kv_transfer_enforcement: config.kv_transfer_enforcement(),
-            kv_transfer_preferred_weight: config.kv_transfer_preferred_weight(),
-        }
-    }
-
-    pub fn topology_value(&self, domain: &str) -> Option<&str> {
-        self.topology_domains.get(domain).map(String::as_str)
-    }
-}
+/// The booked worker's configuration as its host knows it, captured at
+/// booking so a later stage's placement rules (taints, topology domains,
+/// KV-transfer domain) can still read it if the worker has left discovery.
+pub type WorkerConfig = Arc<dyn WorkerConfigLike + Send + Sync>;
 
 /// Routing facts a host records when a stage completes. Engine-opaque data
 /// never enters the plan.
@@ -314,12 +293,11 @@ impl Stage {
     }
 }
 
-#[derive(Debug)]
 struct Slot {
     stage: Stage,
     state: StageState,
     booking: Option<Booking>,
-    facts: Option<WorkerFacts>,
+    config: Option<WorkerConfig>,
     kv_hint: Option<KvHint>,
     attempt: StageAttempt,
     /// Attempts the host reported failed and retried; a limit counts these,
@@ -329,13 +307,28 @@ struct Slot {
     last_worker: Option<WorkerWithDpRank>,
 }
 
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("stage", &self.stage)
+            .field("state", &self.state)
+            .field("booking", &self.booking)
+            .field("has_config", &self.config.is_some())
+            .field("kv_hint", &self.kv_hint)
+            .field("attempt", &self.attempt)
+            .field("failures", &self.failures)
+            .field("last_worker", &self.last_worker)
+            .finish()
+    }
+}
+
 impl Slot {
     fn new(stage: Stage) -> Self {
         Self {
             stage,
             state: StageState::Pending,
             booking: None,
-            facts: None,
+            config: None,
             kv_hint: None,
             attempt: StageAttempt::FIRST,
             failures: 0,
@@ -345,7 +338,7 @@ impl Slot {
 
     fn reset(&mut self, state: StageState) -> Option<Booking> {
         self.state = state;
-        self.facts = None;
+        self.config = None;
         self.kv_hint = None;
         self.booking.take()
     }
@@ -488,9 +481,9 @@ impl Plan {
         self.slots.get(k)?.booking.as_ref()
     }
 
-    /// The booked worker's placement facts, for a later stage's constraints.
-    pub fn facts(&self, k: usize) -> Option<&WorkerFacts> {
-        self.slots.get(k)?.facts.as_ref()
+    /// The booked worker's configuration, for a later stage's placement rules.
+    pub fn worker_config(&self, k: usize) -> Option<&(dyn WorkerConfigLike + Send + Sync)> {
+        self.slots.get(k)?.config.as_deref()
     }
 
     /// The KV hint the router attached to stage `k`'s booking; the host
@@ -611,7 +604,7 @@ impl Plan {
                     // A placement read wants the peer's worker and facts, which
                     // a stage keeps while it is booked or running whether the
                     // scheduler, the host or nobody holds its booking.
-                    self.slots[j].facts.is_some() || self.slots[j].state == StageState::Skipped
+                    self.slots[j].config.is_some() || self.slots[j].state == StageState::Skipped
                 })
     }
 
@@ -644,15 +637,16 @@ impl Plan {
         }
     }
 
-    /// Record the booking the router made for stage `k`, the facts a later
-    /// stage's constraints read, and the KV hint the host forwards. `Pin`
+    /// Record the booking the router made for stage `k`, the worker's
+    /// configuration a later stage's placement rules read, and the KV hint
+    /// the host forwards. `Pin`
     /// and `Exclude` are enforced here. A rejected booking drops and
     /// releases itself.
     pub fn book(
         &mut self,
         k: usize,
         booking: Booking,
-        facts: WorkerFacts,
+        config: WorkerConfig,
         kv_hint: Option<KvHint>,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
@@ -667,7 +661,7 @@ impl Plan {
         let slot = &mut self.slots[k];
         slot.last_worker = Some(worker);
         slot.booking = Some(booking);
-        slot.facts = Some(facts);
+        slot.config = Some(config);
         slot.kv_hint = kv_hint;
         slot.state = StageState::Booked;
         Ok(())
@@ -689,12 +683,12 @@ impl Plan {
     }
 
     /// Book a stage that does no scheduler work (an encoder): record the
-    /// worker and its facts with no booking behind them.
+    /// worker and its configuration with no booking behind them.
     pub fn book_untracked(
         &mut self,
         k: usize,
         worker: WorkerWithDpRank,
-        facts: WorkerFacts,
+        config: WorkerConfig,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
         if self.work_of(k) != Some(StageWork::None) {
@@ -710,7 +704,7 @@ impl Plan {
         let slot = &mut self.slots[k];
         slot.last_worker = Some(worker);
         slot.booking = None;
-        slot.facts = Some(facts);
+        slot.config = Some(config);
         slot.kv_hint = None;
         slot.state = StageState::Booked;
         Ok(())
