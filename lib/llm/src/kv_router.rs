@@ -1309,50 +1309,6 @@ impl KvRouter {
         .await
     }
 
-    /// Advisory selection for a Plan-router host: the scheduler's choice and
-    /// that worker's load, without queue admission or a booking.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn preview_best_match_details_with_policy_class(
-        &self,
-        context_id: Option<&str>,
-        tokens: &[u32],
-        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
-        router_config_override: Option<&RouterConfigOverride>,
-        lora_name: Option<String>,
-        cache_namespace: Option<String>,
-        priority_jump: f64,
-        strict_priority: u32,
-        policy_class: Option<String>,
-        session_context: Option<dynamo_kv_router::SessionContext>,
-        expected_output_tokens: Option<u32>,
-        pinned_worker: Option<WorkerWithDpRank>,
-        allowed_worker_ids: Option<HashSet<WorkerId>>,
-        routing_constraints: RoutingConstraints,
-    ) -> anyhow::Result<AdmittedFindBestMatchOutcome> {
-        self.find_best_match_details_with_policy_class_inner(
-            context_id,
-            tokens,
-            block_mm_infos,
-            router_config_override,
-            false,
-            false,
-            lora_name,
-            cache_namespace,
-            priority_jump,
-            strict_priority,
-            policy_class,
-            session_context,
-            expected_output_tokens,
-            None,
-            pinned_worker,
-            allowed_worker_ids,
-            routing_constraints,
-            FindBestMatchAdmission::WithoutAdmission,
-            None,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn find_best_match_details_with_policy_class_inner(
         &self,
@@ -1652,6 +1608,20 @@ impl KvRouter {
                 None,
             )
             .commit();
+    }
+
+    /// This router's selection core as a plan [`Router`](dynamo_kv_router::router::Router):
+    /// the frontend schedules a plan on it and dispatches from the plan.
+    /// The partition this router's selection core serves.
+    pub fn partition(&self) -> dynamo_kv_router::identity::RoutingPartitionId {
+        self.selection.partition_key().clone()
+    }
+
+    /// This worker set's selection core as the `Router` a plan is scheduled
+    /// on; a host takes each booked stage's booking from the plan to dispatch
+    /// and track it.
+    pub fn plan_router(&self) -> Arc<dyn dynamo_kv_router::router::Router> {
+        Arc::clone(self.selection.core()) as Arc<dyn dynamo_kv_router::router::Router>
     }
 
     pub async fn mark_prefill_completed(&self, request_id: &str) -> Result<(), SequenceError> {

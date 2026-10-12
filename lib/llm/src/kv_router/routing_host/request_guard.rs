@@ -24,10 +24,7 @@ use dynamo_kv_router::{
         BlockExtraInfo, BlockHashOptions, WorkerWithDpRank, compute_block_hash_for_seq,
         compute_next_seq_hash,
     },
-    scheduling::{
-        AbortCause, RequestLifecycle,
-        queue::{BookingHandle, SchedulerBookingDescriptor},
-    },
+    scheduling::{AbortCause, RequestLifecycle, queue::BookingHandle},
 };
 use dynamo_runtime::{
     error::DynamoError,
@@ -424,7 +421,7 @@ struct OutputBlockTracker {
 
 /// Owns the shared attempt-scoped scheduler and approximate-LRU lifecycle after
 /// a KV worker is selected.
-pub(super) struct KvRequestCleanup {
+pub(crate) struct KvRequestCleanup {
     chooser: Arc<KvRouter>,
     context_id: String,
     worker: WorkerWithDpRank,
@@ -464,13 +461,6 @@ impl KvRequestCleanup {
             lifecycle,
             request_lifecycle: None,
         }
-    }
-
-    /// The committed booking this cleanup will release, if admission booked one.
-    pub(super) fn descriptor(&self) -> Option<SchedulerBookingDescriptor> {
-        self.lifecycle
-            .as_ref()
-            .map(|lifecycle| lifecycle.booking().clone())
     }
 
     fn lifecycle(&self) -> Option<&RequestAttemptLease> {

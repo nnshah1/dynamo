@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use crate::kv_hints::KvHint;
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
+use crate::scheduling::SchedulingResponse;
 use crate::scheduling::config::RouterConfigOverride;
 use crate::sequences::SequenceError;
 
@@ -215,6 +216,30 @@ impl StageWork {
     }
 }
 
+/// How a stage's set scores its candidates. YAML: `cache_aware` or
+/// `load_only`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageScoring {
+    /// The cache credit the request or the set configured applies.
+    CacheAware,
+    /// Load alone: the prompt's KV comes from elsewhere, so a candidate's
+    /// cache of it earns no credit.
+    LoadOnly,
+}
+
+impl StageScoring {
+    /// The scorer's cache credit for a stage, in the scheduler's
+    /// request-level terms. `LoadOnly` replaces the request's own override
+    /// for that field, as [`StageWork::apply_to`] replaces the accounting
+    /// fields; `CacheAware` leaves the request's and the set's choice alone.
+    pub fn apply_to(self, config: &mut RouterConfigOverride) {
+        if self == StageScoring::LoadOnly {
+            config.overlap_score_credit = Some(0.0);
+        }
+    }
+}
+
 /// When the router skips a stage instead of booking it. YAML: the variant
 /// name (`no_multimodal`, `conditional_disagg`, …) or `worker_busy: 0.9`.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -290,7 +315,8 @@ impl StageState {
 /// placement rules. Pure configuration; the plan keeps the state beside it.
 ///
 /// YAML: a bare lowercase set name (`prefill`) or a map:
-/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ... }`.
+/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ...,
+/// work: decode_only, scoring: load_only }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(from = "StageSpec")]
 pub struct Stage {
@@ -303,6 +329,8 @@ pub struct Stage {
     pub skip: Option<SkipRule>,
     /// Overrides the accounting derived from the set; see [`Plan::work_of`].
     pub work: Option<StageWork>,
+    /// Overrides the scoring derived from the work; see [`Plan::scoring_of`].
+    pub scoring: Option<StageScoring>,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +351,8 @@ enum StageSpec {
         skip: Option<SkipRule>,
         #[serde(default)]
         work: Option<StageWork>,
+        #[serde(default)]
+        scoring: Option<StageScoring>,
     },
 }
 
@@ -350,6 +380,7 @@ impl From<StageSpec> for Stage {
                 constraints,
                 skip,
                 work,
+                scoring,
             } => Self {
                 set,
                 when,
@@ -358,6 +389,7 @@ impl From<StageSpec> for Stage {
                 constraints,
                 skip,
                 work,
+                scoring,
             },
         }
     }
@@ -373,6 +405,7 @@ impl Stage {
             constraints: Vec::new(),
             skip: None,
             work: None,
+            scoring: None,
         }
     }
 
@@ -397,6 +430,9 @@ struct Slot {
     /// The routing hint the scheduler attached to the booking; the host
     /// forwards it with the request.
     kv_hint: Option<KvHint>,
+    /// The scheduler's answer behind the booking (overlap, cached tokens,
+    /// projected load), for the host's tracking and a policy's observations.
+    scheduling: Option<SchedulingResponse>,
     attempt: StageAttempt,
     /// Attempts the host reported failed and retried; a limit counts these,
     /// not re-placements caused by another stage's failure.
@@ -413,6 +449,7 @@ impl std::fmt::Debug for Slot {
             .field("booking", &self.booking)
             .field("has_config", &self.config.is_some())
             .field("kv_hint", &self.kv_hint)
+            .field("scheduling", &self.scheduling)
             .field("attempt", &self.attempt)
             .field("failures", &self.failures)
             .field("last_worker", &self.last_worker)
@@ -429,6 +466,7 @@ impl Slot {
             config: None,
             booked_at: None,
             kv_hint: None,
+            scheduling: None,
             attempt: StageAttempt::FIRST,
             failures: 0,
             last_worker: None,
@@ -440,6 +478,7 @@ impl Slot {
         self.config = None;
         self.booked_at = None;
         self.kv_hint = None;
+        self.scheduling = None;
         self.booking.take()
     }
 }
@@ -596,6 +635,12 @@ impl Plan {
         self.slots.get(k)?.kv_hint.as_ref()
     }
 
+    /// The scheduler's answer behind stage `k`'s booking, when a scheduler
+    /// made it: what it saw of the worker's cache and load at admission.
+    pub fn scheduling(&self, k: usize) -> Option<&SchedulingResponse> {
+        self.slots.get(k)?.scheduling.as_ref()
+    }
+
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {
@@ -674,6 +719,23 @@ impl Plan {
         })
     }
 
+    /// How stage `k`'s set scores its candidates: the stage's own `scoring`,
+    /// else by work. A stage that only decodes receives its prompt's KV from
+    /// the prefill stage, so it is placed on load alone; every other stage
+    /// keeps its set's configured cache credit.
+    pub fn scoring_of(&self, k: usize) -> Option<StageScoring> {
+        let slot = self.slots.get(k)?;
+        if let Some(scoring) = slot.stage.scoring {
+            return Some(scoring);
+        }
+        Some(match self.work_of(k)? {
+            StageWork::DecodeOnly => StageScoring::LoadOnly,
+            StageWork::PrefillAndDecode | StageWork::PrefillOnly | StageWork::None => {
+                StageScoring::CacheAware
+            }
+        })
+    }
+
     /// Booked stages whose inputs have all completed: what the host forwards.
     pub fn ready(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.slots.len())
@@ -738,8 +800,9 @@ impl Plan {
     }
 
     /// Record the booking the router made for stage `k`, the worker's
-    /// configuration a later stage's placement rules read, and the routing
-    /// hint the host forwards with the request. `Pin`
+    /// configuration a later stage's placement rules read, the routing hint
+    /// the host forwards with the request, and the scheduler's answer behind
+    /// the booking. `Pin`
     /// and `Exclude` are enforced here. A rejected booking drops and
     /// releases itself.
     pub fn book(
@@ -748,6 +811,7 @@ impl Plan {
         booking: Booking,
         config: WorkerConfig,
         kv_hint: Option<KvHint>,
+        scheduling: Option<SchedulingResponse>,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
         if !self.slots[k].state.is_pending() {
@@ -764,6 +828,7 @@ impl Plan {
         slot.config = Some(config);
         slot.booked_at = Some(Instant::now());
         slot.kv_hint = kv_hint;
+        slot.scheduling = scheduling;
         slot.state = StageState::Booked;
         Ok(())
     }

@@ -28,21 +28,21 @@ use crate::{
     session_affinity::AffinityTarget,
 };
 
-pub(super) struct WorkerSelection {
-    pub(super) worker: WorkerWithDpRank,
+pub(crate) struct WorkerSelection {
+    pub(crate) worker: WorkerWithDpRank,
     /// The booking's handle until the request's cleanup takes it over.
-    pub(super) booking: Option<BookingHandle>,
-    pub(super) overlap_amount: u32,
-    pub(super) effective_overlap_blocks: f64,
-    pub(super) cached_tokens: usize,
-    pub(super) selected_raw_cached_tokens: Option<usize>,
+    pub(crate) booking: Option<BookingHandle>,
+    pub(crate) overlap_amount: u32,
+    pub(crate) effective_overlap_blocks: f64,
+    pub(crate) cached_tokens: usize,
+    pub(crate) selected_raw_cached_tokens: Option<usize>,
     /// Greatest raw router-visible overlap among eligible workers, in tokens.
-    pub(super) max_raw_cached_tokens: Option<usize>,
-    pub(super) potential_decode_blocks: u64,
-    pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
-    pub(super) routing_hashes: Option<RoutingDecisionHashes>,
-    pub(super) kv_hint: Option<KvHint>,
-    pub(super) request_lifecycle: Option<Box<RequestLifecycle>>,
+    pub(crate) max_raw_cached_tokens: Option<usize>,
+    pub(crate) potential_decode_blocks: u64,
+    pub(crate) selected_worker_load: Option<AdvisoryWorkerLoad>,
+    pub(crate) routing_hashes: Option<RoutingDecisionHashes>,
+    pub(crate) kv_hint: Option<KvHint>,
+    pub(crate) request_lifecycle: Option<Box<RequestLifecycle>>,
 }
 
 // Transient return value; `Routed` is moved into `WorkerSelection` right away.

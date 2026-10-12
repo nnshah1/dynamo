@@ -20,8 +20,8 @@ use dynamo_kv_router::config::{RouterConfigOverride, try_kv_router_config_from_d
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{RoutingConstraints, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    ClassTable, Constraint, Fallback, MultiStageRouter, Plan, PlanId, Router as PlanRouter, Stage,
-    StageList, StageWork,
+    Booking, ClassTable, Constraint, Fallback, MultiStageRouter, Plan, PlanId,
+    Router as PlanRouter, Stage, StageAttempt, StageList, StageWork,
 };
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::selection::{
@@ -29,7 +29,6 @@ use dynamo_kv_router::services::selection::{
 };
 use dynamo_llm::discovery::{ModelManager, WORKER_TYPE_DECODE};
 use dynamo_llm::kv_router::plan_host::routing_request;
-use dynamo_llm::kv_router::plan_host::wire::{KvRouterSetRouter, booking_id};
 use dynamo_llm::kv_router::prefill_router::PrefillReservation;
 use dynamo_llm::kv_router::{FindBestMatchOutcome, ManagedKvRouter, PrefillRouter};
 use dynamo_llm::model_card::ModelDeploymentCard;
@@ -37,7 +36,6 @@ use dynamo_llm::preprocessor::OpenAIPreprocessor;
 use dynamo_llm::protocols::common::extensions::{NvExt, NvExtProvider, routing_constraints_to_kv};
 use dynamo_llm::protocols::common::llm_backend::PreprocessedRequest;
 use dynamo_llm::protocols::common::preprocessor::RoutingHints;
-use dynamo_llm::protocols::common::timing::RequestPhase;
 use dynamo_llm::types::openai::completions::NvCreateCompletionRequest;
 use dynamo_protocols::types::Prompt;
 use dynamo_runtime::discovery::{
@@ -154,6 +152,18 @@ fn prefill_error(error: anyhow::Error) -> SelectionError {
     }
 }
 
+/// The wire id of a prefill stage's reservation: the plan id for a one-stage
+/// first attempt, else `"{plan}/{k}/{attempt}"`, the rule the core names its
+/// own bookings by.
+fn stage_booking_id(plan: &Plan, k: usize) -> String {
+    let attempt = plan.attempt(k).unwrap_or(StageAttempt::FIRST);
+    if plan.stage_count() == 1 && attempt == StageAttempt::FIRST {
+        plan.id().to_string()
+    } else {
+        format!("{}/{k}/{attempt}", plan.id())
+    }
+}
+
 /// The EPP's prefill set as a Plan [`PlanRouter`]: a custom router over
 /// [`PrefillRouter::reserve_prefill_worker`], booked under the stage's wire
 /// id. The reservation is parked here until the pick moves it into
@@ -252,7 +262,7 @@ impl PlanRouter for PrefillReservationRouter {
                         .filter(|id| !excluded.contains(id))
                         .collect::<HashSet<u64>>()
                 });
-            let id = booking_id(plan, k);
+            let id = stage_booking_id(plan, k);
             let reservation = self
                 .prefill_router
                 .reserve_prefill_worker(
@@ -926,14 +936,15 @@ impl Router {
 
     /// The Plan pick: one `MultiStageRouter` over the prefill set (the
     /// `PrefillRouter`'s own reservation) and the decode set (the decode
-    /// `KvRouter`, booking in export mode) plans and books prefill then
-    /// decode, or decode alone when prefill has no worker to give.
+    /// `KvRouter`'s selection core) plans and books prefill then decode, or
+    /// decode alone when prefill has no worker to give.
     ///
-    /// The decode booking is admitted under its wire id and retained by the
-    /// router's request-lease manager, so the response callbacks keep driving
-    /// it by id: `mark_prefill_complete(id)` and `free_request(id)` are
-    /// unchanged, and a request that never calls back is reaped on lease
-    /// expiry. The plan itself is dropped once read; it owns nothing.
+    /// The EPP takes the decode booking from the plan and enrolls it under
+    /// its id in the router's request-lease manager, exactly as a public
+    /// admission is, so the response callbacks keep driving it by id:
+    /// `mark_prefill_complete(id)` and `free_request(id)` are unchanged, and
+    /// a request that never calls back is reaped on lease expiry. The plan is
+    /// dropped once read; it then owns nothing.
     async fn pick_planned(&self, route: RouteInputs<'_>) -> Result<Picked, PickError> {
         let routing = RoutingHints {
             cache_namespace: route.cache_namespace,
@@ -955,13 +966,8 @@ impl Router {
         let request =
             Context::with_id_and_metadata(body, Uuid::new_v4().to_string(), Default::default());
 
-        let decode = KvRouterSetRouter::new(
-            self.decode_router.router().clone(),
-            WorkerType::Decode,
-            RequestPhase::Decode,
-            &request,
-        );
-        let partition = decode.partition();
+        let decode_router = self.decode_router.router();
+        let partition = decode_router.partition();
         let prefill = Arc::new(PrefillReservationRouter::new(
             self.prefill_router.clone(),
             &request,
@@ -971,45 +977,67 @@ impl Router {
                 WorkerType::Prefill,
                 Arc::clone(&prefill) as Arc<dyn PlanRouter>,
             )
-            .set(WorkerType::Decode, Arc::new(decode))
+            .set(WorkerType::Decode, decode_router.plan_router())
             .classes(ClassTable::new(gateway_stage_list()))
             .build()
             .map_err(routing_failed)?;
 
-        let mut req = routing_request(&request, &partition, route.policy_class);
-        req.export_bookings = true;
+        let req = routing_request(
+            &request,
+            &partition,
+            route.policy_class,
+            decode_router.is_eagle(),
+        );
         let mut plan = router.plan(&req).map_err(routing_failed)?;
         if let Err(error) = router.schedule(&req, &mut plan).await {
-            // Booked stages stay with the host on an error: free them.
+            // Booked stages stay with the host on an error: the prefill
+            // router frees its reservation, the plan the booking it owns.
             prefill.release_all().await;
-            for k in 0..plan.stage_count() {
-                if let Some(booking) = plan.booking(k)
-                    && let Err(free_error) = self.decode_router.free(booking.id()).await
-                {
-                    tracing::debug!(
-                        booking_id = booking.id(),
-                        error = %free_error,
-                        "Failed to free a decode booking of a failed pick"
-                    );
-                }
+            if let Err(release_error) = plan.release().await {
+                tracing::debug!(
+                    error = %release_error,
+                    "Failed to free the decode booking of a failed pick"
+                );
             }
             return Err(routing_failed(error));
         }
 
-        let stage_of = |set: WorkerType| {
+        let stage_of = |plan: &Plan, set: WorkerType| {
             (0..plan.stage_count()).find(|&k| plan.stage(k).is_some_and(|stage| stage.set == set))
         };
-        let decode_stage = stage_of(WorkerType::Decode)
+        let decode_stage = stage_of(&plan, WorkerType::Decode)
             .ok_or_else(|| PickError::RoutingFailed("plan has no decode stage".to_string()))?;
+        let prefill_stage = stage_of(&plan, WorkerType::Prefill);
         let decode_worker = plan
             .worker(decode_stage)
             .ok_or_else(|| PickError::RoutingFailed("decode stage was not booked".to_string()))?;
-        let reservation_id = plan
-            .booking(decode_stage)
-            .ok_or_else(|| PickError::RoutingFailed("decode stage has no booking".to_string()))?
-            .id()
-            .to_string();
-        let prefill_worker = stage_of(WorkerType::Prefill).and_then(|k| {
+        let enrolled = async {
+            let Booking::Owned(handle) = plan
+                .take_booking(decode_stage)
+                .map_err(|error| PickError::RoutingFailed(error.to_string()))?
+            else {
+                return Err(PickError::RoutingFailed(
+                    "decode stage booking is not the plan's own".to_string(),
+                ));
+            };
+            let reservation_id = handle.descriptor().request_id.clone();
+            decode_router
+                .enroll_public_request_attempt(handle, None)
+                .await
+                .map_err(|error| {
+                    PickError::RoutingFailed(format!("enrolling the decode booking: {error}"))
+                })?;
+            Ok::<_, PickError>(reservation_id)
+        }
+        .await;
+        let reservation_id = match enrolled {
+            Ok(reservation_id) => reservation_id,
+            Err(error) => {
+                prefill.release_all().await;
+                return Err(error);
+            }
+        };
+        let prefill_worker = prefill_stage.and_then(|k| {
             let reservation = prefill.take_reservation(k)?;
             let worker = (reservation.worker_id(), reservation.dp_rank());
             self.prefill_bookings

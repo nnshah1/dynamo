@@ -4532,50 +4532,47 @@ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
 }
 
 #[tokio::test]
-async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan_beside_the_plan() {
-    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
-    use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::router::{Router, StageState};
+async fn the_set_router_books_a_stage_the_host_dispatches_from_the_plan() {
+    use crate::kv_router::plan_host::routing_request;
+    use dynamo_kv_router::router::StageState;
 
     let (host, _dispatch, worker_id, _runtime) =
-        router_with_recorded_dispatch("plan-host-books").await;
+        router_with_recorded_dispatch("plan-core-books").await;
     let host = Arc::new(host);
+    let router = host.kv_router().plan_router();
     let request = Context::new(request());
-    let set_router = HostSetRouter::new(
-        Arc::clone(&host),
-        WorkerType::Aggregated,
-        RequestPhase::Aggregated,
-        &request,
-        false,
-        BusyThresholds::default(),
-    );
-    let req = routing_request(&request, &set_router.partition(), None);
-    let mut plan = set_router.plan(&req).unwrap();
+    let req = routing_request(&request, &host.kv_router().partition(), None, false);
+    let mut plan = router.plan(&req).unwrap();
     assert_eq!(plan.stage_count(), 1);
-    set_router.schedule(&req, &mut plan).await.unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.state_of(0), Some(&StageState::Booked));
     assert_eq!(plan.worker(0).map(|w| w.worker_id), Some(worker_id));
     assert!(
-        !plan.booking(0).unwrap().is_owned(),
-        "the host's route plan owns the lease; the plan only records it"
+        plan.booking(0).unwrap().is_owned(),
+        "a leased booking is the plan's until the host takes it"
     );
-    let admitted = potential_loads(&host).await;
-    assert_eq!(active_requests_for(&admitted, worker_id, 0), 1);
+    assert!(
+        plan.scheduling(0).is_some(),
+        "the scheduler's answer is on the stage for the host's tracking"
+    );
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        1
+    );
 
-    let side = set_router
-        .take_side(0)
-        .expect("the admitted route is parked beside the plan");
-    assert_eq!(side.worker().worker_id, worker_id);
-    assert_eq!(side.signals.worker.worker_id, worker_id);
-    assert!(set_router.take_side(0).is_none(), "taken once");
-
-    // Dropping the plan frees nothing; aborting the route plan frees the booking.
+    // The host takes the booking to dispatch from the plan: dropping the
+    // plan then frees nothing, releasing the taken booking frees it.
+    let booking = plan.take_booking(0).unwrap();
     drop(plan);
-    let still_held = potential_loads(&host).await;
-    assert_eq!(active_requests_for(&still_held, worker_id, 0), 1);
-    side.abort().await;
-    let released = potential_loads(&host).await;
-    assert_eq!(active_requests_for(&released, worker_id, 0), 0);
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        1
+    );
+    booking.release().await.unwrap();
+    assert_eq!(
+        active_requests_for(&potential_loads(&host).await, worker_id, 0),
+        0
+    );
 }
 
 /// A host whose one worker every request finds busy (AIS load model, zero
@@ -4615,14 +4612,17 @@ async fn saturated_plan_host(
 }
 
 #[tokio::test]
-async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
-    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
+async fn the_stages_wait_budget_reaches_the_queue_and_the_deadline_keeps_its_class() {
+    use crate::kv_router::plan_host::{frontend_error, routing_request};
     use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::router::{Budget, Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::router::{Budget, Plan, PlanId, Stage};
     use dynamo_kv_router::scheduling::KvSchedulerError;
     use dynamo_kv_router::services::selection::SelectionError;
+    use dynamo_runtime::error::DynamoError;
 
     let (host, worker_id, _runtime, policy) = saturated_plan_host("plan-host-budget", 1).await;
+    let router = host.kv_router().plan_router();
+    let partition = host.kv_router().partition();
     let prompt = || {
         let mut body = request();
         body.token_ids = Arc::new((1..=256).collect());
@@ -4632,44 +4632,28 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
     // Hold the worker with one full-budget booking (admitted: nothing is
     // active yet).
     let held_request = prompt();
-    let held_router = HostSetRouter::new(
-        Arc::clone(&host),
-        WorkerType::Aggregated,
-        RequestPhase::Aggregated,
-        &held_request,
-        false,
-        BusyThresholds::default(),
-    );
-    let held_req = routing_request(&held_request, &held_router.partition(), None);
+    let held_req = routing_request(&held_request, &partition, None, false);
     let mut held = Plan::new(
         PlanId::from("held"),
-        held_router.partition(),
+        partition.clone(),
         vec![Stage::new(WorkerType::Aggregated)],
     )
     .unwrap();
-    held_router.schedule(&held_req, &mut held).await.unwrap();
-    let held_side = held_router.take_side(0).expect("held route");
+    router.schedule(&held_req, &mut held).await.unwrap();
     assert_eq!(
         active_requests_for(&potential_loads(&host).await, worker_id, 0),
         1
     );
 
     let attempt = |wait: Budget| {
-        let host = Arc::clone(&host);
+        let router = Arc::clone(&router);
+        let partition = partition.clone();
         async move {
             let request = prompt();
-            let set_router = HostSetRouter::new(
-                host,
-                WorkerType::Aggregated,
-                RequestPhase::Aggregated,
-                &request,
-                false,
-                BusyThresholds::default(),
-            );
-            let req = routing_request(&request, &set_router.partition(), None);
+            let req = routing_request(&request, &partition, None, false);
             let mut plan = Plan::new(
                 PlanId::from(request.id()),
-                set_router.partition(),
+                partition,
                 vec![Stage {
                     wait,
                     ..Stage::new(WorkerType::Aggregated)
@@ -4677,10 +4661,10 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
             )
             .unwrap();
             let started = Instant::now();
-            let result = set_router.schedule(&req, &mut plan).await;
+            let result = router.schedule(&req, &mut plan).await;
             let elapsed = started.elapsed();
             assert!(plan.state_of(0).unwrap().is_pending());
-            assert!(set_router.take_side(0).is_none(), "nothing was admitted");
+            assert!(plan.booking(0).is_none(), "nothing was admitted");
             (result, elapsed)
         }
     };
@@ -4704,8 +4688,6 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
     // one classification: the same error type and queue-deadline reason a
     // direct immediate admission reports (which the HTTP layer maps to 429).
     {
-        use crate::kv_router::plan_host::frontend_error;
-        use dynamo_runtime::error::DynamoError;
         let planned = frontend_error(result.unwrap_err());
         let direct = host
             .admit_kv_route(
@@ -4748,138 +4730,12 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
         1,
         "only the held booking is charged"
     );
-    held_side.abort().await;
-    drop(held);
-    let _ = std::fs::remove_file(policy);
-}
-
-/// A worker that left the set between admission and recording is refused,
-/// as the core refuses it, rather than recorded as a worker with no
-/// placement requirements.
-#[tokio::test]
-async fn a_worker_that_left_the_set_is_refused_not_recorded_unrestricted() {
-    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter};
-    use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::services::selection::SelectionError;
-
-    let (host, _dispatch, worker_id, _runtime) =
-        router_with_recorded_dispatch("plan-host-vanished-worker").await;
-    let request = Context::new(request());
-    let set_router = HostSetRouter::new(
-        Arc::new(host),
-        WorkerType::Aggregated,
-        RequestPhase::Aggregated,
-        &request,
-        false,
-        BusyThresholds::default(),
-    );
-    assert!(
-        set_router.worker_config(worker_id).is_ok(),
-        "a present worker has a config"
-    );
-    assert!(
-        matches!(
-            set_router.worker_config(worker_id + 1_000),
-            Err(SelectionError::Internal(_))
-        ),
-        "an absent worker is refused"
-    );
-}
-
-/// The two answers that are the client's: a request withdrawn before it was
-/// placed, and a pin on a worker the set does not have. Each crosses the
-/// Router boundary typed and leaves the frontend with the class a direct
-/// admission reports (499 and 400 at the HTTP layer).
-#[tokio::test]
-async fn client_cancellation_and_validation_keep_their_class_through_the_plan_host() {
-    use crate::kv_router::plan_host::{
-        BusyThresholds, HostSetRouter, frontend_error, routing_request,
-    };
-    use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::router::{Plan, PlanId, Router, Stage};
-    use dynamo_kv_router::services::selection::SelectionError;
-    use dynamo_runtime::error::DynamoError;
-
-    let (host, _dispatch, worker_id, _runtime) =
-        router_with_recorded_dispatch("plan-host-client-errors").await;
-    let host = Arc::new(host);
-    let class_of = |error: &anyhow::Error| {
-        error
-            .downcast_ref::<DynamoError>()
-            .unwrap_or_else(|| panic!("a canonical frontend error: {error:?}"))
-            .error_type()
-    };
-    let planned = |request: Context<PreprocessedRequest>| {
-        let host = Arc::clone(&host);
-        async move {
-            let set_router = HostSetRouter::new(
-                host,
-                WorkerType::Aggregated,
-                RequestPhase::Aggregated,
-                &request,
-                false,
-                BusyThresholds::default(),
-            );
-            let req = routing_request(&request, &set_router.partition(), None);
-            let mut plan = Plan::new(
-                PlanId::from(request.id()),
-                set_router.partition(),
-                vec![Stage::new(WorkerType::Aggregated)],
-            )
-            .unwrap();
-            let error = set_router.schedule(&req, &mut plan).await.unwrap_err();
-            assert!(plan.state_of(0).unwrap().is_pending());
-            assert!(set_router.take_side(0).is_none(), "nothing was admitted");
-            error
-        }
-    };
-    let direct = |request: Context<PreprocessedRequest>| {
-        let host = Arc::clone(&host);
-        async move {
-            host.admit_kv_route(
-                &request,
-                RequestPhase::Aggregated,
-                None,
-                CleanupBudget::default(),
-                None,
-            )
-            .await
-            .err()
-            .expect("the direct admission is refused")
-        }
-    };
-
-    // Withdrawn before placement.
-    let cancelled = || {
-        let request = Context::new(request());
-        request.context().stop();
-        request
-    };
-    let error = planned(cancelled()).await;
-    assert!(matches!(error, SelectionError::Cancelled(_)), "{error:?}");
-    assert_eq!(
-        class_of(&frontend_error(error)),
-        class_of(&direct(cancelled()).await)
-    );
-
-    // Pinned to a worker the set does not have.
-    let unknown = || {
-        let mut body = request();
-        body.routing_mut().decode_worker_id = Some(worker_id + 1_000);
-        body.routing_mut().dp_rank = Some(0);
-        Context::new(body)
-    };
-    let error = planned(unknown()).await;
-    assert!(matches!(error, SelectionError::BadRequest(_)), "{error:?}");
-    assert_eq!(
-        class_of(&frontend_error(error)),
-        class_of(&direct(unknown()).await)
-    );
+    held.release().await.unwrap();
     assert_eq!(
         active_requests_for(&potential_loads(&host).await, worker_id, 0),
-        0,
-        "nothing was charged"
+        0
     );
+    let _ = std::fs::remove_file(policy);
 }
 
 /// A class with no queue allowance answers with a structured queue
@@ -4887,40 +4743,31 @@ async fn client_cancellation_and_validation_keep_their_class_through_the_plan_ho
 /// and leaves the frontend as the same raw payload a direct admission
 /// reports, so the HTTP layer renders the same status and details.
 #[tokio::test]
-async fn a_queue_rejection_keeps_its_payload_through_the_plan_host() {
-    use crate::kv_router::plan_host::{
-        BusyThresholds, HostSetRouter, frontend_error, routing_request,
-    };
+async fn a_queue_rejection_keeps_its_payload_through_the_plan() {
+    use crate::kv_router::plan_host::{frontend_error, routing_request};
     use dynamo_kv_router::WorkerType;
-    use dynamo_kv_router::router::{Plan, PlanId, Router, Stage};
+    use dynamo_kv_router::router::{Plan, PlanId, Stage};
     use dynamo_kv_router::scheduling::{KvSchedulerError, QueueRejection};
     use dynamo_kv_router::services::selection::SelectionError;
 
     let (host, worker_id, _runtime, policy) =
         saturated_plan_host("plan-host-queue-reject", 0).await;
+    let router = host.kv_router().plan_router();
+    let partition = host.kv_router().partition();
     let prompt = || {
         let mut body = request();
         body.token_ids = Arc::new((1..=256).collect());
         Context::new(body)
     };
     let held_request = prompt();
-    let held_router = HostSetRouter::new(
-        Arc::clone(&host),
-        WorkerType::Aggregated,
-        RequestPhase::Aggregated,
-        &held_request,
-        false,
-        BusyThresholds::default(),
-    );
-    let held_req = routing_request(&held_request, &held_router.partition(), None);
+    let held_req = routing_request(&held_request, &partition, None, false);
     let mut held = Plan::new(
         PlanId::from("held"),
-        held_router.partition(),
+        partition.clone(),
         vec![Stage::new(WorkerType::Aggregated)],
     )
     .unwrap();
-    held_router.schedule(&held_req, &mut held).await.unwrap();
-    let held_side = held_router.take_side(0).expect("held route");
+    router.schedule(&held_req, &mut held).await.unwrap();
 
     let direct = host
         .admit_kv_route(
@@ -4943,22 +4790,14 @@ async fn a_queue_rejection_keeps_its_payload_through_the_plan_host() {
     let direct_payload = payload_of(&direct);
 
     let request = prompt();
-    let set_router = HostSetRouter::new(
-        Arc::clone(&host),
-        WorkerType::Aggregated,
-        RequestPhase::Aggregated,
-        &request,
-        false,
-        BusyThresholds::default(),
-    );
-    let req = routing_request(&request, &set_router.partition(), None);
+    let req = routing_request(&request, &partition, None, false);
     let mut plan = Plan::new(
         PlanId::from(request.id()),
-        set_router.partition(),
+        partition,
         vec![Stage::new(WorkerType::Aggregated)],
     )
     .unwrap();
-    let error = set_router.schedule(&req, &mut plan).await.unwrap_err();
+    let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
         matches!(
             &error,
@@ -4968,14 +4807,13 @@ async fn a_queue_rejection_keeps_its_payload_through_the_plan_host() {
         "the typed answer carries the payload: {error:?}"
     );
     assert!(plan.state_of(0).unwrap().is_pending());
-    assert!(set_router.take_side(0).is_none(), "nothing was admitted");
+    assert!(plan.booking(0).is_none(), "nothing was admitted");
     assert_eq!(payload_of(&frontend_error(error)), direct_payload);
     assert_eq!(
         active_requests_for(&potential_loads(&host).await, worker_id, 0),
         1,
         "only the held booking is charged"
     );
-    held_side.abort().await;
-    drop(held);
+    held.release().await.unwrap();
     let _ = std::fs::remove_file(policy);
 }

@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::WorkerType;
 use crate::scheduling::policy_config::{PolicyClassConfig, PolicyProfile};
 
-use super::plan::{Budget, Constraint, SkipRule, Stage, When};
+use super::plan::{Budget, Constraint, SkipRule, Stage, StageScoring, When};
 
 /// What a class does when its first stage is rejected for capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -151,9 +151,13 @@ impl StageList {
 
     /// `prefill_decode` whose prefill stage is skipped when the conditional
     /// disaggregation policy says the previewed decode worker should do it.
+    /// Decode keeps its cache credit either way: the policy previews the
+    /// decode set's cache, and the worker it chose for a local prefill is
+    /// the one with the prompt.
     pub fn conditional_prefill_decode() -> Self {
         let mut list = Self::prefill_decode();
         list.stages[0].skip = Some(SkipRule::ConditionalDisagg);
+        list.stages[1].scoring = Some(StageScoring::CacheAware);
         list
     }
 
@@ -299,6 +303,8 @@ impl ClassTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::RoutingPartitionId;
+    use crate::router::{Plan, PlanId};
 
     #[test]
     fn stage_lists_parse_from_yaml_shorthand_and_long_form() {
@@ -330,9 +336,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list.stages[0].skip, Some(SkipRule::NoMultimodal));
+        let list: StageList =
+            serde_yaml::from_str("[prefill, { set: decode, inputs: [0], scoring: cache_aware }]")
+                .unwrap();
+        assert_eq!(list.stages[1].scoring, Some(StageScoring::CacheAware));
         assert!(serde_yaml::from_str::<StageList>("[{ set: decode, wait: soon }]").is_err());
         let error = serde_yaml::from_str::<StageList>("prefill_then_decode").unwrap_err();
         assert!(error.to_string().contains("unknown built-in"), "{error}");
+    }
+
+    /// Plain disaggregation places decode on load alone; conditional
+    /// disaggregation keeps decode's cache credit, as the legacy frontend's
+    /// decode override did in each mode.
+    #[test]
+    fn builtin_lists_score_decode_as_the_legacy_path_did() {
+        let plan = |list: StageList| {
+            Plan::new(
+                PlanId::from("scoring"),
+                RoutingPartitionId::new("model", "default"),
+                list.stages,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            plan(StageList::prefill_decode()).scoring_of(1),
+            Some(StageScoring::LoadOnly)
+        );
+        assert_eq!(
+            plan(StageList::prefill_decode_deferred(DEFAULT_DEFERRED_WAIT)).scoring_of(1),
+            Some(StageScoring::LoadOnly)
+        );
+        assert_eq!(
+            plan(StageList::decode_first()).scoring_of(0),
+            Some(StageScoring::LoadOnly)
+        );
+        assert_eq!(
+            plan(StageList::conditional_prefill_decode()).scoring_of(1),
+            Some(StageScoring::CacheAware)
+        );
+        assert_eq!(
+            plan(StageList::aggregated()).scoring_of(0),
+            Some(StageScoring::CacheAware)
+        );
     }
 
     #[test]
