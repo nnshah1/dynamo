@@ -26,8 +26,8 @@ use super::fake::{FakeEvent, FakeRouter, FakeSignals, FakeThresholds, FakeWorker
 use super::multistage::{MultiStageRouter, RouterLimits};
 use super::placement::topology_taint;
 use super::plan::{
-    Budget, Constraint, DomainMode, Failure, Outcome, Plan, PlanError, SkipRule, Stage,
-    StageAttempt, StageState, StageWork, When,
+    Budget, Constraint, DomainMode, Failure, Plan, PlanError, SkipRule, Stage, StageAttempt,
+    StageState, StageWork, When,
 };
 use super::router_trait::Router;
 
@@ -69,13 +69,6 @@ fn multimodal(mut req: SelectAndReserveRequest) -> SelectAndReserveRequest {
 fn all_now(mut req: SelectAndReserveRequest) -> SelectAndReserveRequest {
     req.all_now = true;
     req
-}
-
-fn outcome(w: WorkerWithDpRank) -> Outcome {
-    Outcome {
-        worker: w,
-        kv_hint: None,
-    }
 }
 
 fn failure(is_retryable: bool) -> Failure {
@@ -241,8 +234,7 @@ fn previews(router: &FakeRouter) -> usize {
 fn run(plan: &mut Plan, k: usize) -> StageAttempt {
     let attempt = plan.dispatch(k).expect("ready to dispatch");
     let worker = plan.worker(k).expect("booked");
-    plan.complete(k, attempt, outcome(worker))
-        .expect("complete");
+    plan.complete(k, attempt, worker).expect("complete");
     attempt
 }
 
@@ -662,8 +654,7 @@ async fn cancel_after_prefill_dispatch_still_routes_decode_for_kv_cleanup() {
     let attempt = plan.dispatch(0).unwrap();
     // The client is gone, but prefill is staging KV for one decode worker:
     // the host keeps the plan and routes decode when prefill completes.
-    plan.complete(0, attempt, outcome(plan.worker(0).unwrap()))
-        .unwrap();
+    plan.complete(0, attempt, plan.worker(0).unwrap()).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.stage(1).unwrap().inputs, vec![0]);
     run(&mut plan, 1);
@@ -681,8 +672,7 @@ async fn cancel_with_a_held_dependent_of_a_dispatched_producer_keeps_it() {
     // keeps the plan: decode stays reserved and nothing on it changes.
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(fixture.decode.outstanding().len(), 1);
-    plan.complete(1, attempt, outcome(plan.worker(1).unwrap()))
-        .unwrap();
+    plan.complete(1, attempt, plan.worker(1).unwrap()).unwrap();
     assert_eq!(ready(&plan), vec![0]);
     run(&mut plan, 0);
 }
@@ -723,7 +713,7 @@ async fn retry_fences_the_old_attempts_handoff_and_failure() {
 
     // Late events for the old attempt change nothing.
     assert!(matches!(
-        plan.complete(0, first, outcome(failed_worker)),
+        plan.complete(0, first, failed_worker),
         Err(PlanError::StaleAttempt { .. })
     ));
     assert!(state(&plan, 1).is_pending());
@@ -747,8 +737,8 @@ async fn duplicate_terminal_events_are_idempotent() {
     let mut plan = booked(&router, &req).await;
     let attempt = plan.dispatch(0).unwrap();
     let worker = plan.worker(0).unwrap();
-    plan.complete(0, attempt, outcome(worker)).unwrap();
-    plan.complete(0, attempt, outcome(worker)).unwrap();
+    plan.complete(0, attempt, worker).unwrap();
+    plan.complete(0, attempt, worker).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(books(&fixture.decode), 1, "decode is booked once");

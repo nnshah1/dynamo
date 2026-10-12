@@ -122,10 +122,7 @@ impl MultiStageRouterBuilder {
                 ));
             }
             for (k, stage) in list.stages.iter().enumerate() {
-                let reads_decode = matches!(
-                    stage.skip,
-                    Some(SkipRule::ConditionalDisagg | SkipRule::DecodeHoldsPrefix)
-                );
+                let reads_decode = matches!(stage.skip, Some(SkipRule::ConditionalDisagg));
                 if reads_decode
                     && !list.stages[k + 1..]
                         .iter()
@@ -309,19 +306,7 @@ impl MultiStageRouter {
             } else {
                 Decision::Keep
             }),
-            SkipRule::WorkerBusy(fraction) => {
-                let response = self.set_router(stage.set)?.select(advisory(req)).await?;
-                let is_busy = response.worker_load.is_some_and(|load| {
-                    load.active_prefill_tokens as f64
-                        > fraction * load.prefill_token_capacity as f64
-                });
-                Ok(if is_busy {
-                    Decision::Skip
-                } else {
-                    Decision::Keep
-                })
-            }
-            SkipRule::DecodeHoldsPrefix | SkipRule::ConditionalDisagg => {
+            SkipRule::ConditionalDisagg => {
                 // A caller-pinned stage is not up for discussion.
                 let is_pinned = req.pinned_worker.is_some()
                     || stage

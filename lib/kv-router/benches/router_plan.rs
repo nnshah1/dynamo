@@ -36,7 +36,7 @@ use dynamo_kv_router::protocols::{
     compute_block_hash_for_seq, compute_seq_hash_for_block,
 };
 use dynamo_kv_router::router::{
-    ClassTable, MultiStageRouter, Outcome, Plan, Router, SkipRule, StageList, StageState, StageWork,
+    ClassTable, MultiStageRouter, Plan, Router, SkipRule, StageList, StageState, StageWork,
 };
 use dynamo_kv_router::scheduling::queue::BookingHandle;
 use dynamo_kv_router::services::indexer::backend::Indexer;
@@ -181,15 +181,7 @@ async fn drive(router: &dyn Router, req: &SelectAndReserveRequest) -> Plan {
         for k in ready {
             let attempt = plan.dispatch(k).expect("dispatch");
             let worker = plan.worker(k).expect("worker");
-            plan.complete(
-                k,
-                attempt,
-                Outcome {
-                    worker,
-                    kv_hint: None,
-                },
-            )
-            .expect("complete");
+            plan.complete(k, attempt, worker).expect("complete");
         }
     }
     assert!(!plan.has_pending(), "a stage was never booked");
