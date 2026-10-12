@@ -721,7 +721,7 @@ async fn release_abort_and_drop_free_every_owned_booking_exactly_once() {
 
 #[test]
 fn a_cancelled_request_can_still_route_its_held_decode_for_kv_cleanup() {
-    // DEP #15457 §6: the client is gone after prefill was dispatched, but
+    // The client is gone after prefill was dispatched, but
     // prefill is staging KV for one decode worker. The host keeps the plan,
     // forwards decode when its input settles, then releases everything.
     let releases = Arc::new(AtomicUsize::new(0));
