@@ -19,6 +19,7 @@ use crate::scheduling::policy_config::RouterPolicyConfig;
 use crate::services::selection::{
     MmRoutingInfoRequest, PromptRequest, SelectAndReserveRequest, SelectionError,
 };
+use crate::test_utils::SimpleWorkerConfig;
 
 use super::class_table::{ClassTable, Fallback, StageList};
 use super::fake::{FakeEvent, FakeRouter, FakeSignals, FakeThresholds, FakeWorker};
@@ -26,7 +27,7 @@ use super::multistage::{MultiStageRouter, RouterLimits};
 use super::placement::topology_taint;
 use super::plan::{
     Budget, Constraint, DomainMode, Failure, Outcome, Plan, PlanError, SkipRule, Stage,
-    StageAttempt, StageState, StageWork, When, WorkerFacts,
+    StageAttempt, StageState, StageWork, When,
 };
 use super::router_trait::Router;
 
@@ -85,18 +86,18 @@ fn failure(is_retryable: bool) -> Failure {
 }
 
 fn zoned(worker_id: u64, zone: &str) -> FakeWorker {
-    FakeWorker::new(worker_id).with_facts(WorkerFacts {
+    FakeWorker::new(worker_id).with_config(SimpleWorkerConfig {
         taints: HashSet::from([topology_taint("zone", zone)]),
         topology_domains: HashMap::from([("zone".to_string(), zone.to_string())]),
-        ..WorkerFacts::default()
+        ..SimpleWorkerConfig::default()
     })
 }
 
 fn transfer_worker(worker_id: u64, zone: &str, enforcement: KvTransferEnforcement) -> FakeWorker {
     let mut worker = zoned(worker_id, zone);
-    worker.facts.kv_transfer_domain = Some("zone".to_string());
-    worker.facts.kv_transfer_enforcement = Some(enforcement);
-    worker.facts.kv_transfer_preferred_weight = Some(0.5);
+    worker.config.kv_transfer_domain = Some("zone".to_string());
+    worker.config.kv_transfer_enforcement = Some(enforcement);
+    worker.config.kv_transfer_preferred_weight = Some(0.5);
     worker
 }
 

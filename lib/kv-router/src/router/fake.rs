@@ -25,8 +25,9 @@ use crate::services::selection::{
 };
 
 use super::booking::Booking;
-use super::plan::{Budget, Constraint, Plan, PlanId, Stage, WorkerFacts};
+use super::plan::{Budget, Constraint, Plan, PlanId, Stage, WorkerConfig};
 use super::router_trait::Router;
+use crate::test_utils::SimpleWorkerConfig;
 
 /// Projected load and cache state a fake worker reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -41,7 +42,7 @@ pub struct FakeSignals {
 #[derive(Debug, Clone)]
 pub struct FakeWorker {
     pub worker: WorkerWithDpRank,
-    pub facts: WorkerFacts,
+    pub config: SimpleWorkerConfig,
     pub signals: FakeSignals,
 }
 
@@ -49,7 +50,7 @@ impl FakeWorker {
     pub fn new(worker_id: WorkerId) -> Self {
         Self {
             worker: WorkerWithDpRank::new(worker_id, 0),
-            facts: WorkerFacts::default(),
+            config: SimpleWorkerConfig::default(),
             signals: FakeSignals {
                 prefill_token_capacity: 1000,
                 ..FakeSignals::default()
@@ -57,8 +58,8 @@ impl FakeWorker {
         }
     }
 
-    pub fn with_facts(mut self, facts: WorkerFacts) -> Self {
-        self.facts = facts;
+    pub fn with_config(mut self, config: SimpleWorkerConfig) -> Self {
+        self.config = config;
         self
     }
 
@@ -230,7 +231,7 @@ impl FakeRouter {
             .filter(|candidate| {
                 allowed.is_none_or(|allowed| allowed.contains(&candidate.worker.worker_id))
             })
-            .filter(|candidate| required_taints.is_subset(&candidate.facts.taints))
+            .filter(|candidate| required_taints.is_subset(&candidate.config.taints))
             .collect();
         if candidates.is_empty() {
             return Err(SelectionError::Scheduler(
@@ -406,7 +407,8 @@ impl Router for FakeRouter {
                     .required_taints,
             );
             let worker = self.choose(pinned, allowed.as_ref(), &required)?;
-            plan.check_placement(k, &worker.facts)
+            let config: WorkerConfig = Arc::new(worker.config.clone());
+            plan.check_placement(k, &config)
                 .map_err(|error| SelectionError::Conflict(error.to_string()))?;
             let attempt = plan.attempt(k).expect("stage exists");
             // The same id scheme as `SelectionCore`'s implementation.
@@ -428,7 +430,7 @@ impl Router for FakeRouter {
             plan.book(
                 k,
                 Booking::scripted(booking_id, worker.worker, releases),
-                worker.facts.clone(),
+                config,
                 None,
             )
             .map_err(|error| SelectionError::Internal(error.to_string()))?;

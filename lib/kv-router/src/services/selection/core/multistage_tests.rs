@@ -594,7 +594,11 @@ impl Router for UntrackedPrefill {
                 .schedulable()
                 .find(|&k| plan.stage(k).is_some_and(|s| s.set == WorkerType::Prefill));
             let Some(k) = next else { break };
-            plan.book_untracked(k, WorkerWithDpRank::new(99, 0), Default::default())?;
+            plan.book_untracked(
+                k,
+                WorkerWithDpRank::new(99, 0),
+                Arc::new(crate::test_utils::SimpleWorkerConfig::default()),
+            )?;
         }
         Ok(())
     }
