@@ -26,6 +26,7 @@ use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
 use std::sync::Arc;
 
+use crate::kv_hints::KvHint;
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
 use crate::scheduling::config::RouterConfigOverride;
 use crate::sequences::SequenceError;
@@ -393,6 +394,9 @@ struct Slot {
     booking: Option<Booking>,
     config: Option<WorkerConfig>,
     booked_at: Option<Instant>,
+    /// The routing hint the scheduler attached to the booking; the host
+    /// forwards it with the request.
+    kv_hint: Option<KvHint>,
     attempt: StageAttempt,
     /// Attempts the host reported failed and retried; a limit counts these,
     /// not re-placements caused by another stage's failure.
@@ -408,6 +412,7 @@ impl std::fmt::Debug for Slot {
             .field("state", &self.state)
             .field("booking", &self.booking)
             .field("has_config", &self.config.is_some())
+            .field("kv_hint", &self.kv_hint)
             .field("attempt", &self.attempt)
             .field("failures", &self.failures)
             .field("last_worker", &self.last_worker)
@@ -423,6 +428,7 @@ impl Slot {
             booking: None,
             config: None,
             booked_at: None,
+            kv_hint: None,
             attempt: StageAttempt::FIRST,
             failures: 0,
             last_worker: None,
@@ -433,6 +439,7 @@ impl Slot {
         self.state = state;
         self.config = None;
         self.booked_at = None;
+        self.kv_hint = None;
         self.booking.take()
     }
 }
@@ -584,6 +591,10 @@ impl Plan {
         slot.booked_at.map(|booked_at| booked_at.elapsed())
     }
 
+    /// The routing hint the scheduler attached to stage `k`'s booking.
+    pub fn kv_hint(&self, k: usize) -> Option<&KvHint> {
+        self.slots.get(k)?.kv_hint.as_ref()
+    /// The worker stage `k` is booked on.
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {
@@ -725,8 +736,9 @@ impl Plan {
         }
     }
 
-    /// Record the booking the router made for stage `k` and the worker's
-    /// configuration a later stage's placement rules read. `Pin`
+    /// Record the booking the router made for stage `k`, the worker's
+    /// configuration a later stage's placement rules read, and the routing
+    /// hint the host forwards with the request. `Pin`
     /// and `Exclude` are enforced here. A rejected booking drops and
     /// releases itself.
     pub fn book(
@@ -734,6 +746,7 @@ impl Plan {
         k: usize,
         booking: Booking,
         config: WorkerConfig,
+        kv_hint: Option<KvHint>,
     ) -> Result<(), PlanError> {
         self.check_index(k)?;
         if !self.slots[k].state.is_pending() {
@@ -749,6 +762,7 @@ impl Plan {
         slot.booking = Some(booking);
         slot.config = Some(config);
         slot.booked_at = Some(Instant::now());
+        slot.kv_hint = kv_hint;
         slot.state = StageState::Booked;
         Ok(())
     }
