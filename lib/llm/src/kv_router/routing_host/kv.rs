@@ -6,6 +6,7 @@ use crate::kv_router::{
     FindBestMatchAdmission,
     routing_host::{kv_selection::SelectionOutcome, request_guard::RouteObservation},
 };
+use dynamo_kv_router::scheduling::RequestLifecycle;
 
 impl RoutingHost {
     #[allow(clippy::too_many_arguments)]
@@ -125,11 +126,37 @@ impl RoutingHost {
     where
         Fut: Future<Output = Result<(WorkerSelection, Option<Hold>), Error>>,
     {
+        let ((mut selection, affinity), lifecycle) = self
+            .with_request_lifecycle(request, phase, select, |(selection, _)| {
+                Some(selection.worker)
+            })
+            .await?;
+        selection.request_lifecycle = lifecycle;
+        Ok((selection, affinity))
+    }
+
+    /// Claim or begin the classifier lifecycle for `request`, run the selection
+    /// future built by `select` under it, and return the lifecycle for the
+    /// caller to attach to what it dispatches. `worker_of` names the worker a
+    /// successful selection chose, if it is known yet; a caller that learns
+    /// it later reports it with `RequestLifecycle::selected`. Selection
+    /// failures either park the lifecycle for a migration retry or abort it
+    /// with the cause.
+    pub(crate) async fn with_request_lifecycle<T, Fut>(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        select: impl FnOnce() -> Fut,
+        worker_of: impl FnOnce(&T) -> Option<WorkerWithDpRank>,
+    ) -> Result<(T, Option<Box<RequestLifecycle>>), Error>
+    where
+        Fut: Future<Output = Result<T, Error>>,
+    {
         // Decode/aggregated routing owns the logical request's classifier.
         // A retry can run prefill again with the same MigrationState; that hop
         // must leave the parked decode lifecycle for the decode host to resume.
         match phase {
-            RequestPhase::Prefill => return select().await,
+            RequestPhase::Prefill => return Ok((select().await?, None)),
             RequestPhase::Decode | RequestPhase::Aggregated => {}
         }
         let mut lifecycle = request
@@ -144,7 +171,7 @@ impl RoutingHost {
                 .map(Box::new);
         }
 
-        let (mut selection, affinity) = match select().await {
+        let selection = match select().await {
             Ok(selection) => selection,
             Err(error) => {
                 if let Some(mut lifecycle) = lifecycle.take() {
@@ -171,11 +198,10 @@ impl RoutingHost {
                 return Err(error);
             }
         };
-        if let Some(lifecycle) = lifecycle.as_mut() {
-            lifecycle.selected(selection.worker);
+        if let (Some(lifecycle), Some(worker)) = (lifecycle.as_mut(), worker_of(&selection)) {
+            lifecycle.selected(worker);
         }
-        selection.request_lifecycle = lifecycle;
-        Ok((selection, affinity))
+        Ok((selection, lifecycle))
     }
 
     fn route_signals(&self, selection: &WorkerSelection) -> RoutePlanSignals {
@@ -329,22 +355,40 @@ impl RoutingHost {
         plan: RoutePlan,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let RoutePlan {
-            mut selection,
+            selection,
             cleanup,
-            mut affinity,
+            affinity,
             budget,
             ..
         } = plan;
+        self.dispatch_worker_selection(request, selection, Some(cleanup), affinity, &budget)
+            .await
+    }
+
+    /// The host's half of routing for a selection the caller already holds:
+    /// track it, dispatch it, bind the affinity hold to the stream. The
+    /// selection may come from the host's own admission (a [`RoutePlan`]) or
+    /// from a stage of a plan the host dispatches from; `cleanup` is `None`
+    /// when the selection still carries the booking handle to release.
+    pub(crate) async fn dispatch_worker_selection(
+        &self,
+        request: SingleIn<PreprocessedRequest>,
+        mut selection: WorkerSelection,
+        cleanup: Option<KvRequestCleanup>,
+        mut affinity: Option<Hold>,
+        budget: &CleanupBudget,
+    ) -> Result<ManyOut<Annotated<LLMEngineOutput>>, Error> {
         let selected_target = route_target(selection.worker);
+        let phase = request.phase();
         let guard = match self
-            .track_planned_selection(&request, &mut selection, cleanup, &budget)
+            .track_selection_with_cleanup(&request, &mut selection, phase, false, cleanup, budget)
             .await
         {
             Ok(guard) => guard,
             Err(error) => return Err(error),
         };
         let stream = match self
-            .dispatch_selection(request, selection, guard, &budget)
+            .dispatch_selection(request, selection, guard, budget)
             .await
         {
             Ok(stream) => stream,
@@ -406,18 +450,6 @@ impl RoutingHost {
         budget: &CleanupBudget,
     ) -> Result<RequestGuard, Error> {
         self.track_selection_with_cleanup(request, selection, phase, is_query_only, None, budget)
-            .await
-    }
-
-    async fn track_planned_selection(
-        &self,
-        request: &SingleIn<PreprocessedRequest>,
-        selection: &mut WorkerSelection,
-        cleanup: KvRequestCleanup,
-        budget: &CleanupBudget,
-    ) -> Result<RequestGuard, Error> {
-        let phase = request.phase();
-        self.track_selection_with_cleanup(request, selection, phase, false, Some(cleanup), budget)
             .await
     }
 

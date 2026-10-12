@@ -10,7 +10,7 @@ use std::{
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
-    scheduling::{AbortCause, KvSchedulerError, queue::SchedulerBookingDescriptor},
+    scheduling::{AbortCause, KvSchedulerError},
     selector::{WorkerInputs, WorkerSelector},
 };
 use dynamo_runtime::{
@@ -54,6 +54,7 @@ mod request_guard;
 
 use builtin::BuiltinWorkerSelector;
 pub(crate) use cancellation::CleanupBudget;
+pub(crate) use cancellation::cancelled_error;
 use cancellation::{DispatchCancellation, StagedKv, await_with_cleanup_policy};
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
@@ -354,25 +355,15 @@ impl RoutePlanSignals {
 }
 
 impl RoutePlan {
-    #[cfg(test)]
-    pub(crate) fn cleanup_budget_remaining(&self) -> std::time::Duration {
-        self.budget.remaining()
-    }
-
     /// Free the admitted booking without dispatching.
+    #[cfg(test)]
     pub(crate) async fn abort(self) {
         self.cleanup.finish().await;
     }
 
-    pub(crate) fn worker(&self) -> WorkerWithDpRank {
-        self.signals.worker
-    }
-
-    /// The scheduler booking this plan's cleanup holds, for a host that
-    /// records the admission elsewhere and keeps this plan as its owner.
-    /// `None` when admission booked nothing.
-    pub(crate) fn booking_descriptor(&self) -> Option<SchedulerBookingDescriptor> {
-        self.cleanup.descriptor()
+    #[cfg(test)]
+    pub(crate) fn cleanup_budget_remaining(&self) -> std::time::Duration {
+        self.budget.remaining()
     }
 }
 
@@ -633,7 +624,11 @@ impl RoutingHost {
 
     /// Check request-supplied targets only at initial selection, not after a route preview
     /// or when dispatching: a worker disappearing later is a service failure.
-    fn validate_explicit_worker(
+    pub(crate) fn session_affinity_mode(&self) -> SessionAffinityMode {
+        self.session_affinity_mode
+    }
+
+    pub(crate) fn validate_explicit_worker(
         &self,
         request: &PreprocessedRequest,
         phase: RequestPhase,
@@ -723,7 +718,7 @@ impl RoutingHost {
         }
     }
 
-    async fn select_with_session_affinity<T, Select, SelectionFuture>(
+    pub(crate) async fn select_with_session_affinity<T, Select, SelectionFuture>(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,

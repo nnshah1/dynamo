@@ -1609,6 +1609,16 @@ impl KvRouter {
             .commit();
     }
 
+    /// This router's selection core as a plan [`Router`](dynamo_kv_router::router::Router):
+    /// the frontend schedules a plan on it and dispatches from the plan.
+    pub(crate) fn partition(&self) -> dynamo_kv_router::identity::RoutingPartitionId {
+        self.selection.partition_key().clone()
+    }
+
+    pub(crate) fn plan_router(&self) -> Arc<dyn dynamo_kv_router::router::Router> {
+        Arc::clone(self.selection.core()) as Arc<dyn dynamo_kv_router::router::Router>
+    }
+
     pub async fn mark_prefill_completed(&self, request_id: &str) -> Result<(), SequenceError> {
         self.selection
             .scheduler()

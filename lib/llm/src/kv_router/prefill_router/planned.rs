@@ -4,15 +4,17 @@
 //! Prefill/decode routing with the frontend as the host of a Plan-returning
 //! `Router`.
 //!
-//! A `MultiStageRouter` over one `HostSetRouter` per worker set decides the
-//! stage list, the conditional-disagg bypass (preview, decode-busy gate,
-//! previewed pin), placement constraints and per-stage accounting. This
-//! module is the host: it dispatches what the plan books, observes the
-//! prefill handoff and reports it into the plan, and lets the existing
-//! `RoutePlan` cleanups, the prefill background task and `forward_decode`
-//! own the request's lifecycle, exactly as the legacy path does. Once decode
-//! is dispatched the plan is informational: its bookings already live in
-//! the route plans' cleanups, so dropping it frees nothing.
+//! The frontend schedules a plan on the routers of its worker sets (the
+//! selection cores its `KvRouter`s already embed, composed by a
+//! `MultiStageRouter` or a custom `Router` from the factory) and dispatches
+//! from the plan: each booked stage's worker, booking, KV hint and scheduler
+//! answer are read off the plan and handed to the host's existing dispatch,
+//! tracking and cleanup. The library owns the stage list, the conditional
+//! bypass, placement, budgets and accounting; this module owns session
+//! affinity, the request's classifier lifecycle, the prefill handoff and the
+//! response stream, as the legacy path does. Once decode is dispatched the
+//! plan is informational: its bookings already live in the host's cleanups,
+//! so dropping it frees nothing.
 //!
 //! `DYN_ROUTER_PLAN_HOST=0` falls back to the legacy hand-composed path for
 //! one release.
@@ -23,9 +25,12 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::conditional_disagg::ConditionalDisaggPolicy;
+use dynamo_kv_router::protocols::{WorkerAffinityTarget, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    ClassTable, Constraint, Failure, MultiStageRouter, Plan, Router, StageList, StageState,
+    Booking, ClassTable, Constraint, Failure, MultiStageRouter, Plan, Router, StageList, StageState,
 };
+use dynamo_kv_router::scheduling::RequestLifecycle;
+use dynamo_kv_router::services::selection::SelectAndReserveRequest;
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
     pipeline::{
@@ -34,6 +39,7 @@ use dynamo_runtime::{
     protocols::annotated::Annotated,
 };
 use futures::stream::{self, StreamExt};
+use tokio::sync::Mutex;
 
 use super::{
     BYPASS_REMOTE_PREFILL_ANNOTATION, PrefillBinding, PrefillCompletion, PrefillOutcome,
@@ -42,9 +48,10 @@ use super::{
     strip_terminal_disaggregated_params,
 };
 use crate::kv_router::RoutingHost;
-use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, frontend_error, routing_request};
-use crate::kv_router::routing_host::kv_selection::{
-    pinned_worker_hint, resolve_pinned_worker_rank,
+use crate::kv_router::plan_host::{frontend_error, routing_request};
+use crate::kv_router::routing_host::{
+    CleanupBudget, cancelled_error,
+    kv_selection::{WorkerSelection, pinned_worker_hint, resolve_pinned_worker_rank},
 };
 use crate::protocols::common::{
     extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
@@ -52,10 +59,10 @@ use crate::protocols::common::{
     preprocessor::{PrefillResult, TraceLink},
     timing::{RequestPhase, RequestTracker},
 };
-use crate::session_affinity::AffinityTarget;
+use crate::session_affinity::{AffinityTarget, Hold, SessionAffinityMode};
 
-/// What a [`PlanRouterFactory`] receives: one `Router` per worker set over
-/// this request's hosts, and the conditional-disaggregation policy with
+/// What a [`PlanRouterFactory`] receives: one `Router` per worker set (the
+/// set's selection core), and the conditional-disaggregation policy with
 /// whether a decode-busy gate is configured. The factory returns the
 /// `Router` the frontend drives for the request; the default builds a
 /// `MultiStageRouter` over the class's stage list.
@@ -156,27 +163,13 @@ impl PrefillRouter {
         }
 
         let conditional = self.conditional_disagg_policy.is_enabled();
-        let thresholds = BusyThresholds {
-            prefill: self.conditional_disagg_prefill_busy_threshold,
-            decode: self.conditional_disagg_decode_busy_threshold,
-        };
-        let prefill_set = Arc::new(HostSetRouter::new(
-            Arc::clone(&binding.router),
-            WorkerType::Prefill,
-            RequestPhase::Prefill,
-            &prefill_request,
-            conditional,
-            thresholds,
-        ));
-        let decode_set = Arc::new(HostSetRouter::new(
-            Arc::clone(&decode_host),
-            WorkerType::Decode,
-            RequestPhase::Decode,
+        let decode_router = decode_host.kv_router();
+        let routing = routing_request(
             &decode_request,
-            conditional,
-            thresholds,
-        ));
-        let routing = routing_request(&decode_request, &decode_set.partition(), policy_class);
+            &decode_router.partition(),
+            policy_class,
+            decode_router.is_eagle(),
+        );
 
         let mut flow = PlannedFlow {
             router: self,
@@ -187,17 +180,22 @@ impl PrefillRouter {
             original_max_tokens,
             prefill_request: Some(prefill_request),
             decode_request: Some(decode_request),
-            prefill_set,
-            decode_set,
+            // One cleanup budget for the request's whole route, as the
+            // legacy host uses.
+            budget: CleanupBudget::default(),
+            affinity: None,
+            lifecycle: None,
+            lifecycle_selected: false,
+            staged_kv_cleanup: false,
             outcome: None,
             prefill_completion: None,
             dispatched: false,
         };
-        match flow.run(&routing, conditional).await {
+        match flow.run(routing, conditional).await {
             Ok(response) => Ok(response),
             // A failed conditional decision falls back to remote prefill, as
             // before, unless the request itself was cancelled or invalid.
-            Err(error)
+            Err((routing, error))
                 if conditional
                     && !flow.dispatched
                     && !match_error_chain(
@@ -211,9 +209,9 @@ impl PrefillRouter {
                     error = %error,
                     "Conditional disagg decision failed; falling back to remote prefill"
                 );
-                flow.run(&routing, false).await
+                flow.run(routing, false).await.map_err(|(_, error)| error)
             }
-            Err(error) => Err(error),
+            Err((_, error)) => Err(error),
         }
     }
 }
@@ -228,8 +226,14 @@ struct PlannedFlow<'a> {
     original_max_tokens: Option<u32>,
     prefill_request: Option<SingleIn<PreprocessedRequest>>,
     decode_request: Option<SingleIn<PreprocessedRequest>>,
-    prefill_set: Arc<HostSetRouter>,
-    decode_set: Arc<HostSetRouter>,
+    budget: CleanupBudget,
+    /// The decode phase's session-affinity hold, bound to the decode stream.
+    affinity: Option<Hold>,
+    /// The request's classifier lifecycle, owned by the decode leg.
+    lifecycle: Option<Box<RequestLifecycle>>,
+    lifecycle_selected: bool,
+    /// A remote prefill staged KV: decode must go on through a disconnect.
+    staged_kv_cleanup: bool,
     outcome: Option<PrefillOutcome>,
     prefill_completion: Option<PrefillTask>,
     /// Something reached a worker; a failure now is not a routing decision
@@ -242,13 +246,17 @@ enum Step {
     Done(ManyOut<Annotated<LLMEngineOutput>>),
 }
 
+/// The routing request and the plan it produced, shared with the affinity
+/// wrapper's retry closure during the first `schedule`.
+type Shared = Mutex<(SelectAndReserveRequest, Option<Plan>)>;
+
 impl PlannedFlow<'_> {
     /// The `Router` for this request: the configured factory's, or the
-    /// default `MultiStageRouter`, over this request's set routers.
+    /// default `MultiStageRouter`, over the worker sets' selection cores.
     fn plan_router(&self, conditional: bool) -> Result<Arc<dyn Router>> {
         let parts = PlanRouterParts {
-            prefill: Arc::clone(&self.prefill_set) as Arc<dyn Router>,
-            decode: Arc::clone(&self.decode_set) as Arc<dyn Router>,
+            prefill: self.binding.router.kv_router().plan_router(),
+            decode: self.decode_host.kv_router().plan_router(),
             conditional: conditional.then(|| {
                 (
                     Arc::clone(&self.router.conditional_disagg_policy),
@@ -264,21 +272,69 @@ impl PlannedFlow<'_> {
         }
     }
 
+    /// Plan, schedule and dispatch. The routing request comes back with an
+    /// error so a conditional fallback can rerun with it.
     async fn run(
         &mut self,
-        routing: &dynamo_kv_router::services::selection::SelectAndReserveRequest,
+        routing: SelectAndReserveRequest,
+        conditional: bool,
+    ) -> std::result::Result<
+        ManyOut<Annotated<LLMEngineOutput>>,
+        (SelectAndReserveRequest, anyhow::Error),
+    > {
+        let shared: Shared = Mutex::new((routing, None));
+        let result = self.run_inner(&shared, conditional).await;
+        let (routing, _) = shared.into_inner();
+        result.map_err(|error| (routing, error))
+    }
+
+    async fn run_inner(
+        &mut self,
+        shared: &Shared,
         conditional: bool,
     ) -> Result<ManyOut<Annotated<LLMEngineOutput>>> {
         let multistage = self.plan_router(conditional)?;
-        let mut plan = multistage.plan(routing)?;
-        self.pin_caller_targets(&mut plan)?;
         let engine_ctx = self
             .decode_request
             .as_ref()
             .ok_or_else(|| anyhow!("decode request already consumed"))?
             .context();
+        // A caller-named worker is checked once, before planning, as the
+        // host's own path checks it; a withdrawn request is not planned.
+        {
+            let body = self
+                .decode_request
+                .as_ref()
+                .ok_or_else(|| anyhow!("decode request already consumed"))?
+                .content();
+            self.binding
+                .router
+                .validate_explicit_worker(body, RequestPhase::Prefill)
+                .map_err(|error| self.routing_error(error))?;
+            self.decode_host
+                .validate_explicit_worker(body, RequestPhase::Decode)
+                .map_err(|error| self.routing_error(error))?;
+        }
+        if engine_ctx.is_stopped() || engine_ctx.is_killed() {
+            return Err(self.routing_error(cancelled_error(engine_ctx.id())));
+        }
+        {
+            let mut guard = shared.lock().await;
+            let (routing, slot) = &mut *guard;
+            let mut plan = multistage
+                .plan(routing)
+                .map_err(|error| self.routing_error(frontend_error(error)))?;
+            self.pin_caller_targets(&mut plan)?;
+            *slot = Some(plan);
+        }
+        self.schedule_first(&multistage, shared).await?;
+        let mut guard = shared.lock().await;
+        let (routing, plan) = &mut *guard;
+        let plan = plan.as_mut().expect("plan set above");
         loop {
-            if let Err(error) = multistage.schedule(routing, &mut plan).await {
+            if plan.ready().next().is_none()
+                && let Err(error) = multistage.schedule(routing, plan).await
+            {
                 return Err(self.routing_error(frontend_error(error)));
             }
             let Some(k) = plan.ready().next() else {
@@ -291,17 +347,91 @@ impl PlannedFlow<'_> {
             };
             let set = plan.stage(k).expect("ready stage exists").set;
             let step = match set {
-                WorkerType::Prefill => self.run_prefill(&mut plan, k, &engine_ctx).await?,
-                WorkerType::Decode => {
-                    self.run_decode(&mut plan, k, conditional, &engine_ctx)
-                        .await?
-                }
+                WorkerType::Prefill => self.run_prefill(plan, k, &engine_ctx).await?,
+                WorkerType::Decode => self.run_decode(plan, k, conditional, &engine_ctx).await?,
                 other => return Err(anyhow!("plan dispatched unexpected set {other:?}")),
             };
             if let Step::Done(response) = step {
                 return Ok(response);
             }
         }
+    }
+
+    /// The first `schedule`, under the host's session-affinity and
+    /// classifier-lifecycle wrappers, as the legacy selection runs: the
+    /// prefill host resolves the session's prefill target, the decode host
+    /// its decode target, and each target steers its own set's stages (a
+    /// pin in hard mode, a preference in soft mode). The decode hold and
+    /// lifecycle stay with the flow for the decode dispatch.
+    async fn schedule_first(
+        &mut self,
+        multistage: &Arc<dyn Router>,
+        shared: &Shared,
+    ) -> Result<()> {
+        let prefill_request = self
+            .prefill_request
+            .as_ref()
+            .ok_or_else(|| anyhow!("prefill request already consumed"))?;
+        let decode_request = self
+            .decode_request
+            .as_ref()
+            .ok_or_else(|| anyhow!("decode request already consumed"))?;
+        let prefill_host = &self.binding.router;
+        let decode_host = self.decode_host;
+        let budget = &self.budget;
+        let select = || {
+            prefill_host.select_with_session_affinity(
+                prefill_request,
+                RequestPhase::Prefill,
+                false,
+                budget,
+                |prefill_target| {
+                    decode_host.select_with_session_affinity(
+                        decode_request,
+                        RequestPhase::Decode,
+                        false,
+                        budget,
+                        move |decode_target| async move {
+                            let mut guard = shared.lock().await;
+                            let (routing, plan) = &mut *guard;
+                            let plan = plan.as_mut().expect("plan set before scheduling");
+                            steer(
+                                routing,
+                                plan,
+                                WorkerType::Prefill,
+                                prefill_target,
+                                prefill_host,
+                            )?;
+                            steer(
+                                routing,
+                                plan,
+                                WorkerType::Decode,
+                                decode_target,
+                                decode_host,
+                            )?;
+                            multistage
+                                .schedule(routing, plan)
+                                .await
+                                .map_err(frontend_error)?;
+                            Ok(decode_worker(plan))
+                        },
+                    )
+                },
+            )
+        };
+        let (((decode_worker, decode_hold), _prefill_hold), lifecycle) = decode_host
+            .with_request_lifecycle(
+                decode_request,
+                RequestPhase::Decode,
+                select,
+                |((w, _), _)| *w,
+            )
+            .await
+            .map_err(|error| self.routing_error(error))?;
+        self.lifecycle_selected = decode_worker.is_some();
+        self.lifecycle = lifecycle;
+        self.affinity = decode_hold;
+        Ok(())
     }
 
     /// A worker the caller named for a phase pins that phase's stage, so the
@@ -333,11 +463,7 @@ impl PlannedFlow<'_> {
                 .kv_router_if_enabled()
                 .and_then(|router| router.unique_dp_rank_for_worker(worker_id));
             let worker = resolve_pinned_worker_rank(worker_id, dp_rank, unique_rank)?;
-            for k in 0..plan.stage_count() {
-                if plan.stage(k).is_some_and(|stage| stage.set == set) {
-                    plan.constrain(k, Constraint::Pin(worker))?;
-                }
-            }
+            pin_set(plan, set, worker)?;
         }
         Ok(())
     }
@@ -349,16 +475,13 @@ impl PlannedFlow<'_> {
         engine_ctx: &Arc<dyn AsyncEngineContext>,
     ) -> Result<Step> {
         let attempt = plan.dispatch(k)?;
-        let side = self
-            .prefill_set
-            .take_side(k)
-            .ok_or_else(|| anyhow!("prefill stage has no admitted route"))?;
+        let selection = stage_selection(plan, k, None)?;
         let mut prefill_request = self
             .prefill_request
             .take()
             .ok_or_else(|| anyhow!("prefill stage executed twice"))?;
         let phase_barrier = self.tracker.set_phase(RequestPhase::Prefill).await;
-        let worker = side.worker();
+        let worker = selection.worker;
         let target = AffinityTarget::new(worker.worker_id, Some(worker.dp_rank));
         let prepared = self.router.prepare_prefill_dispatch(
             &mut prefill_request,
@@ -368,7 +491,7 @@ impl PlannedFlow<'_> {
         let prefill_stream = match self
             .binding
             .router
-            .dispatch_kv_plan(prefill_request, side)
+            .dispatch_worker_selection(prefill_request, selection, None, None, &self.budget)
             .await
         {
             Ok(stream) => stream,
@@ -378,9 +501,9 @@ impl PlannedFlow<'_> {
             }
         };
         self.dispatched = true;
-        // Decode must now be selected even if the client disconnects: only
+        // Decode must now be dispatched even if the client disconnects: only
         // its worker's KV-transfer path frees what prefill staged.
-        self.decode_set.set_staged_kv_cleanup(true);
+        self.staged_kv_cleanup = true;
 
         let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info.clone() {
             self.prefill_completion = Some(self.router.spawn_prefill_task(
@@ -445,10 +568,13 @@ impl PlannedFlow<'_> {
         engine_ctx: &Arc<dyn AsyncEngineContext>,
     ) -> Result<Step> {
         plan.dispatch(k)?;
-        let side = self
-            .decode_set
-            .take_side(k)
-            .ok_or_else(|| anyhow!("decode stage has no admitted route"))?;
+        let mut lifecycle = self.lifecycle.take();
+        if let (Some(lifecycle), Some(worker)) = (lifecycle.as_mut(), plan.worker(k))
+            && !self.lifecycle_selected
+        {
+            lifecycle.selected(worker);
+        }
+        let selection = stage_selection(plan, k, lifecycle)?;
         let decode_request = self
             .decode_request
             .take()
@@ -464,13 +590,13 @@ impl PlannedFlow<'_> {
         // In the bootstrap path this waits until the spawned prefill task
         // releases its phase barrier, keeping worker attribution correct.
         let _decode_permit = self.tracker.set_phase(RequestPhase::Decode).await;
+        let staged_kv_cleanup = self.staged_kv_cleanup;
         let decode_request = if local_prefill {
-            let signals = side.signals;
             tracing::info!(
                 request_id = %self.request_id,
-                worker_id = signals.worker.worker_id,
-                dp_rank = signals.worker.dp_rank,
-                cached_tokens = signals.cached_tokens,
+                worker_id = selection.worker.worker_id,
+                dp_rank = selection.worker.dp_rank,
+                cached_tokens = selection.cached_tokens,
                 "Conditional disagg routing to decode worker"
             );
             decode_request.map(|mut request| {
@@ -502,8 +628,21 @@ impl PlannedFlow<'_> {
                 decode
             })
         };
+        // A remote prefill staged KV for this leg: decode's dispatch and
+        // cleanup go on through a client disconnect.
+        let decode_request = decode_request.map(|mut request| {
+            request.staged_kv_cleanup = staged_kv_cleanup;
+            request
+        });
         self.dispatched = true;
-        let dispatch = self.decode_host.dispatch_kv_plan(decode_request, side);
+        let affinity = self.affinity.take();
+        let dispatch = self.decode_host.dispatch_worker_selection(
+            decode_request,
+            selection,
+            None,
+            affinity,
+            &self.budget,
+        );
         let response = match self.prefill_completion.take() {
             Some(completion) => {
                 completion
@@ -567,6 +706,98 @@ fn failure(error: &anyhow::Error) -> Failure {
         is_retryable: false,
         reason: error.to_string(),
     }
+}
+
+/// Steer a set's stages toward the session's affinity target the way the
+/// host's own selection does: hard affinity pins the stage, soft affinity
+/// prefers the worker; a stage the caller already pinned keeps its pin.
+fn steer(
+    routing: &mut SelectAndReserveRequest,
+    plan: &mut Plan,
+    set: WorkerType,
+    target: Option<AffinityTarget>,
+    host: &RoutingHost,
+) -> Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    match host.session_affinity_mode() {
+        SessionAffinityMode::Hard => {
+            let unique_rank = host
+                .kv_router_if_enabled()
+                .and_then(|router| router.unique_dp_rank_for_worker(target.worker_id));
+            let worker = resolve_pinned_worker_rank(target.worker_id, target.dp_rank, unique_rank)?;
+            pin_set(plan, set, worker)
+        }
+        SessionAffinityMode::Soft => {
+            if set == WorkerType::Decode {
+                routing.affinity_target =
+                    Some(WorkerAffinityTarget::new(target.worker_id, target.dp_rank));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Pin every pending stage of `set` to `worker`, unless it is pinned already.
+fn pin_set(plan: &mut Plan, set: WorkerType, worker: WorkerWithDpRank) -> Result<()> {
+    for k in 0..plan.stage_count() {
+        let Some(stage) = plan.stage(k) else { continue };
+        if stage.set != set
+            || !plan.state_of(k).is_some_and(StageState::is_pending)
+            || stage
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Pin(_)))
+        {
+            continue;
+        }
+        plan.constrain(k, Constraint::Pin(worker))?;
+    }
+    Ok(())
+}
+
+fn decode_worker(plan: &Plan) -> Option<WorkerWithDpRank> {
+    (0..plan.stage_count())
+        .find(|&k| {
+            plan.stage(k)
+                .is_some_and(|stage| stage.set == WorkerType::Decode)
+        })
+        .and_then(|k| plan.worker(k))
+}
+
+/// The host's view of a booked stage, read off the plan: the worker, the
+/// booking handle (now the host's to release through its cleanup), the
+/// scheduler's answer for tracking, and the hint to forward.
+fn stage_selection(
+    plan: &mut Plan,
+    k: usize,
+    request_lifecycle: Option<Box<RequestLifecycle>>,
+) -> Result<WorkerSelection> {
+    let worker = plan
+        .worker(k)
+        .ok_or_else(|| anyhow!("stage {k} has no booked worker"))?;
+    let booking = match plan.take_booking(k)? {
+        Booking::Owned(handle) => Some(handle),
+        // Someone else owns the release (an exported booking); nothing for
+        // the cleanup to hold.
+        _ => None,
+    };
+    let scheduling = plan.scheduling(k);
+    Ok(WorkerSelection {
+        worker,
+        booking,
+        overlap_amount: scheduling.map_or(0, |s| s.effective_overlap_blocks.round() as u32),
+        effective_overlap_blocks: scheduling.map_or(0.0, |s| s.effective_overlap_blocks),
+        cached_tokens: scheduling.map_or(0, |s| s.cached_tokens),
+        selected_raw_cached_tokens: scheduling.and_then(|s| s.selected_raw_cached_tokens),
+        max_raw_cached_tokens: scheduling.and_then(|s| s.max_raw_cached_tokens),
+        potential_decode_blocks: scheduling.map_or(0, |s| s.potential_decode_blocks as u64),
+        selected_worker_load: None,
+        routing_hashes: None,
+        kv_hint: plan.kv_hint(k).cloned(),
+        request_lifecycle,
+    })
 }
 
 fn handoff_outcome(
@@ -703,6 +934,7 @@ mod tests {
         distributed: &DistributedRuntime,
         namespace: &str,
         role: &'static str,
+        conditional: bool,
         worker_config: ModelRuntimeConfig,
     ) -> KvSet {
         let endpoint = distributed
@@ -715,14 +947,25 @@ mod tests {
         endpoint.register_endpoint_instance().await.unwrap();
         let worker_id = client.wait_for_instances().await.unwrap()[0].id();
         let (_workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
+        // The deployment's flag reaches each set's router, as the model
+        // manager passes it: a decode set that may run prefill locally keeps
+        // cache-aware selection, a plain one scores on load alone.
         let config = KvRouterConfig {
             skip_initial_worker_wait: true,
             use_kv_events: false,
             router_track_active_blocks: false,
+            conditional_disagg_enabled: conditional,
             ..Default::default()
         };
+        // The role types the core's `Router`: it books only the stages of
+        // its own set, as production's discovery-managed hosts do.
+        let worker_role = match role {
+            "prefill" => WorkerType::Prefill,
+            "decode" => WorkerType::Decode,
+            other => panic!("unknown role {other}"),
+        };
         let chooser = Arc::new(
-            KvRouter::new(
+            KvRouter::new_with_worker_role(
                 endpoint,
                 client.clone(),
                 workers,
@@ -731,6 +974,7 @@ mod tests {
                 SelectionPolicySource::Registry,
                 Some(config),
                 None,
+                Some(worker_role),
                 role,
                 None,
                 false,
@@ -792,8 +1036,22 @@ mod tests {
             DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
                 .await
                 .unwrap();
-        let prefill = kv_set(&distributed, namespace, "prefill", prefill_config).await;
-        let decode = kv_set(&distributed, namespace, "decode", decode_config).await;
+        let prefill = kv_set(
+            &distributed,
+            namespace,
+            "prefill",
+            conditional,
+            prefill_config,
+        )
+        .await;
+        let decode = kv_set(
+            &distributed,
+            namespace,
+            "decode",
+            conditional,
+            decode_config,
+        )
+        .await;
         let endpoint_id = dynamo_runtime::protocols::EndpointId {
             namespace: namespace.to_string(),
             component: "prefill".to_string(),
@@ -1252,8 +1510,9 @@ mod tests {
     /// preview sees a full prefix hit there.
     /// The decode worker requires its KV-transfer peers in zone b; the
     /// prefill worker publishes no zone. The forward constraints prefill
-    /// was selected under cannot see decode's requirement, so the host checks
-    /// the pair before recording decode and aborts the refused route.
+    /// was selected under cannot see decode's requirement, so the core
+    /// checks the pair before recording decode and frees the refused
+    /// booking; prefill's booking stays with the plan for the host.
     #[tokio::test]
     async fn an_incompatible_transfer_pair_is_refused_and_nothing_is_kept() {
         use dynamo_kv_router::protocols::KvTransferEnforcement;
@@ -1261,8 +1520,7 @@ mod tests {
         use dynamo_kv_router::services::selection::SelectionError;
         use std::collections::HashSet;
 
-        use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter, routing_request};
-        use crate::protocols::common::timing::RequestPhase;
+        use crate::kv_router::plan_host::routing_request;
 
         let fixture = fixture_configs(
             "plan-host-reverse-transfer",
@@ -1278,26 +1536,10 @@ mod tests {
         )
         .await;
         let request = Context::new(request());
-        let prefill = Arc::new(HostSetRouter::new(
-            Arc::clone(&fixture.prefill.host),
-            WorkerType::Prefill,
-            RequestPhase::Prefill,
-            &request,
-            false,
-            BusyThresholds::default(),
-        ));
-        let decode = Arc::new(HostSetRouter::new(
-            Arc::clone(&fixture.decode.host),
-            WorkerType::Decode,
-            RequestPhase::Decode,
-            &request,
-            false,
-            BusyThresholds::default(),
-        ));
-        let req = routing_request(&request, &decode.partition(), None);
+        let req = routing_request(&request, &fixture.decode.chooser.partition(), None, false);
         let router = MultiStageRouter::builder()
-            .set(WorkerType::Prefill, Arc::clone(&prefill) as Arc<dyn Router>)
-            .set(WorkerType::Decode, Arc::clone(&decode) as Arc<dyn Router>)
+            .set(WorkerType::Prefill, fixture.prefill.chooser.plan_router())
+            .set(WorkerType::Decode, fixture.decode.chooser.plan_router())
             .classes(ClassTable::new(StageList::prefill_decode()))
             .build()
             .unwrap();
@@ -1312,13 +1554,77 @@ mod tests {
             "decode was not recorded"
         );
         assert!(
-            decode.take_side(1).is_none(),
-            "the refused route was not kept"
+            plan.booking(0).is_some(),
+            "prefill stays booked for the host"
         );
-        // Prefill's admitted route stays with the host for the caller to
-        // abort, as any booked stage does when a later one fails.
-        prefill.take_side(0).expect("prefill route").abort().await;
         plan.release().await.unwrap();
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
+    /// The two answers that are the client's, through the real frontend
+    /// loop: a request withdrawn before it was planned, and a decode worker
+    /// the set does not have. Each leaves with the class a direct admission
+    /// reports (499 and 400 at the HTTP layer).
+    #[tokio::test]
+    async fn client_cancellation_and_validation_keep_their_class_through_the_loop() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::timing::RequestPhase;
+        use dynamo_runtime::error::DynamoError;
+
+        let fixture = fixture("plan-host-client-errors").await;
+        let class_of = |error: &anyhow::Error| {
+            error
+                .downcast_ref::<DynamoError>()
+                .unwrap_or_else(|| panic!("a canonical frontend error: {error:?}"))
+                .error_type()
+        };
+        let direct = |request: Context<PreprocessedRequest>| {
+            let host = Arc::clone(&fixture.decode.host);
+            async move {
+                host.admit_kv_route(
+                    &request,
+                    RequestPhase::Decode,
+                    None,
+                    CleanupBudget::default(),
+                    None,
+                )
+                .await
+                .err()
+                .expect("the direct admission is refused")
+            }
+        };
+
+        // Withdrawn before planning.
+        let cancelled = || {
+            let request = Context::new(request());
+            request.context().stop();
+            request
+        };
+        let Err(planned) = fixture
+            .router
+            .generate(cancelled(), Arc::new(NeverNext))
+            .await
+        else {
+            panic!("a withdrawn request is not planned");
+        };
+        assert_eq!(class_of(&planned), class_of(&direct(cancelled()).await));
+
+        // Pinned to a decode worker the set does not have.
+        let unknown = || {
+            let mut body = request();
+            body.routing_mut().decode_worker_id = Some(fixture.decode.worker_id + 1_000);
+            body.routing_mut().dp_rank = Some(0);
+            Context::new(body)
+        };
+        let Err(planned) = fixture
+            .router
+            .generate(unknown(), Arc::new(NeverNext))
+            .await
+        else {
+            panic!("an unknown decode worker is refused");
+        };
+        assert_eq!(class_of(&planned), class_of(&direct(unknown()).await));
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();
     }
