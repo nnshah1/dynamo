@@ -474,7 +474,7 @@ impl PlannedFlow<'_> {
         k: usize,
         engine_ctx: &Arc<dyn AsyncEngineContext>,
     ) -> Result<Step> {
-        let attempt = plan.dispatch(k)?;
+        let attempt = plan.mark_dispatched(k)?;
         let selection = stage_selection(plan, k, None)?;
         let mut prefill_request = self
             .prefill_request
@@ -496,7 +496,7 @@ impl PlannedFlow<'_> {
         {
             Ok(stream) => stream,
             Err(error) => {
-                plan.fail(k, attempt, failure(&error))?;
+                plan.mark_failed(k, attempt, failure(&error))?;
                 return Err(self.prefill_error(error));
             }
         };
@@ -528,7 +528,7 @@ impl PlannedFlow<'_> {
                 Ok(completion) => completion,
                 Err(error) => {
                     let error = anyhow::Error::from(error);
-                    plan.fail(k, attempt, failure(&error))?;
+                    plan.mark_failed(k, attempt, failure(&error))?;
                     return Err(self.prefill_error(error));
                 }
             };
@@ -544,7 +544,7 @@ impl PlannedFlow<'_> {
                 PrefillCompletion::Terminal { output } => {
                     // The context step finished the request: nothing to hand
                     // off and no decode to select.
-                    plan.complete(k, attempt, worker)?;
+                    plan.mark_completed(k, attempt, worker)?;
                     let output = strip_terminal_disaggregated_params(*output);
                     return Ok(Step::Done(ResponseStream::new(
                         Box::pin(stream::once(async move { output })),
@@ -556,7 +556,7 @@ impl PlannedFlow<'_> {
         self.outcome = Some(outcome);
         // Bootstrap info or the first output unlocks decode; the prefill task
         // reports completion or a late failure through `forward_decode`.
-        plan.handoff(k, attempt)?;
+        plan.mark_handed_off(k, attempt)?;
         Ok(Step::Continue)
     }
 
@@ -567,7 +567,7 @@ impl PlannedFlow<'_> {
         conditional: bool,
         engine_ctx: &Arc<dyn AsyncEngineContext>,
     ) -> Result<Step> {
-        plan.dispatch(k)?;
+        plan.mark_dispatched(k)?;
         let mut lifecycle = self.lifecycle.take();
         if let (Some(lifecycle), Some(worker)) = (lifecycle.as_mut(), plan.worker(k))
             && !self.lifecycle_selected

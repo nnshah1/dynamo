@@ -375,8 +375,8 @@ mod tests {
             .await
             .expect("schedule");
         let first_worker = plan.worker(0).expect("booked");
-        let attempt = plan.dispatch(0).unwrap();
-        plan.fail(
+        let attempt = plan.mark_dispatched(0).unwrap();
+        plan.mark_failed(
             0,
             attempt,
             Failure {

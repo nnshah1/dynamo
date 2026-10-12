@@ -232,9 +232,9 @@ fn previews(router: &FakeRouter) -> usize {
 
 /// Forward stage `k` and report its outcome.
 fn run(plan: &mut Plan, k: usize) -> StageAttempt {
-    let attempt = plan.dispatch(k).expect("ready to dispatch");
+    let attempt = plan.mark_dispatched(k).expect("ready to dispatch");
     let worker = plan.worker(k).expect("booked");
-    plan.complete(k, attempt, worker).expect("complete");
+    plan.mark_completed(k, attempt, worker).expect("complete");
     attempt
 }
 
@@ -640,7 +640,7 @@ async fn cancel_between_admission_and_transfer_releases_the_held_stage() {
     // Cancelled before prefill was dispatched: the host declines to dispatch
     // and fails the booked stage; decode read it, so decode is released too.
     let attempt = plan.attempt(1).unwrap();
-    plan.fail(1, attempt, failure(false)).unwrap();
+    plan.mark_failed(1, attempt, failure(false)).unwrap();
     assert!(state(&plan, 0).is_pending());
     assert_eq!(fixture.outstanding(), 0);
 }
@@ -651,10 +651,11 @@ async fn cancel_after_prefill_dispatch_still_routes_decode_for_kv_cleanup() {
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let req = request("cancel-3");
     let mut plan = booked(&router, &req).await;
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     // The client is gone, but prefill is staging KV for one decode worker:
     // the host keeps the plan and routes decode when prefill completes.
-    plan.complete(0, attempt, plan.worker(0).unwrap()).unwrap();
+    plan.mark_completed(0, attempt, plan.worker(0).unwrap())
+        .unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.stage(1).unwrap().inputs, vec![0]);
     run(&mut plan, 1);
@@ -667,12 +668,13 @@ async fn cancel_with_a_held_dependent_of_a_dispatched_producer_keeps_it() {
     let fixture = Fixture::new();
     let router = fixture.router(StageList::decode_first());
     let mut plan = booked(&router, &request("cancel-4")).await;
-    let attempt = plan.dispatch(1).unwrap();
+    let attempt = plan.mark_dispatched(1).unwrap();
     // Cancellation arrives; prefill already reached a worker, so the host
     // keeps the plan: decode stays reserved and nothing on it changes.
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(fixture.decode.outstanding().len(), 1);
-    plan.complete(1, attempt, plan.worker(1).unwrap()).unwrap();
+    plan.mark_completed(1, attempt, plan.worker(1).unwrap())
+        .unwrap();
     assert_eq!(ready(&plan), vec![0]);
     run(&mut plan, 0);
 }
@@ -682,7 +684,7 @@ async fn dropping_the_host_side_after_transfer_releases_the_reservation() {
     let fixture = Fixture::new();
     let router = fixture.router(StageList::aggregated());
     let mut plan = booked(&router, &request("drop-1")).await;
-    let _ = plan.dispatch(0).unwrap();
+    let _ = plan.mark_dispatched(0).unwrap();
     drop(plan);
     assert_eq!(fixture.outstanding(), 0);
     assert_eq!(fixture.aggregated.release_count("drop-1"), 1);
@@ -698,12 +700,12 @@ async fn retry_fences_the_old_attempts_handoff_and_failure() {
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let req = request("retry-1");
     let mut plan = booked(&router, &req).await;
-    let first = plan.dispatch(0).unwrap();
+    let first = plan.mark_dispatched(0).unwrap();
     assert_eq!(first, StageAttempt::FIRST);
     let failed_worker = plan.worker(0).unwrap();
     assert_eq!(failed_worker.worker_id, 11);
 
-    plan.fail(0, first, failure(true)).unwrap();
+    plan.mark_failed(0, first, failure(true)).unwrap();
     plan.retry(0).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     let second = plan.attempt(0).unwrap();
@@ -713,12 +715,12 @@ async fn retry_fences_the_old_attempts_handoff_and_failure() {
 
     // Late events for the old attempt change nothing.
     assert!(matches!(
-        plan.complete(0, first, failed_worker),
+        plan.mark_completed(0, first, failed_worker),
         Err(PlanError::StaleAttempt { .. })
     ));
     assert!(state(&plan, 1).is_pending());
     assert!(matches!(
-        plan.fail(0, first, failure(true)),
+        plan.mark_failed(0, first, failure(true)),
         Err(PlanError::StaleAttempt { .. })
     ));
     assert_eq!(state(&plan, 0), &StageState::Booked);
@@ -735,10 +737,10 @@ async fn duplicate_terminal_events_are_idempotent() {
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let req = request("dup-1");
     let mut plan = booked(&router, &req).await;
-    let attempt = plan.dispatch(0).unwrap();
+    let attempt = plan.mark_dispatched(0).unwrap();
     let worker = plan.worker(0).unwrap();
-    plan.complete(0, attempt, worker).unwrap();
-    plan.complete(0, attempt, worker).unwrap();
+    plan.mark_completed(0, attempt, worker).unwrap();
+    plan.mark_completed(0, attempt, worker).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(books(&fixture.decode), 1, "decode is booked once");
@@ -882,8 +884,8 @@ async fn retry_exhaustion_fails_the_stage_and_releases_dependents() {
     let req = request("exhaust-1");
     let mut plan = booked(&router, &req).await;
     let first_decode = fixture.decode.outstanding()[0].clone();
-    let first = plan.dispatch(1).unwrap();
-    plan.fail(1, first, failure(true)).unwrap();
+    let first = plan.mark_dispatched(1).unwrap();
+    plan.mark_failed(1, first, failure(true)).unwrap();
     assert!(
         state(&plan, 0).is_pending(),
         "the held decode read the failed stage"
@@ -897,8 +899,8 @@ async fn retry_exhaustion_fails_the_stage_and_releases_dependents() {
         vec!["exhaust-1/0/1".to_string()]
     );
 
-    let second = plan.dispatch(1).unwrap();
-    plan.fail(1, second, failure(true)).unwrap();
+    let second = plan.mark_dispatched(1).unwrap();
+    plan.mark_failed(1, second, failure(true)).unwrap();
     plan.retry(1).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::Conflict(_)), "{error}");
@@ -911,8 +913,8 @@ async fn non_retryable_failure_completes_routing_after_releasing_held_stages() {
     let fixture = Fixture::new();
     let router = fixture.router(StageList::decode_first());
     let mut plan = booked(&router, &request("fatal-1")).await;
-    let attempt = plan.dispatch(1).unwrap();
-    plan.fail(1, attempt, failure(false)).unwrap();
+    let attempt = plan.mark_dispatched(1).unwrap();
+    plan.mark_failed(1, attempt, failure(false)).unwrap();
     assert!(matches!(
         plan.retry(1),
         Err(PlanError::InvalidTransition { .. })
@@ -1302,8 +1304,8 @@ async fn a_bypassed_decode_can_be_retried_elsewhere() {
         22,
         "pinned to the preview"
     );
-    let attempt = plan.dispatch(1).unwrap();
-    plan.fail(1, attempt, failure(true)).unwrap();
+    let attempt = plan.mark_dispatched(1).unwrap();
+    plan.mark_failed(1, attempt, failure(true)).unwrap();
     plan.retry(1).unwrap();
     router
         .schedule(&req, &mut plan)
