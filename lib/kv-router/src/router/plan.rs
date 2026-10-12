@@ -795,13 +795,13 @@ impl Plan {
     /// Stage `k`'s attempt is running and has handed its dependents what
     /// they need: they may be booked and forwarded now. The stage still
     /// completes or fails later. Idempotent for the current attempt.
-    pub fn handoff(&mut self, k: usize, attempt: StageAttempt) -> Result<(), PlanError> {
+    pub fn mark_handed_off(&mut self, k: usize, attempt: StageAttempt) -> Result<(), PlanError> {
         self.check_index(k)?;
         self.check_attempt(k, attempt)?;
         match &self.slots[k].state {
             StageState::Dispatched(_) => {}
             StageState::HandedOff(_) => return Ok(()),
-            _ => return Err(self.invalid_transition(k, "hand off")),
+            _ => return Err(self.invalid_transition(k, "mark handed off")),
         }
         self.slots[k].state = StageState::HandedOff(attempt);
         Ok(())
@@ -809,7 +809,7 @@ impl Plan {
 
     /// Stage `k`'s attempt finished on `worker`. The booking stays held
     /// until `release`. Idempotent for the current attempt.
-    pub fn complete(
+    pub fn mark_completed(
         &mut self,
         k: usize,
         attempt: StageAttempt,
@@ -824,7 +824,7 @@ impl Plan {
             | StageState::Booked
             | StageState::Failed(..)
             | StageState::Skipped => {
-                return Err(self.invalid_transition(k, "complete"));
+                return Err(self.invalid_transition(k, "mark completed"));
             }
         }
         debug_assert_eq!(self.slots[k].last_worker, Some(worker));
@@ -836,7 +836,7 @@ impl Plan {
     /// stage. Its booking is released and every booked stage that reads it,
     /// transitively, falls back to `Pending`. Idempotent for the current
     /// attempt.
-    pub fn fail(
+    pub fn mark_failed(
         &mut self,
         k: usize,
         attempt: StageAttempt,
@@ -848,7 +848,7 @@ impl Plan {
             StageState::Booked | StageState::Dispatched(_) | StageState::HandedOff(_) => {}
             StageState::Failed(..) => return Ok(()),
             StageState::Pending | StageState::Completed(_) | StageState::Skipped => {
-                return Err(self.invalid_transition(k, "fail"));
+                return Err(self.invalid_transition(k, "mark failed"));
             }
         }
         drop(self.slots[k].reset(StageState::Failed(attempt, cause)));
