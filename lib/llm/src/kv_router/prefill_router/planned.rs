@@ -24,7 +24,7 @@ use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::conditional_disagg::ConditionalDisaggPolicy;
 use dynamo_kv_router::router::{
-    ClassTable, Constraint, Failure, MultiStageRouter, Outcome, Plan, Router, StageList, StageState,
+    ClassTable, Constraint, Failure, MultiStageRouter, Plan, Router, StageList, StageState,
 };
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
@@ -358,7 +358,7 @@ impl PlannedFlow<'_> {
             .take()
             .ok_or_else(|| anyhow!("prefill stage executed twice"))?;
         let phase_barrier = self.tracker.set_phase(RequestPhase::Prefill).await;
-        let worker = side.plan.worker();
+        let worker = side.worker();
         let target = AffinityTarget::new(worker.worker_id, Some(worker.dp_rank));
         let prepared = self.router.prepare_prefill_dispatch(
             &mut prefill_request,
@@ -368,7 +368,7 @@ impl PlannedFlow<'_> {
         let prefill_stream = match self
             .binding
             .router
-            .dispatch_kv_plan(prefill_request, side.plan)
+            .dispatch_kv_plan(prefill_request, side)
             .await
         {
             Ok(stream) => stream,
@@ -421,14 +421,7 @@ impl PlannedFlow<'_> {
                 PrefillCompletion::Terminal { output } => {
                     // The context step finished the request: nothing to hand
                     // off and no decode to select.
-                    plan.complete(
-                        k,
-                        attempt,
-                        Outcome {
-                            worker,
-                            kv_hint: None,
-                        },
-                    )?;
+                    plan.complete(k, attempt, worker)?;
                     let output = strip_terminal_disaggregated_params(*output);
                     return Ok(Step::Done(ResponseStream::new(
                         Box::pin(stream::once(async move { output })),
@@ -510,7 +503,7 @@ impl PlannedFlow<'_> {
             })
         };
         self.dispatched = true;
-        let dispatch = self.decode_host.dispatch_kv_plan(decode_request, side.plan);
+        let dispatch = self.decode_host.dispatch_kv_plan(decode_request, side);
         let response = match self.prefill_completion.take() {
             Some(completion) => {
                 completion
@@ -1324,12 +1317,7 @@ mod tests {
         );
         // Prefill's admitted route stays with the host for the caller to
         // abort, as any booked stage does when a later one fails.
-        prefill
-            .take_side(0)
-            .expect("prefill route")
-            .plan
-            .abort()
-            .await;
+        prefill.take_side(0).expect("prefill route").abort().await;
         plan.release().await.unwrap();
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();

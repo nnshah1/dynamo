@@ -4565,7 +4565,7 @@ async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan
     let side = set_router
         .take_side(0)
         .expect("the admitted route is parked beside the plan");
-    assert_eq!(side.plan.worker().worker_id, worker_id);
+    assert_eq!(side.worker().worker_id, worker_id);
     assert_eq!(side.signals.worker.worker_id, worker_id);
     assert!(set_router.take_side(0).is_none(), "taken once");
 
@@ -4573,7 +4573,7 @@ async fn host_set_router_books_through_the_routing_host_and_parks_the_route_plan
     drop(plan);
     let still_held = potential_loads(&host).await;
     assert_eq!(active_requests_for(&still_held, worker_id, 0), 1);
-    side.plan.abort().await;
+    side.abort().await;
     let released = potential_loads(&host).await;
     assert_eq!(active_requests_for(&released, worker_id, 0), 0);
 }
@@ -4748,7 +4748,7 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
         1,
         "only the held booking is charged"
     );
-    held_side.plan.abort().await;
+    held_side.abort().await;
     drop(held);
     let _ = std::fs::remove_file(policy);
 }
@@ -4975,7 +4975,7 @@ async fn a_queue_rejection_keeps_its_payload_through_the_plan_host() {
         1,
         "only the held booking is charged"
     );
-    held_side.plan.abort().await;
+    held_side.abort().await;
     drop(held);
     let _ = std::fs::remove_file(policy);
 }

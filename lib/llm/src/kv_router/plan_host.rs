@@ -32,7 +32,7 @@ use dynamo_kv_router::services::selection::{
 };
 use dynamo_runtime::pipeline::{Context, SingleIn, async_trait};
 
-use super::routing_host::{CleanupBudget, RoutePlan, RoutePlanSignals, RoutePreview, RoutingHost};
+use super::routing_host::{CleanupBudget, RoutePlan, RoutePreview, RoutingHost};
 use crate::protocols::common::{llm_backend::PreprocessedRequest, timing::RequestPhase};
 
 /// The conditional-disagg thresholds the legacy host consults; the set router
@@ -41,12 +41,6 @@ use crate::protocols::common::{llm_backend::PreprocessedRequest, timing::Request
 pub(crate) struct BusyThresholds {
     pub prefill: Option<f64>,
     pub decode: Option<f64>,
-}
-
-/// What the host keeps beside a booked stage until it dispatches it.
-pub(crate) struct StageSide {
-    pub plan: RoutePlan,
-    pub signals: RoutePlanSignals,
 }
 
 /// A [`Router`] over one worker set's [`RoutingHost`].
@@ -65,7 +59,9 @@ pub(crate) struct HostSetRouter {
     /// The host preview behind the last advisory `select`, so an admission
     /// pinned to that worker continues its cleanup budget.
     pending_preview: Mutex<Option<(WorkerWithDpRank, RoutePreview)>>,
-    sidecar: Mutex<HashMap<usize, StageSide>>,
+    /// The admitted route of each booked stage, kept beside the plan until
+    /// the host dispatches it.
+    sidecar: Mutex<HashMap<usize, RoutePlan>>,
 }
 
 impl HostSetRouter {
@@ -97,7 +93,7 @@ impl HostSetRouter {
     }
 
     /// The admitted route for stage `k`, for the host to dispatch.
-    pub(crate) fn take_side(&self, k: usize) -> Option<StageSide> {
+    pub(crate) fn take_side(&self, k: usize) -> Option<RoutePlan> {
         self.sidecar.lock().expect("sidecar lock").remove(&k)
     }
 
@@ -365,18 +361,17 @@ impl Router for HostSetRouter {
                 .worker_config(route_plan.worker().worker_id)
                 .and_then(|config| {
                     plan.check_placement(k, &config)?;
-                    plan.book(k, Booking::Committed(descriptor), config, None)?;
+                    plan.book(k, Booking::Committed(descriptor), config)?;
                     Ok(())
                 });
             if let Err(error) = recorded {
                 route_plan.abort().await;
                 return Err(error);
             }
-            let side = StageSide {
-                signals: route_plan.signals,
-                plan: route_plan,
-            };
-            self.sidecar.lock().expect("sidecar lock").insert(k, side);
+            self.sidecar
+                .lock()
+                .expect("sidecar lock")
+                .insert(k, route_plan);
         }
         Ok(())
     }
