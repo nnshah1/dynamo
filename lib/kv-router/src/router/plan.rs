@@ -177,8 +177,6 @@ impl StageWork {
 pub enum SkipRule {
     /// No multimodal input (an encode stage).
     NoMultimodal,
-    /// The stage's worker set is busier than this fraction.
-    SetBusy(f64),
     /// The conditional-disaggregation policy and decode-busy gate.
     ConditionalDisagg,
 }
@@ -491,6 +489,14 @@ impl Plan {
             }
         }
         state
+    }
+
+    pub fn stages(&self) -> impl Iterator<Item = &Stage> {
+        self.slots.iter().map(|slot| &slot.stage)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.slots.iter().any(|slot| slot.state.is_pending())
     }
 
     /// Pending stages the router can book on this `schedule` call: their

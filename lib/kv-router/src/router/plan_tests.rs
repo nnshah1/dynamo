@@ -186,7 +186,7 @@ fn a_deferred_stage_is_booked_only_after_its_input_completes() {
     p.book(1, booking("d", worker(21), &releases), zone("a"))
         .unwrap();
     assert_eq!(vec_of(p.ready()), vec![1]);
-    assert!(p.schedulable().next().is_none());
+    assert!(!p.has_pending());
     p.abort();
     assert_eq!(
         releases.load(Ordering::SeqCst),
