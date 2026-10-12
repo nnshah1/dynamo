@@ -233,7 +233,6 @@ mod tests {
             0,
             Booking::scripted("p", WorkerWithDpRank::new(11, 0), releases),
             prefill,
-            None,
         )
         .unwrap();
         plan
