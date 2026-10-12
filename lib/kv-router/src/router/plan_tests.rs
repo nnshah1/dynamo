@@ -1153,11 +1153,12 @@ fn scoring_follows_the_work_unless_the_stage_says_otherwise() {
         overlap_score_credit: Some(0.7),
         ..RouterConfigOverride::default()
     };
-    StageScoring::LoadOnly.apply_to(&mut config);
-    assert_eq!(config.overlap_score_credit, Some(0.0));
     StageScoring::CacheAware.apply_to(&mut config);
     assert_eq!(
-        config.overlap_score_credit, None,
-        "the set's credit applies"
+        config.overlap_score_credit,
+        Some(0.7),
+        "the request's own credit stands"
     );
+    StageScoring::LoadOnly.apply_to(&mut config);
+    assert_eq!(config.overlap_score_credit, Some(0.0));
 }
