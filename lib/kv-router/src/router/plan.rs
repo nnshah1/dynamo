@@ -603,16 +603,12 @@ impl Plan {
         self.slots.get(k)?.kv_hint.as_ref()
     }
 
-<<<<<<< HEAD
-=======
     /// The scheduler's answer behind stage `k`'s booking, when a scheduler
     /// made it: what it saw of the worker's cache and load at admission.
     pub fn scheduling(&self, k: usize) -> Option<&SchedulingResponse> {
         self.slots.get(k)?.scheduling.as_ref()
     }
 
-    /// The worker stage `k` is booked on.
->>>>>>> 6e58740204 (feat(kv-router): the plan keeps the scheduler's answer behind each booking)
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {
