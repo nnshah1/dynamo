@@ -4774,12 +4774,12 @@ async fn a_worker_that_left_the_set_is_refused_not_recorded_unrestricted() {
         BusyThresholds::default(),
     );
     assert!(
-        set_router.facts(worker_id).is_ok(),
-        "a present worker has facts"
+        set_router.worker_config(worker_id).is_ok(),
+        "a present worker has a config"
     );
     assert!(
         matches!(
-            set_router.facts(worker_id + 1_000),
+            set_router.worker_config(worker_id + 1_000),
             Err(SelectionError::Internal(_))
         ),
         "an absent worker is refused"

@@ -22,7 +22,7 @@ use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageWork, WorkerFacts,
+    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageWork, WorkerConfig,
 };
 use dynamo_kv_router::scheduling::{KvSchedulerError, QueueRejection};
 use dynamo_kv_router::services::overlap::MooncakeOverlapSummary;
@@ -105,18 +105,21 @@ impl HostSetRouter {
         self.host.kv_router().selection.partition_key().clone()
     }
 
-    /// The admitted worker's placement facts, captured now for the stages
+    /// The admitted worker's configuration, captured now for the stages
     /// placed against it later. The worker was in the set an instant ago;
     /// missing now means it just left, and a booking on it is useless, so
     /// the stage is refused rather than recorded as a worker with no
     /// placement requirements (as the core does).
-    pub(crate) fn facts(&self, worker_id: WorkerId) -> Result<WorkerFacts, SelectionError> {
+    pub(crate) fn worker_config(
+        &self,
+        worker_id: WorkerId,
+    ) -> Result<WorkerConfig, SelectionError> {
         self.host
             .kv_router()
             .workers_with_configs
             .borrow()
             .get(&worker_id)
-            .map(WorkerFacts::from_config)
+            .map(|config| Arc::new(config.clone()) as WorkerConfig)
             .ok_or_else(|| {
                 SelectionError::Internal(format!(
                     "selected worker {worker_id} left the set before it could be booked"
@@ -358,11 +361,13 @@ impl Router for HostSetRouter {
             // The chosen worker's own requirement on its earlier peers is the
             // one check the forward constraints it was selected under cannot
             // make; a refused pair is aborted before the host keeps it.
-            let recorded = self.facts(route_plan.worker().worker_id).and_then(|facts| {
-                plan.check_placement(k, &facts)?;
-                plan.book(k, Booking::Committed(descriptor), facts, None)?;
-                Ok(())
-            });
+            let recorded = self
+                .worker_config(route_plan.worker().worker_id)
+                .and_then(|config| {
+                    plan.check_placement(k, &config)?;
+                    plan.book(k, Booking::Committed(descriptor), config, None)?;
+                    Ok(())
+                });
             if let Err(error) = recorded {
                 route_plan.abort().await;
                 return Err(error);
