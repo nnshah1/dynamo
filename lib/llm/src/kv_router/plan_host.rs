@@ -365,7 +365,7 @@ impl Router for HostSetRouter {
                 .worker_config(route_plan.worker().worker_id)
                 .and_then(|config| {
                     plan.check_placement(k, &config)?;
-                    plan.book(k, Booking::Committed(descriptor), config)?;
+                    plan.book(k, Booking::Committed(descriptor), config, None)?;
                     Ok(())
                 });
             if let Err(error) = recorded {
