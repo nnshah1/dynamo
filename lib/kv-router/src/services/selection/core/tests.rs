@@ -470,7 +470,7 @@ async fn unreachable_remote_indexer_is_reported_not_ready() {
 
 /// Two event-driven workers; worker 1 holds every block of an 8-token
 /// prompt. `configure` adjusts each registration before upsert.
-async fn hint_fixture(
+pub(super) async fn hint_fixture(
     configure: impl Fn(&mut WorkerRequest),
 ) -> (SelectionCore, Arc<SelectionEntry>, Vec<u32>) {
     use crate::indexer::KvIndexerInterface;
@@ -499,7 +499,7 @@ async fn hint_fixture(
     (core, entry, tokens)
 }
 
-fn hint_capable(request: &mut WorkerRequest) {
+pub(super) fn hint_capable(request: &mut WorkerRequest) {
     request.router_hint_worker_type = Some("decode".to_string());
     request.router_hint_source_control_endpoints =
         HashMap::from([(0, format!("tcp://worker-{}:9000", request.worker_id))]);
