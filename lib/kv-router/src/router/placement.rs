@@ -5,9 +5,9 @@
 //! workers booked before it, as the topology taints the selector already
 //! filters and scores on.
 
-use crate::protocols::{KvTransferEnforcement, RoutingConstraints};
+use crate::protocols::{KvTransferEnforcement, RoutingConstraints, WorkerConfigLike};
 
-use super::plan::{Constraint, DomainMode, Plan, PlanError, WorkerFacts};
+use super::plan::{Constraint, DomainMode, Plan, PlanError, WorkerConfig};
 
 /// Prefix of the taint a worker publishes for each topology domain; the same
 /// one the frontend's KV-transfer constraints use.
@@ -34,16 +34,16 @@ impl Plan {
         };
         for constraint in &stage.constraints {
             let derived = match constraint {
-                Constraint::TransferCompatible(j) => match self.facts(*j) {
-                    Some(facts) => transfer_constraint(facts, k, *j)?,
+                Constraint::TransferCompatible(j) => match self.worker_config(*j) {
+                    Some(config) => transfer_constraint(config, k, *j)?,
                     None => Derived::None,
                 },
                 Constraint::SameDomain {
                     stage: j,
                     key,
                     mode,
-                } => match self.facts(*j) {
-                    Some(facts) => same_domain_constraint(facts, key, *mode, k, *j)?,
+                } => match self.worker_config(*j) {
+                    Some(config) => same_domain_constraint(config, key, *mode, k, *j)?,
                     None => Derived::None,
                 },
                 Constraint::Pin(_) | Constraint::Previewed(_) | Constraint::Exclude(_) => {
@@ -87,7 +87,7 @@ impl Plan {
             .into_iter()
             .flat_map(|stage| stage.constraints.iter().filter_map(Constraint::reads))
             .filter(move |&j| {
-                self.facts(j).is_none()
+                self.worker_config(j).is_none()
                     && self.state_of(j) != Some(&super::plan::StageState::Skipped)
             })
     }
@@ -97,7 +97,7 @@ impl Plan {
     /// The check in the other direction: the worker chosen for stage `k`
     /// may itself require KV-transfer peers in its own domain, which the
     /// earlier stages' workers must satisfy. Run before booking `k`.
-    pub fn check_placement(&self, k: usize, facts: &WorkerFacts) -> Result<(), PlanError> {
+    pub fn check_placement(&self, k: usize, config: &WorkerConfig) -> Result<(), PlanError> {
         let Some(stage) = self.stage(k) else {
             return Err(PlanError::NoSuchStage { stage: k });
         };
@@ -105,11 +105,11 @@ impl Plan {
             let Constraint::TransferCompatible(j) = constraint else {
                 continue;
             };
-            let Some(peer) = self.facts(*j) else {
+            let Some(peer) = self.worker_config(*j) else {
                 continue;
             };
-            if let Derived::Required(taint) = transfer_constraint(facts, *j, k)?
-                && !peer.taints.contains(&taint)
+            if let Derived::Required(taint) = transfer_constraint(config.as_ref(), *j, k)?
+                && !peer.taints().contains(&taint)
             {
                 return Err(PlanError::Placement {
                     stage: k,
@@ -125,13 +125,13 @@ impl Plan {
 }
 
 fn same_domain_constraint(
-    facts: &WorkerFacts,
+    config: &dyn WorkerConfigLike,
     domain: &str,
     mode: DomainMode,
     stage: usize,
     reads: usize,
 ) -> Result<Derived, PlanError> {
-    let Some(value) = facts.topology_value(domain) else {
+    let Some(value) = topology_value(config, domain) else {
         return match mode {
             DomainMode::Required => Err(PlanError::Placement {
                 stage,
@@ -148,13 +148,17 @@ fn same_domain_constraint(
     })
 }
 
+fn topology_value<'a>(config: &'a dyn WorkerConfigLike, domain: &str) -> Option<&'a str> {
+    config.topology_domains()?.get(domain).map(String::as_str)
+}
+
 /// The KV-transfer constraint a booked worker imposes on its peers.
 fn transfer_constraint(
-    facts: &WorkerFacts,
+    config: &dyn WorkerConfigLike,
     stage: usize,
     reads: usize,
 ) -> Result<Derived, PlanError> {
-    let Some(domain) = facts.kv_transfer_domain.as_deref() else {
+    let Some(domain) = config.kv_transfer_domain() else {
         return Ok(Derived::None);
     };
     let placement = |reason: String| PlanError::Placement {
@@ -162,16 +166,16 @@ fn transfer_constraint(
         reads,
         reason,
     };
-    let value = facts.topology_value(domain).ok_or_else(|| {
+    let value = topology_value(config, domain).ok_or_else(|| {
         placement(format!(
             "kv_transfer_domain={domain:?} but topology_domains has no such domain"
         ))
     })?;
     let taint = topology_taint(domain, value);
-    match facts.kv_transfer_enforcement {
+    match config.kv_transfer_enforcement() {
         Some(KvTransferEnforcement::Required) => Ok(Derived::Required(taint)),
         Some(KvTransferEnforcement::Preferred) => {
-            let weight = facts.kv_transfer_preferred_weight.ok_or_else(|| {
+            let weight = config.kv_transfer_preferred_weight().ok_or_else(|| {
                 placement(format!(
                     "preferred KV transfer for {domain:?} but kv_transfer_preferred_weight is missing"
                 ))
@@ -191,23 +195,27 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::super::booking::Booking;
-    use super::super::plan::{Constraint, DomainMode, Plan, PlanError, PlanId, Stage, WorkerFacts};
+    use super::super::plan::{
+        Constraint, DomainMode, Plan, PlanError, PlanId, Stage, WorkerConfig,
+    };
     use super::*;
     use crate::WorkerType;
     use crate::identity::RoutingPartitionId;
     use crate::protocols::WorkerWithDpRank;
+    use crate::test_utils::SimpleWorkerConfig;
 
-    fn facts(zone: &str, enforcement: Option<KvTransferEnforcement>) -> WorkerFacts {
-        WorkerFacts {
+    fn facts(zone: &str, enforcement: Option<KvTransferEnforcement>) -> WorkerConfig {
+        Arc::new(SimpleWorkerConfig {
             taints: HashSet::from([topology_taint("zone", zone)]),
             topology_domains: HashMap::from([("zone".to_string(), zone.to_string())]),
             kv_transfer_domain: Some("zone".to_string()),
             kv_transfer_enforcement: enforcement,
             kv_transfer_preferred_weight: Some(0.5),
-        }
+            ..SimpleWorkerConfig::default()
+        })
     }
 
-    fn booked_prefill(constraint: Constraint, prefill: WorkerFacts) -> Plan {
+    fn booked_prefill(constraint: Constraint, prefill: WorkerConfig) -> Plan {
         let mut plan = Plan::new(
             PlanId::from("p"),
             RoutingPartitionId::new("model", "default"),
@@ -271,11 +279,11 @@ mod tests {
         // against it requires zone-a peers.
         let plan = booked_prefill(
             Constraint::TransferCompatible(0),
-            WorkerFacts {
+            Arc::new(SimpleWorkerConfig {
                 taints: HashSet::from([topology_taint("zone", "b")]),
                 topology_domains: HashMap::from([("zone".to_string(), "b".to_string())]),
-                ..WorkerFacts::default()
-            },
+                ..SimpleWorkerConfig::default()
+            }),
         );
         let strict = facts("a", Some(KvTransferEnforcement::Required));
         assert!(matches!(
@@ -299,14 +307,17 @@ mod tests {
             key: "rack".to_string(),
             mode,
         };
-        let plan = booked_prefill(rule(DomainMode::Required), WorkerFacts::default());
+        let plan = booked_prefill(
+            rule(DomainMode::Required),
+            Arc::new(SimpleWorkerConfig::default()) as WorkerConfig,
+        );
         assert!(matches!(
             plan.routing_constraints(1),
             Err(PlanError::Placement { .. })
         ));
         let plan = booked_prefill(
             rule(DomainMode::Preferred { weight: 1.0 }),
-            WorkerFacts::default(),
+            Arc::new(SimpleWorkerConfig::default()) as WorkerConfig,
         );
         assert!(plan.routing_constraints(1).unwrap().is_empty());
     }
