@@ -24,7 +24,7 @@ use dynamo_kv_router::config::RouterConfigOverride;
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank};
 use dynamo_kv_router::router::{
-    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageAttempt, StageWork, WorkerFacts,
+    Booking, Budget, Constraint, Plan, PlanId, Router, Stage, StageAttempt, StageWork, WorkerConfig,
 };
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::overlap::MooncakeOverlapSummary;
@@ -113,13 +113,20 @@ impl KvRouterSetRouter {
         self.router.selection.partition_key().clone()
     }
 
-    fn facts(&self, worker_id: WorkerId) -> WorkerFacts {
+    /// The admitted worker's configuration, captured for the stages placed
+    /// against it later; a worker that left the set since selection is
+    /// refused, as the core refuses it.
+    fn worker_config(&self, worker_id: WorkerId) -> Result<WorkerConfig, SelectionError> {
         self.router
             .workers_with_configs
             .borrow()
             .get(&worker_id)
-            .map(WorkerFacts::from_config)
-            .unwrap_or_default()
+            .map(|config| Arc::new(config.clone()) as WorkerConfig)
+            .ok_or_else(|| {
+                SelectionError::Internal(format!(
+                    "selected worker {worker_id} left the set before it could be booked"
+                ))
+            })
     }
 
     fn pin(&self, body: &mut PreprocessedRequest, worker: WorkerWithDpRank) {
@@ -401,15 +408,16 @@ impl Router for KvRouterSetRouter {
             // The chosen worker's own requirement on its earlier peers is the
             // one check the forward constraints it was selected under cannot
             // make; a refused pair frees the exported booking by its id.
-            let facts = self.facts(worker.worker_id);
-            if let Err(error) = plan
-                .check_placement(k, &facts)
-                .and_then(|()| plan.book(k, Booking::Committed(descriptor), facts, kv_hint))
-            {
+            let recorded = self.worker_config(worker.worker_id).and_then(|config| {
+                plan.check_placement(k, &config)?;
+                plan.book(k, Booking::Committed(descriptor), config, kv_hint)?;
+                Ok(())
+            });
+            if let Err(error) = recorded {
                 if let Err(free_error) = self.router.free(&id).await {
                     tracing::debug!(booking_id = %id, %free_error, "freeing a booking the plan refused");
                 }
-                return Err(error.into());
+                return Err(error);
             }
         }
         Ok(())

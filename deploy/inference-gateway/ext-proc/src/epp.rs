@@ -273,12 +273,12 @@ impl PlanRouter for PrefillReservationRouter {
                 .map_err(prefill_error)?;
             let worker =
                 WorkerWithDpRank::new(reservation.worker_id(), reservation.dp_rank().unwrap_or(0));
-            // The reserved worker's actual placement facts, checked both ways
-            // before the plan records it. A refused reservation is released.
-            let facts = reservation.facts().clone();
+            // The reserved worker's configuration, checked both ways before
+            // the plan records it. A refused reservation is released.
+            let config = reservation.config().clone();
             if let Err(error) = plan
-                .check_placement(k, &facts)
-                .and_then(|()| plan.book_untracked(k, worker, facts))
+                .check_placement(k, &config)
+                .and_then(|()| plan.book_untracked(k, worker, config))
             {
                 if let Err(release_error) = reservation.release().await {
                     tracing::debug!(%release_error, "Failed to release a prefill reservation the plan refused");

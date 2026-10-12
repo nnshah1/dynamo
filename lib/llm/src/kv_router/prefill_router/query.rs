@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Result;
 use dynamo_kv_router::{
     protocols::{BlockExtraInfo, RoutingConstraints, WorkerId, WorkerWithDpRank},
-    router::WorkerFacts,
+    router::WorkerConfig,
     scheduling::queue::BookingHandle,
 };
 
 use super::{PrefillError, PrefillLifecycleState, PrefillRouter};
+use crate::local_model::runtime_config::ModelRuntimeConfig;
 
 /// A prefill booking that owns cleanup of the exact scheduler attempt it admitted.
 ///
@@ -22,9 +24,9 @@ use super::{PrefillError, PrefillLifecycleState, PrefillRouter};
 pub struct PrefillReservation {
     worker: WorkerWithDpRank,
     dp_rank: Option<u32>,
-    /// The worker's placement facts at reservation time, for a plan that
+    /// The worker's configuration at reservation time, for a plan that
     /// places later stages against it.
-    facts: WorkerFacts,
+    config: WorkerConfig,
     booking: Option<BookingHandle>,
 }
 
@@ -37,8 +39,8 @@ impl PrefillReservation {
         self.dp_rank
     }
 
-    pub fn facts(&self) -> &WorkerFacts {
-        &self.facts
+    pub fn config(&self) -> &WorkerConfig {
+        &self.config
     }
 
     /// Release this booking and wait for the scheduler to acknowledge it.
@@ -91,7 +93,9 @@ impl PrefillRouter {
             return Ok(PrefillReservation {
                 worker: WorkerWithDpRank::new(worker_id, 0),
                 dp_rank: None,
-                facts: WorkerFacts::default(),
+                // Round-robin prefill has no config map: no topology is
+                // published on this path, so an empty config is exact.
+                config: Arc::new(ModelRuntimeConfig::default()),
                 booking: None,
             });
         };
@@ -122,16 +126,23 @@ impl PrefillRouter {
                 let Some(booking) = booking else {
                     anyhow::bail!("prefill reservation admission did not return a booking");
                 };
-                let facts = chooser
+                // The worker was in the set an instant ago; gone now means the
+                // reservation is useless, and dropping the handle frees it.
+                let config: WorkerConfig = chooser
                     .workers_with_configs
                     .borrow()
                     .get(&worker.worker_id)
-                    .map(WorkerFacts::from_config)
-                    .unwrap_or_default();
+                    .map(|config| Arc::new(config.clone()) as WorkerConfig)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "prefill worker {} left the set before it could be reserved",
+                            worker.worker_id
+                        )
+                    })?;
                 Ok(PrefillReservation {
                     worker,
                     dp_rank: Some(worker.dp_rank),
-                    facts,
+                    config,
                     booking: Some(booking),
                 })
             }
