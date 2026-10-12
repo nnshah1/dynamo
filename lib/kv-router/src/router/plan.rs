@@ -177,7 +177,7 @@ impl StageWork {
 /// How a stage's set scores its candidates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StageScoring {
-    /// The set's configured cache credit applies.
+    /// The cache credit the request or the set configured applies.
     CacheAware,
     /// Load alone: the prompt's KV comes from elsewhere, so a candidate's
     /// cache of it earns no credit.
@@ -186,13 +186,13 @@ pub enum StageScoring {
 
 impl StageScoring {
     /// The scorer's cache credit for a stage, in the scheduler's
-    /// request-level terms. Like [`StageWork::apply_to`], this replaces the
-    /// request's own override for that field.
+    /// request-level terms. `LoadOnly` replaces the request's own override
+    /// for that field, as [`StageWork::apply_to`] replaces the accounting
+    /// fields; `CacheAware` leaves the request's and the set's choice alone.
     pub fn apply_to(self, config: &mut RouterConfigOverride) {
-        config.overlap_score_credit = match self {
-            StageScoring::CacheAware => None,
-            StageScoring::LoadOnly => Some(0.0),
-        };
+        if self == StageScoring::LoadOnly {
+            config.overlap_score_credit = Some(0.0);
+        }
     }
 }
 
