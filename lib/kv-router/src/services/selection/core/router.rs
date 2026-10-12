@@ -6,6 +6,7 @@
 //! the armed booking to the plan.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use async_trait::async_trait;
 use super::super::types::resolve_session_context;
 use super::run::session_binding;
 use super::*;
-use crate::router::{Booking, Budget, Constraint, Plan, PlanId, Router, Stage, WorkerFacts};
+use crate::router::{Booking, Budget, Constraint, Plan, PlanId, Router, Stage, WorkerConfig};
 
 #[async_trait]
 impl Router for SelectionCore {
@@ -225,7 +226,7 @@ impl SelectionCore {
         recorded
     }
 
-    /// Read the booked worker's facts, check placement against the stages it
+    /// Read the booked worker's config, check placement against the stages it
     /// reads, and hand the booking to the plan. Consumes the booking either
     /// way: on an error the caller rolls it back.
     fn record_stage(
@@ -238,19 +239,19 @@ impl SelectionCore {
     ) -> Result<(), SelectionError> {
         // The worker was in the snapshot the selector read an instant ago;
         // missing now means it just left, and a booking on it is useless.
-        let facts = entry
+        let config: WorkerConfig = entry
             .workers_tx
             .borrow()
             .get(&worker.worker_id)
-            .map(WorkerFacts::from_config)
+            .map(|config| Arc::new(config.clone()) as WorkerConfig)
             .ok_or_else(|| {
                 SelectionError::Internal(format!(
                     "selected worker {} left the partition before it could be booked",
                     worker.worker_id
                 ))
             })?;
-        plan.check_placement(k, &facts)?;
-        plan.book(k, booking, facts, kv_hint)
+        plan.check_placement(k, &config)?;
+        plan.book(k, booking, config, kv_hint)
             .map_err(|error| SelectionError::Internal(error.to_string()))
     }
 }
@@ -333,7 +334,11 @@ mod tests {
         assert_eq!(booking.worker().worker_id, 1);
         assert!(booking.is_owned());
         assert!(entry.scheduler.has_request("sel-1"));
-        assert_eq!(plan.facts(0).unwrap().topology_value("zone"), Some("a"));
+        assert_eq!(
+            plan.worker_config(0)
+                .and_then(|c| c.topology_domains()?.get("zone").cloned()),
+            Some("a".to_string())
+        );
         assert!(
             core.reservation_index.read().is_empty(),
             "the plan owns the booking; no index row"
