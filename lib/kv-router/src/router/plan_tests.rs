@@ -12,12 +12,13 @@ use std::time::Duration;
 use super::booking::Booking;
 use super::plan::{
     Budget, Constraint, Failure, Plan, PlanError, PlanId, PlanState, Retry, SkipRule, Stage,
-    StageAttempt, StageState, StageWork, When, WorkerConfig,
+    StageAttempt, StageScoring, StageState, StageWork, When, WorkerConfig,
 };
 use crate::WorkerType;
 use crate::identity::RoutingPartitionId;
 use crate::protocols::WorkerWithDpRank;
 use crate::scheduling::AttemptId;
+use crate::scheduling::config::RouterConfigOverride;
 use crate::scheduling::queue::SchedulerBookingDescriptor;
 use crate::test_utils::SimpleWorkerConfig;
 
@@ -1112,4 +1113,52 @@ fn stage_work_charges_a_booking_the_same_way_everywhere() {
         charge(StageWork::None),
         (Some(false), None, Some(32), false)
     );
+}
+
+/// A decode stage fed by remote prefill is placed on load alone; once that
+/// prefill is skipped it does the prefill itself and its cache counts again.
+/// The stage's own `scoring` wins over the derived rule, and both forms
+/// write the one scorer field.
+#[test]
+fn scoring_follows_the_work_unless_the_stage_says_otherwise() {
+    let mut p = plan(vec![
+        Stage::new(WorkerType::Prefill),
+        Stage {
+            inputs: vec![0],
+            constraints: vec![Constraint::TransferCompatible(0)],
+            ..Stage::new(WorkerType::Decode)
+        },
+        Stage {
+            inputs: vec![0],
+            scoring: Some(StageScoring::CacheAware),
+            ..Stage::new(WorkerType::Decode)
+        },
+    ]);
+    assert_eq!(p.scoring_of(0), Some(StageScoring::CacheAware));
+    assert_eq!(p.scoring_of(1), Some(StageScoring::LoadOnly));
+    assert_eq!(
+        p.scoring_of(2),
+        Some(StageScoring::CacheAware),
+        "an explicit scoring is kept"
+    );
+    p.skip(0).unwrap();
+    assert_eq!(
+        p.scoring_of(1),
+        Some(StageScoring::CacheAware),
+        "no remote prefill: decode does it, and its cache counts"
+    );
+    assert_eq!(p.scoring_of(3), None);
+
+    let mut config = RouterConfigOverride {
+        overlap_score_credit: Some(0.7),
+        ..RouterConfigOverride::default()
+    };
+    StageScoring::CacheAware.apply_to(&mut config);
+    assert_eq!(
+        config.overlap_score_credit,
+        Some(0.7),
+        "the request's own credit stands"
+    );
+    StageScoring::LoadOnly.apply_to(&mut config);
+    assert_eq!(config.overlap_score_credit, Some(0.0));
 }
