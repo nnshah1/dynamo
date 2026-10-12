@@ -263,8 +263,8 @@ mod tests {
 
     use super::super::super::affinity::SessionAffinityMode;
     use super::super::tests::{
-        core_with_session_affinity_mode, default_key, local_core, reserve_request, saturated_core,
-        test_config, wait_until, worker,
+        core_with_session_affinity_mode, default_key, hint_capable, hint_fixture, local_core,
+        reserve_request, saturated_core, test_config, wait_until, worker,
     };
     use super::*;
     use crate::RouterConfigOverride;
@@ -853,5 +853,35 @@ mod tests {
             Router::schedule(&core, &other, &mut plan).await,
             Err(SelectionError::BadRequest(_))
         ));
+    }
+
+    /// The hint the scheduler attaches to a booking (here: fetch the prefix
+    /// worker 1 holds) is recorded on the plan's stage, where the host reads
+    /// it to dispatch.
+    #[tokio::test]
+    async fn a_booked_stage_records_the_schedulers_kv_hint() {
+        let (core, _entry, tokens) = hint_fixture(hint_capable).await;
+        let mut req = reserve_request("hinted");
+        req.prompt.token_ids = Some(tokens.clone());
+        req.pinned_worker = Some(WorkerWithDpRank::new(2, 0));
+        let mut plan = Router::plan(&core, &req).unwrap();
+        Router::schedule(&core, &req, &mut plan).await.unwrap();
+        let hint = plan
+            .kv_hint(0)
+            .expect("the booking on worker 2 carries a hint");
+        assert_eq!(
+            hint.message_id, "hinted",
+            "the hint is addressed by the booking id"
+        );
+        assert_eq!(hint.actions[0].action_type, "kv.fetch");
+        // Worker 1 holds the prefix itself: nothing to fetch, no hint.
+        let mut req = reserve_request("unhinted");
+        req.prompt.token_ids = Some(tokens);
+        req.pinned_worker = Some(WorkerWithDpRank::new(1, 0));
+        let mut other = Router::plan(&core, &req).unwrap();
+        Router::schedule(&core, &req, &mut other).await.unwrap();
+        assert!(other.kv_hint(0).is_none());
+        plan.release().await.unwrap();
+        other.release().await.unwrap();
     }
 }
