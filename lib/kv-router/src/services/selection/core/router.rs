@@ -117,6 +117,11 @@ impl SelectionCore {
             router_config_override.get_or_insert_with(Default::default),
             &mut expected_output_tokens,
         );
+        // How this stage's candidates are scored: a decode that receives its
+        // KV from a prefill stage is placed on load alone.
+        plan.scoring_of(k)
+            .ok_or_else(no_such_stage)?
+            .apply_to(router_config_override.get_or_insert_with(Default::default));
         let track_active_blocks = work.tracks_active_blocks();
         let key = plan.partition().clone();
         let entry = self.ready_entry(&key)?;
@@ -273,7 +278,7 @@ mod tests {
     use super::super::super::affinity::SessionAffinityMode;
     use super::super::tests::{
         core_with_session_affinity_mode, default_key, hint_capable, hint_fixture, local_core,
-        reserve_request, saturated_core, test_config, wait_until, worker,
+        reserve_request, saturated_core, select_request, test_config, wait_until, worker,
     };
     use super::*;
     use crate::RouterConfigOverride;
@@ -892,5 +897,82 @@ mod tests {
         assert!(other.kv_hint(0).is_none());
         plan.release().await.unwrap();
         other.release().await.unwrap();
+    }
+
+    /// Worker 2 holds the whole prompt and one active request; worker 1 is
+    /// idle with nothing cached. A stage that decodes after remote prefill
+    /// is placed on load alone, so it goes to worker 1 despite worker 2's
+    /// cache; the same stage told to score cache-aware goes to worker 2, as
+    /// a plain advisory selection does.
+    #[tokio::test]
+    async fn a_decode_only_stage_is_placed_on_load_not_cache() {
+        use crate::router::StageScoring;
+        let core = local_core(test_config(false));
+        core.upsert_worker(worker(1)).await.expect("worker upsert");
+        core.upsert_worker(worker(2)).await.expect("worker upsert");
+        let tokens: Vec<u32> = (1..=64).collect();
+
+        // Book the prompt on worker 2: the approximate primary records its
+        // prefix there, and the booking is its load.
+        let mut held = reserve_request("held");
+        held.prompt.token_ids = Some(tokens.clone());
+        held.pinned_worker = Some(WorkerWithDpRank::new(2, 0));
+        core.select_and_reserve(held).await.expect("reserve");
+        let advisory = || {
+            let mut req = select_request();
+            req.prompt.token_ids = Some(tokens.clone());
+            req.advisory = true;
+            req
+        };
+        let baseline = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = core.select(advisory()).await.expect("select");
+                if response.overlap.longest_matched > 0 {
+                    return response;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the booked prompt is credited");
+        assert_eq!(baseline.worker_id, 2, "cache-aware: the cached worker wins");
+
+        let stage = |scoring: Option<StageScoring>| {
+            Plan::new(
+                PlanId::from(match scoring {
+                    None => "load-only",
+                    Some(_) => "cache-aware",
+                }),
+                default_key(),
+                vec![Stage {
+                    work: Some(StageWork::DecodeOnly),
+                    scoring,
+                    ..Stage::new(WorkerType::Aggregated)
+                }],
+            )
+            .unwrap()
+        };
+        let mut req = reserve_request("load-only");
+        req.prompt.token_ids = Some(tokens.clone());
+        let mut plan = stage(None);
+        Router::schedule(&core, &req, &mut plan).await.unwrap();
+        assert_eq!(
+            plan.worker(0).unwrap().worker_id,
+            1,
+            "decode after remote prefill ignores the cache and takes the idle worker"
+        );
+
+        let mut req = reserve_request("cache-aware");
+        req.prompt.token_ids = Some(tokens.clone());
+        let mut other = stage(Some(StageScoring::CacheAware));
+        Router::schedule(&core, &req, &mut other).await.unwrap();
+        assert_eq!(
+            other.worker(0).unwrap().worker_id,
+            2,
+            "the stage's own scoring puts it back on the cached worker"
+        );
+        plan.release().await.unwrap();
+        other.release().await.unwrap();
+        core.free_reservation("held").await.unwrap();
     }
 }
