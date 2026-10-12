@@ -432,6 +432,7 @@ impl Router for FakeRouter {
                 Booking::scripted(booking_id, worker.worker, releases),
                 config,
                 None,
+                None,
             )
             .map_err(|error| SelectionError::Internal(error.to_string()))?;
         }
