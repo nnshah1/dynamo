@@ -594,7 +594,8 @@ impl Plan {
     /// The routing hint the scheduler attached to stage `k`'s booking.
     pub fn kv_hint(&self, k: usize) -> Option<&KvHint> {
         self.slots.get(k)?.kv_hint.as_ref()
-    /// The worker stage `k` is booked on.
+    }
+
     /// The worker stage `k` is booked on or ran on; `None` before booking
     /// and after a failure.
     pub fn worker(&self, k: usize) -> Option<WorkerWithDpRank> {
