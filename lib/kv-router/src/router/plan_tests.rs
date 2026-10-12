@@ -767,6 +767,46 @@ fn a_placement_read_needs_the_peers_facts_not_its_booking() {
 }
 
 #[test]
+fn the_kv_hint_travels_with_the_booking_and_clears_with_the_attempt() {
+    use crate::kv_hints::KvHint;
+    let hint = |id: &str| Some(KvHint::new(id, Vec::new()));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let mut plan = plan(prefill_decode(When::Now, Budget::Full));
+    plan.book(
+        0,
+        booking("p", worker(11), &releases),
+        zone("a"),
+        hint("p-1"),
+    )
+    .unwrap();
+    plan.book(1, booking("d", worker(21), &releases), zone("a"), None)
+        .unwrap();
+    assert_eq!(plan.kv_hint(0).map(|h| h.message_id.as_str()), Some("p-1"));
+    assert!(plan.kv_hint(1).is_none());
+
+    // The host taking the booking's ownership does not take the hint: it
+    // still dispatches from the plan.
+    let taken = plan.take_booking(0).unwrap();
+    assert_eq!(plan.kv_hint(0).map(|h| h.message_id.as_str()), Some("p-1"));
+
+    // A failed attempt loses its placement and its hint; the replacement
+    // attempt's booking carries its own.
+    let attempt = plan.dispatch(0).unwrap();
+    plan.fail(0, attempt, failure(true)).unwrap();
+    assert!(plan.kv_hint(0).is_none(), "a failed attempt's hint is gone");
+    plan.retry(0).unwrap();
+    plan.book(
+        0,
+        booking("p2", worker(12), &releases),
+        zone("a"),
+        hint("p-2"),
+    )
+    .unwrap();
+    assert_eq!(plan.kv_hint(0).map(|h| h.message_id.as_str()), Some("p-2"));
+    drop(taken);
+}
+
+#[test]
 fn an_untracked_booking_obeys_the_stages_pins_and_exclusions() {
     let encode = |constraint: Constraint| {
         vec![Stage {
