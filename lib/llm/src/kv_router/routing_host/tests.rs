@@ -4753,6 +4753,39 @@ async fn host_set_router_forwards_the_stages_wait_budget_to_the_queue() {
     let _ = std::fs::remove_file(policy);
 }
 
+/// A worker that left the set between admission and recording is refused,
+/// as the core refuses it, rather than recorded as a worker with no
+/// placement requirements.
+#[tokio::test]
+async fn a_worker_that_left_the_set_is_refused_not_recorded_unrestricted() {
+    use crate::kv_router::plan_host::{BusyThresholds, HostSetRouter};
+    use dynamo_kv_router::WorkerType;
+    use dynamo_kv_router::services::selection::SelectionError;
+
+    let (host, _dispatch, worker_id, _runtime) =
+        router_with_recorded_dispatch("plan-host-vanished-worker").await;
+    let request = Context::new(request());
+    let set_router = HostSetRouter::new(
+        Arc::new(host),
+        WorkerType::Aggregated,
+        RequestPhase::Aggregated,
+        &request,
+        false,
+        BusyThresholds::default(),
+    );
+    assert!(
+        set_router.facts(worker_id).is_ok(),
+        "a present worker has facts"
+    );
+    assert!(
+        matches!(
+            set_router.facts(worker_id + 1_000),
+            Err(SelectionError::Internal(_))
+        ),
+        "an absent worker is refused"
+    );
+}
+
 /// The two answers that are the client's: a request withdrawn before it was
 /// placed, and a pin on a worker the set does not have. Each crosses the
 /// Router boundary typed and leaves the frontend with the class a direct
