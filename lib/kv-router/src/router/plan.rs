@@ -315,7 +315,8 @@ impl StageState {
 /// placement rules. Pure configuration; the plan keeps the state beside it.
 ///
 /// YAML: a bare lowercase set name (`prefill`) or a map:
-/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ... }`.
+/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ...,
+/// work: decode_only, scoring: load_only }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(from = "StageSpec")]
 pub struct Stage {
@@ -350,6 +351,8 @@ enum StageSpec {
         skip: Option<SkipRule>,
         #[serde(default)]
         work: Option<StageWork>,
+        #[serde(default)]
+        scoring: Option<StageScoring>,
     },
 }
 
@@ -377,6 +380,7 @@ impl From<StageSpec> for Stage {
                 constraints,
                 skip,
                 work,
+                scoring,
             } => Self {
                 set,
                 when,
@@ -385,6 +389,7 @@ impl From<StageSpec> for Stage {
                 constraints,
                 skip,
                 work,
+                scoring,
             },
         }
     }
