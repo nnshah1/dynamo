@@ -607,6 +607,14 @@ impl Plan {
         state
     }
 
+    pub fn stages(&self) -> impl Iterator<Item = &Stage> {
+        self.slots.iter().map(|slot| &slot.stage)
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.slots.iter().any(|slot| slot.state.is_pending())
+    }
+
     /// Pending stages the router can book on this `schedule` call: their
     /// `when` is satisfied and every constraint has a worker to read.
     pub fn schedulable(&self) -> impl Iterator<Item = usize> + '_ {
