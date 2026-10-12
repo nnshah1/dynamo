@@ -19,7 +19,7 @@ mod plan_tests;
 pub use booking::Booking;
 pub use plan::{
     Budget, Constraint, DomainMode, Failure, Outcome, Plan, PlanError, PlanId, PlanState, Retry,
-    SkipRule, Stage, StageAttempt, StageState, StageWork, When, WorkerFacts,
+    SkipRule, Stage, StageAttempt, StageState, StageWork, When, WorkerConfig,
 };
 
 #[cfg(feature = "standalone-selection")]
