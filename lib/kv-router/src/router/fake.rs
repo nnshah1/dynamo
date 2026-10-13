@@ -102,13 +102,22 @@ pub struct FakeRouter {
     /// stale by the time the booking is made.
     leaves_after_preview: Mutex<Option<WorkerId>>,
     can_select: bool,
+    /// The worker set this fake is, when a test routes more than one set of
+    /// its type.
+    pool: Option<String>,
 }
 
 impl FakeRouter {
     pub fn new(set: WorkerType) -> Arc<Self> {
+        Self::new_in_pool(set, None)
+    }
+
+    /// A router that is the named worker set `pool` of `set`'s type.
+    pub fn new_in_pool(set: WorkerType, pool: Option<&str>) -> Arc<Self> {
         let (admission_open, _) = watch::channel(true);
         Arc::new(Self {
             set,
+            pool: pool.map(str::to_string),
             block_size: 1,
             thresholds: FakeThresholds::default(),
             workers: Mutex::new(Vec::new()),
@@ -126,7 +135,16 @@ impl FakeRouter {
         set: WorkerType,
         worker_ids: impl IntoIterator<Item = WorkerId>,
     ) -> Arc<Self> {
-        let router = Self::new(set);
+        Self::with_workers_in_pool(set, None, worker_ids)
+    }
+
+    /// `with_workers` for the named worker set `pool` of `set`'s type.
+    pub fn with_workers_in_pool(
+        set: WorkerType,
+        pool: Option<&str>,
+        worker_ids: impl IntoIterator<Item = WorkerId>,
+    ) -> Arc<Self> {
+        let router = Self::new_in_pool(set, pool);
         for worker_id in worker_ids {
             router.add_worker(FakeWorker::new(worker_id));
         }
@@ -360,7 +378,10 @@ impl Router for FakeRouter {
         Plan::new(
             PlanId::from(id),
             RoutingPartitionId::new(req.model_name.clone(), req.routing_group.clone()),
-            vec![Stage::new(self.set)],
+            vec![Stage {
+                pool: self.pool.clone(),
+                ..Stage::new(self.set)
+            }],
         )
         .map_err(|error| SelectionError::BadRequest(error.to_string()))
     }
@@ -371,9 +392,11 @@ impl Router for FakeRouter {
         plan: &mut Plan,
     ) -> Result<(), SelectionError> {
         loop {
-            let next = plan
-                .schedulable()
-                .find(|&k| plan.stage(k).is_some_and(|stage| stage.set == self.set));
+            let next = plan.schedulable().find(|&k| {
+                plan.stage(k).is_some_and(|stage| {
+                    stage.set == self.set && stage.pool.as_deref() == self.pool.as_deref()
+                })
+            });
             let Some(k) = next else { break };
             let stage = plan.stage(k).cloned().expect("schedulable stage exists");
             self.wait_for_admission(stage.wait).await?;

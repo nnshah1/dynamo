@@ -315,8 +315,8 @@ impl StageState {
 /// placement rules. Pure configuration; the plan keeps the state beside it.
 ///
 /// YAML: a bare lowercase set name (`prefill`) or a map:
-/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ...,
-/// work: decode_only, scoring: load_only }`.
+/// `{ set: decode, pool: canary, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...],
+/// skip: ..., work: decode_only, scoring: load_only }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(from = "StageSpec")]
 pub struct Stage {
@@ -343,6 +343,8 @@ enum StageSpec {
     Set(WorkerType),
     Full {
         set: WorkerType,
+        #[serde(default)]
+        pool: Option<String>,
         #[serde(default = "When::now")]
         when: When,
         #[serde(default)]
@@ -378,6 +380,7 @@ impl From<StageSpec> for Stage {
             StageSpec::Set(set) => Self::new(set),
             StageSpec::Full {
                 set,
+                pool,
                 when,
                 inputs,
                 wait,
@@ -387,6 +390,7 @@ impl From<StageSpec> for Stage {
                 scoring,
             } => Self {
                 set,
+                pool,
                 when,
                 inputs,
                 wait,
