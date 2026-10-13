@@ -1162,3 +1162,22 @@ fn scoring_follows_the_work_unless_the_stage_says_otherwise() {
     StageScoring::LoadOnly.apply_to(&mut config);
     assert_eq!(config.overlap_score_credit, Some(0.0));
 }
+
+/// A stage names the worker set it books into only when there is more than
+/// one of its type; the plain constructor is the unnamed set.
+#[test]
+fn a_stage_may_name_its_pool() {
+    let unnamed = Stage::new(WorkerType::Decode);
+    assert_eq!(unnamed.pool, None);
+    let canary = Stage {
+        pool: Some("canary".to_string()),
+        ..Stage::new(WorkerType::Decode)
+    };
+    assert_eq!(canary.set, WorkerType::Decode);
+    assert_eq!(canary.pool.as_deref(), Some("canary"));
+    let p = plan(vec![unnamed, canary]);
+    assert_eq!(
+        p.stage(1).and_then(|stage| stage.pool.as_deref()),
+        Some("canary")
+    );
+}

@@ -7,7 +7,7 @@
 //! Every stage runs the same four steps in its own set's queue; the only
 //! per-stage difference is the wait budget the class gave it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +53,7 @@ impl Default for RouterLimits {
 }
 
 pub struct MultiStageRouter {
-    sets: HashMap<WorkerType, Arc<dyn Router>>,
+    sets: Vec<PoolRouter>,
     classes: ClassTable,
     limits: RouterLimits,
     conditional_disagg: Option<Arc<dyn ConditionalDisaggPolicy>>,
@@ -62,16 +62,37 @@ pub struct MultiStageRouter {
 
 #[derive(Default)]
 pub struct MultiStageRouterBuilder {
-    sets: HashMap<WorkerType, Arc<dyn Router>>,
+    sets: Vec<PoolRouter>,
     classes: Option<ClassTable>,
     limits: RouterLimits,
     conditional_disagg: Option<Arc<dyn ConditionalDisaggPolicy>>,
     has_decode_gate: bool,
 }
 
+/// One worker set's router: its type, its pool name when the host routes
+/// more than one set of that type, and the router.
+struct PoolRouter {
+    set: WorkerType,
+    pool: Option<String>,
+    router: Arc<dyn Router>,
+}
+
 impl MultiStageRouterBuilder {
-    pub fn set(mut self, set: WorkerType, router: Arc<dyn Router>) -> Self {
-        self.sets.insert(set, router);
+    /// The one unnamed set of `set`'s type.
+    pub fn set(self, set: WorkerType, router: Arc<dyn Router>) -> Self {
+        self.insert(set, None, router)
+    }
+
+    /// A named set of `set`'s type: a rolling update's new generation, a
+    /// canary, a second hardware pool. Stages reach it through `Stage.pool`.
+    pub fn pool(self, set: WorkerType, pool: impl Into<String>, router: Arc<dyn Router>) -> Self {
+        self.insert(set, Some(pool.into()), router)
+    }
+
+    fn insert(mut self, set: WorkerType, pool: Option<String>, router: Arc<dyn Router>) -> Self {
+        self.sets
+            .retain(|entry| !(entry.set == set && entry.pool == pool));
+        self.sets.push(PoolRouter { set, pool, router });
         self
     }
 
@@ -103,19 +124,42 @@ impl MultiStageRouterBuilder {
     /// a valid plan, puts a decode-reading skip rule after its decode stage,
     /// or falls back to a decode set it does not have.
     pub fn build(self) -> Result<MultiStageRouter, SelectionError> {
-        let classes = self.classes.unwrap_or_default();
+        let Self {
+            sets,
+            classes,
+            limits,
+            conditional_disagg,
+            has_decode_gate,
+        } = self;
+        let has = |set: WorkerType, pool: Option<&str>| {
+            sets.iter()
+                .any(|entry| entry.set == set && entry.pool.as_deref() == pool)
+        };
+        let classes = classes.unwrap_or_default();
         let invalid = |class: &str, reason: String| {
             SelectionError::BadRequest(format!("class {class:?} stage list: {reason}"))
         };
         for (class, list) in classes.lists() {
             let class = class.unwrap_or("default");
-            if let Some(set) = list.sets().find(|set| !self.sets.contains_key(set)) {
+            if let Some(stage) = list
+                .stages
+                .iter()
+                .find(|stage| !has(stage.set, stage.pool.as_deref()))
+            {
                 return Err(invalid(
                     class,
-                    format!("no router was given for the {set} set"),
+                    match &stage.pool {
+                        Some(pool) => {
+                            format!(
+                                "no router was given for pool {pool:?} of the {} set",
+                                stage.set
+                            )
+                        }
+                        None => format!("no router was given for the {} set", stage.set),
+                    },
                 ));
             }
-            if list.fallback.is_some() && !self.sets.contains_key(&WorkerType::Decode) {
+            if list.fallback.is_some() && !has(WorkerType::Decode, None) {
                 return Err(invalid(
                     class,
                     "falls back to a decode set it does not have".to_string(),
@@ -144,11 +188,11 @@ impl MultiStageRouterBuilder {
             .map_err(|error| invalid(class, error.to_string()))?;
         }
         Ok(MultiStageRouter {
-            sets: self.sets,
+            sets,
             classes,
-            limits: self.limits,
-            conditional_disagg: self.conditional_disagg,
-            has_decode_gate: self.has_decode_gate,
+            limits,
+            conditional_disagg,
+            has_decode_gate,
         })
     }
 }
@@ -173,10 +217,21 @@ impl MultiStageRouter {
         self.classes.stages(req.policy_class.as_deref())
     }
 
-    fn set_router(&self, set: WorkerType) -> Result<&Arc<dyn Router>, SelectionError> {
+    fn set_router(
+        &self,
+        set: WorkerType,
+        pool: Option<&str>,
+    ) -> Result<&Arc<dyn Router>, SelectionError> {
         self.sets
-            .get(&set)
-            .ok_or_else(|| SelectionError::Internal(format!("no router for the {set} set")))
+            .iter()
+            .find(|entry| entry.set == set && entry.pool.as_deref() == pool)
+            .map(|entry| &entry.router)
+            .ok_or_else(|| match pool {
+                Some(pool) => SelectionError::Internal(format!(
+                    "no router for pool {pool:?} of the {set} set"
+                )),
+                None => SelectionError::Internal(format!("no router for the {set} set")),
+            })
     }
 
     fn check_limits(&self, plan: &Plan) -> Result<(), SelectionError> {
@@ -241,11 +296,13 @@ impl MultiStageRouter {
             let Some(k) = plan.schedulable().next() else {
                 break;
             };
-            let set = plan
+            let (set, pool) = plan
                 .stage(k)
-                .map(|stage| stage.set)
+                .map(|stage| (stage.set, stage.pool.clone()))
                 .ok_or_else(|| internal(super::plan::PlanError::NoSuchStage { stage: k }))?;
-            self.set_router(set)?.schedule(req, plan).await?;
+            self.set_router(set, pool.as_deref())?
+                .schedule(req, plan)
+                .await?;
             if plan.state_of(k).is_some_and(|state| state.is_pending()) {
                 return Err(SelectionError::Internal(format!(
                     "the {set} set's router returned without booking stage {k}"
@@ -268,7 +325,7 @@ impl MultiStageRouter {
         }
         *plan = Plan::new(plan.id().clone(), plan.partition().clone(), vec![decode])
             .map_err(internal)?;
-        self.set_router(WorkerType::Decode)?
+        self.set_router(WorkerType::Decode, None)?
             .schedule(req, plan)
             .await
     }
@@ -362,7 +419,7 @@ impl MultiStageRouter {
                     allowed.retain(|worker_id| !excluded.contains(worker_id));
                 }
                 let preview = self
-                    .set_router(WorkerType::Decode)?
+                    .set_router(WorkerType::Decode, decode_stage.pool.as_deref())?
                     .select(decode_probe)
                     .await?;
                 if excluded.contains(&preview.worker_id) {
@@ -381,7 +438,7 @@ impl MultiStageRouter {
                         // A failed prefill-load probe is a missing signal,
                         // not a failed request, as in the frontend today.
                         let prefill_busy = if policy.needs_prefill_worker_busy() {
-                            self.set_router(stage.set)?
+                            self.set_router(stage.set, stage.pool.as_deref())?
                                 .select(advisory(req))
                                 .await
                                 .ok()
@@ -457,13 +514,13 @@ impl Router for MultiStageRouter {
         // An advisory pick is for the set that serves the response: decode
         // when the default list has one, else its last stage.
         let stages = &self.classes.stages(None).stages;
-        let set = stages
+        let (set, pool) = stages
             .iter()
-            .map(|stage| stage.set)
-            .find(|set| *set == WorkerType::Decode)
-            .or_else(|| stages.last().map(|stage| stage.set))
-            .unwrap_or(WorkerType::Aggregated);
-        self.set_router(set)?.select(req).await
+            .find(|stage| stage.set == WorkerType::Decode)
+            .or_else(|| stages.last())
+            .map(|stage| (stage.set, stage.pool.as_deref()))
+            .unwrap_or((WorkerType::Aggregated, None));
+        self.set_router(set, pool)?.select(req).await
     }
 
     fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {

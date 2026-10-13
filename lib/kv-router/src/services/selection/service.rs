@@ -41,6 +41,7 @@ pub struct SelectionServiceBuilder {
     worker_selection_policy_factory: Option<WorkerSelectionPolicyFactory>,
     session_affinity_ttl: Option<Duration>,
     host_manages_request_lifecycle: bool,
+    pool: Option<String>,
 }
 
 /// Warn when a host does not construct workers for explicitly configured policy roles.
@@ -82,7 +83,15 @@ impl SelectionServiceBuilder {
             worker_selection_policy_factory: None,
             session_affinity_ttl: None,
             host_manages_request_lifecycle: false,
+            pool: None,
         }
+    }
+
+    /// Name the worker set this service's core is, for a host that routes
+    /// more than one set of the same worker type.
+    pub fn pool(mut self, pool: impl Into<String>) -> Self {
+        self.pool = Some(pool.into());
+        self
     }
 
     /// Use `factory` for every partition's worker-selection policy instead of
@@ -199,6 +208,9 @@ impl SelectionServiceBuilder {
             indexer_policy,
             self.session_affinity_ttl.map(SessionAffinityConfig::new),
         ));
+        if let Some(pool) = self.pool {
+            core.set_pool(pool).map_err(anyhow::Error::msg)?;
+        }
 
         if recover_from_peers {
             match core.recover_indexer_from_peers(&self.indexer_peers).await {

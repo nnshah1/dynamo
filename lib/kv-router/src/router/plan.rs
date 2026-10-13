@@ -315,12 +315,16 @@ impl StageState {
 /// placement rules. Pure configuration; the plan keeps the state beside it.
 ///
 /// YAML: a bare lowercase set name (`prefill`) or a map:
-/// `{ set: decode, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...], skip: ...,
-/// work: decode_only, scoring: load_only }`.
+/// `{ set: decode, pool: canary, when: { after: 0 }, inputs: [0], wait: 2s, constraints: [...],
+/// skip: ..., work: decode_only, scoring: load_only }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(from = "StageSpec")]
 pub struct Stage {
     pub set: WorkerType,
+    /// The worker set this stage books into when more than one set of this
+    /// type is routed (a rolling update's new generation, a canary, a second
+    /// hardware pool). `None` is the one unnamed set of the type.
+    pub pool: Option<String>,
     pub when: When,
     /// Stages whose outcome this one needs before it is forwarded.
     pub inputs: Vec<usize>,
@@ -339,6 +343,8 @@ enum StageSpec {
     Set(WorkerType),
     Full {
         set: WorkerType,
+        #[serde(default)]
+        pool: Option<String>,
         #[serde(default = "When::now")]
         when: When,
         #[serde(default)]
@@ -374,6 +380,7 @@ impl From<StageSpec> for Stage {
             StageSpec::Set(set) => Self::new(set),
             StageSpec::Full {
                 set,
+                pool,
                 when,
                 inputs,
                 wait,
@@ -383,6 +390,7 @@ impl From<StageSpec> for Stage {
                 scoring,
             } => Self {
                 set,
+                pool,
                 when,
                 inputs,
                 wait,
@@ -399,6 +407,7 @@ impl Stage {
     pub fn new(set: WorkerType) -> Self {
         Self {
             set,
+            pool: None,
             when: When::Now,
             inputs: Vec::new(),
             wait: Budget::Full,
