@@ -1451,3 +1451,78 @@ async fn all_now_books_every_stage_in_one_call() {
         "execution order is still encode → prefill → decode"
     );
 }
+
+/// Two decode worker sets, as a rolling update has them: the unnamed set
+/// and a named one. A class steers its decode stage to the named set by
+/// pool; the two sets book, account and release independently, and a stage
+/// list naming a pool no router was given for is rejected at build time.
+#[tokio::test]
+async fn two_decode_pools_are_booked_independently_by_name() {
+    let fixture = Fixture::new();
+    let canary = FakeRouter::with_workers_in_pool(WorkerType::Decode, Some("canary"), [23, 24]);
+    let mut canary_list = StageList::prefill_decode();
+    canary_list.stages[1].pool = Some("canary".to_string());
+    let router = fixture
+        .builder()
+        .pool(WorkerType::Decode, "canary", canary.clone())
+        .classes(ClassTable::new(StageList::prefill_decode()).with_class("canary", canary_list))
+        .build()
+        .expect("valid router");
+
+    let steady = booked(&router, &request("steady")).await;
+    let mut req = request("canary");
+    req.policy_class = Some("canary".to_string());
+    let rolled = booked(&router, &req).await;
+
+    assert!(matches!(steady.worker(1).unwrap().worker_id, 21 | 22));
+    assert!(matches!(rolled.worker(1).unwrap().worker_id, 23 | 24));
+    assert_eq!(
+        fixture
+            .decode
+            .events()
+            .iter()
+            .filter(|event| matches!(event, FakeEvent::Book { .. }))
+            .count(),
+        1,
+        "the unnamed decode set booked only the steady request"
+    );
+    assert_eq!(
+        canary
+            .events()
+            .iter()
+            .filter(|event| matches!(event, FakeEvent::Book { .. }))
+            .count(),
+        1,
+        "the canary set booked only its class's request"
+    );
+    assert_eq!(
+        fixture.prefill.outstanding().len(),
+        2,
+        "both prefills on the one prefill set"
+    );
+    assert_eq!(fixture.decode.outstanding().len(), 1);
+    assert_eq!(canary.outstanding().len(), 1);
+
+    rolled.release().await.unwrap();
+    assert_eq!(
+        canary.outstanding().len(),
+        0,
+        "releasing the canary plan frees only its set"
+    );
+    assert_eq!(fixture.decode.outstanding().len(), 1);
+    steady.release().await.unwrap();
+    assert_eq!(fixture.outstanding(), 0);
+
+    let mut unknown = StageList::prefill_decode();
+    unknown.stages[1].pool = Some("blue".to_string());
+    let error = fixture
+        .builder()
+        .classes(ClassTable::new(unknown))
+        .build()
+        .err()
+        .expect("a pool with no router is rejected");
+    assert!(error.to_string().contains("pool \"blue\""), "{error}");
+    let parsed: StageList =
+        serde_yaml::from_str("[prefill, { set: decode, pool: canary, inputs: [0] }]").unwrap();
+    assert_eq!(parsed.stages[1].pool.as_deref(), Some("canary"));
+}
