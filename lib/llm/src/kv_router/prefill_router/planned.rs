@@ -185,6 +185,7 @@ impl PrefillRouter {
             budget: CleanupBudget::default(),
             affinity: None,
             prefill_affinity: None,
+            migration_exhausted: Vec::new(),
             lifecycle: None,
             lifecycle_selected: false,
             staged_kv_cleanup: false,
@@ -237,6 +238,10 @@ struct PlannedFlow<'a> {
     lifecycle_selected: bool,
     /// A remote prefill staged KV: decode must go on through a disconnect.
     staged_kv_cleanup: bool,
+    /// Sets a migration retry has no eligible worker left in. A stage of
+    /// such a set that still needs admission fails with the migration's
+    /// exhaustion error; a skipped or absent stage does not.
+    migration_exhausted: Vec<WorkerType>,
     outcome: Option<PrefillOutcome>,
     prefill_completion: Option<PrefillTask>,
     /// Something reached a worker; a failure now is not a routing decision
@@ -345,6 +350,11 @@ impl PlannedFlow<'_> {
                 } else {
                     StagedKv::Absent
                 };
+                let body = self
+                    .decode_request
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("decode request already consumed"))?
+                    .content();
                 await_with_cleanup_policy(
                     engine_ctx.as_ref(),
                     RequestPhase::Decode,
@@ -355,7 +365,11 @@ impl PlannedFlow<'_> {
                 )
                 .await
                 .map_err(|error| self.routing_error(error))?
-                .map_err(|error| self.routing_error(frontend_error(error)))?;
+                .map_err(|error| {
+                    let error = migration_exhaustion(plan, &self.migration_exhausted, body)
+                        .unwrap_or_else(|| frontend_error(error));
+                    self.routing_error(error)
+                })?;
             }
             let Some(k) = plan.ready().next() else {
                 return Err(anyhow!(
@@ -399,6 +413,7 @@ impl PlannedFlow<'_> {
         let prefill_host = &self.binding.router;
         let decode_host = self.decode_host;
         let budget = &self.budget;
+        let exhausted = &self.migration_exhausted;
         let engine_ctx = decode_request.context();
         let engine_ctx: &dyn AsyncEngineContext = engine_ctx.as_ref();
         let select = || {
@@ -443,7 +458,10 @@ impl PlannedFlow<'_> {
                                 multistage.schedule(routing, plan),
                             )
                             .await?
-                            .map_err(frontend_error)?;
+                            .map_err(|error| {
+                                migration_exhaustion(plan, exhausted, decode_request.content())
+                                    .unwrap_or_else(|| frontend_error(error))
+                            })?;
                             Ok(decode_worker(plan))
                         },
                     )
@@ -467,11 +485,13 @@ impl PlannedFlow<'_> {
     }
 
     /// A migration retry may not reuse a worker a previous attempt failed on.
-    /// Each host applies its one eligibility rule (allowed set, constraints,
-    /// recorded failures, exhaustion); the plan records the exclusions on
-    /// that set's pending stages so the core selects around them.
+    /// Each host whose set the plan uses applies its one eligibility rule
+    /// (allowed set, constraints, recorded failures); the plan records the
+    /// exclusions on that set's pending stages so the core selects around
+    /// them. A set with nothing eligible left is remembered: only a stage
+    /// that still needs it after the skip decisions fails for it.
     fn exclude_migration_failures(
-        &self,
+        &mut self,
         routing: &SelectAndReserveRequest,
         plan: &mut Plan,
     ) -> Result<()> {
@@ -491,22 +511,27 @@ impl PlannedFlow<'_> {
             ),
             (WorkerType::Decode, RequestPhase::Decode, self.decode_host),
         ];
+        let mut exhausted = Vec::new();
         for (set, phase, host) in phases {
-            let eligible = host
-                .migration_eligible_workers(
-                    body,
-                    phase,
-                    &routing.routing_constraints,
-                    routing.allowed_worker_ids.as_ref(),
-                )
-                .map_err(|error| self.routing_error(error))?;
-            if eligible.is_none() {
+            if !has_stage(plan, set) {
                 continue;
+            }
+            let Some(eligible) = host.migration_eligible_workers(
+                body,
+                phase,
+                &routing.routing_constraints,
+                routing.allowed_worker_ids.as_ref(),
+            ) else {
+                continue;
+            };
+            if eligible.is_empty() {
+                exhausted.push(set);
             }
             for worker_id in state.excluded_worker_ids() {
                 exclude_set(plan, set, worker_id)?;
             }
         }
+        self.migration_exhausted = exhausted;
         Ok(())
     }
 
@@ -840,6 +865,32 @@ fn pin_set(plan: &mut Plan, set: WorkerType, worker: WorkerWithDpRank) -> Result
     Ok(())
 }
 
+fn has_stage(plan: &Plan, set: WorkerType) -> bool {
+    (0..plan.stage_count()).any(|k| plan.stage(k).is_some_and(|stage| stage.set == set))
+}
+
+/// A schedule failure while a pending (not skipped) stage belongs to a set
+/// the migration retry has exhausted is the migration's own answer: the
+/// request cannot be placed anywhere it has not already failed.
+fn migration_exhaustion(
+    plan: &Plan,
+    exhausted: &[WorkerType],
+    body: &PreprocessedRequest,
+) -> Option<anyhow::Error> {
+    let needs_exhausted_set = (0..plan.stage_count()).any(|k| {
+        plan.stage(k)
+            .is_some_and(|stage| exhausted.contains(&stage.set))
+            && plan.state_of(k).is_some_and(StageState::is_pending)
+    });
+    if !needs_exhausted_set {
+        return None;
+    }
+    body.migration_state
+        .as_ref()
+        .and_then(|state| state.exhausted_error())
+        .map(anyhow::Error::from)
+}
+
 /// Exclude `worker_id` from every pending stage of `set`.
 fn exclude_set(plan: &mut Plan, set: WorkerType, worker_id: u64) -> Result<()> {
     for k in 0..plan.stage_count() {
@@ -956,6 +1007,9 @@ mod tests {
     struct ScriptedWorker {
         frames: Mutex<VecDeque<Vec<Annotated<LLMEngineOutput>>>>,
         seen: Mutex<Vec<(u64, PreprocessedRequest)>>,
+        /// Runs once, inside the next dispatch: a client that cancels while
+        /// the worker is being reached.
+        on_dispatch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl ScriptedWorker {
@@ -986,6 +1040,13 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("a scripted answer for every dispatch");
+            if let Some(on_dispatch) = self.on_dispatch.lock().unwrap().take() {
+                on_dispatch();
+                assert!(
+                    !context.context().is_stopped(),
+                    "remote prefill keeps its independent context"
+                );
+            }
             Ok(ResponseStream::new(
                 Box::pin(stream::iter(frames)),
                 context.context(),
@@ -2165,5 +2226,269 @@ mod tests {
             planned_cancelled,
             "planned admission must retract on stop without external task abortion"
         );
+    }
+
+    /// A fixture whose prefill set runs in its own runtime, so the two sets
+    /// have distinct worker ids and a failure recorded against one cannot
+    /// alias the other.
+    async fn distinct_prefill_fixture(namespace: &str, conditional: bool) -> Fixture {
+        let mut f = fixture_with(namespace, conditional).await;
+        let distributed =
+            DistributedRuntime::new(f.runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let prefill_namespace = format!("{namespace}-separate-prefill");
+        f.prefill = kv_set(
+            &distributed,
+            &prefill_namespace,
+            "prefill",
+            conditional,
+            ModelRuntimeConfig::default(),
+        )
+        .await;
+        let endpoint_id = dynamo_runtime::protocols::EndpointId {
+            namespace: prefill_namespace,
+            component: "prefill".to_string(),
+            name: "generate".to_string(),
+        };
+        f.router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint_id.clone()),
+            endpoint_id,
+            router: Arc::clone(&f.prefill.host),
+            prefill_router_mode: RouterMode::KV,
+        })));
+        assert_ne!(
+            f.prefill.worker_id, f.decode.worker_id,
+            "independent worker runtimes must have distinct ids"
+        );
+        f
+    }
+
+    /// The reviewer's probe: a decode-only plan has no prefill stage, so an
+    /// exhausted prefill set is not this request's concern.
+    #[tokio::test]
+    async fn reviewer_monitor_decode_only_ignores_excluded_prefill_pool() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::timing::RequestPhase;
+        use dynamo_kv_router::router::{ClassTable, MultiStageRouter, Stage, StageList};
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let f = distinct_prefill_fixture("monitor-unused-prefill-exclusion", false).await;
+        f.router
+            .set_plan_router_factory(Arc::new(|parts| {
+                Ok(Arc::new(
+                    MultiStageRouter::builder()
+                        .set(WorkerType::Decode, parts.decode)
+                        .classes(ClassTable::new(StageList::new(vec![Stage::new(
+                            WorkerType::Decode,
+                        )])))
+                        .build()?,
+                ) as Arc<dyn Router>)
+            }))
+            .unwrap();
+        let mut body = request();
+        body.migration_state = Some(Default::default());
+        body.migration_state.as_ref().unwrap().record_failure(
+            f.prefill.worker_id,
+            Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::WorkerOverloaded)
+                    .message("the previous prefill attempt failed")
+                    .build(),
+            ),
+        );
+        let direct = f
+            .decode
+            .host
+            .admit_kv_route(
+                &Context::new(body.clone()),
+                RequestPhase::Decode,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await
+            .expect("the healthy decode pool is eligible");
+        direct.abort().await;
+        wait_until_released(&f).await;
+        f.decode.worker.script(vec![token_frame(7), stop_frame()]);
+        let response = f
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await;
+        let succeeded = match response {
+            Ok(response) => {
+                let frames: Vec<_> = response.collect().await;
+                frames.iter().all(|frame| frame.err().is_none())
+            }
+            Err(_) => false,
+        };
+        wait_until_released(&f).await;
+        let prefill_seen = f.prefill.worker.seen();
+        let decode_seen = f.decode.worker.seen();
+        f.runtime.shutdown();
+        assert!(prefill_seen.is_empty());
+        assert!(
+            succeeded,
+            "a decode-only plan must ignore exhaustion in an absent prefill stage"
+        );
+        assert_eq!(decode_seen.len(), 1);
+    }
+
+    /// The reviewer's probe: a conditional bypass skips prefill, so an
+    /// exhausted prefill set does not refuse the cached decode.
+    #[tokio::test]
+    async fn reviewer_monitor_cached_bypass_ignores_excluded_prefill_pool() {
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let f = distinct_prefill_fixture("monitor-skipped-prefill-exclusion", true).await;
+        seed_prefix(&f.decode, &(1..=64).collect::<Vec<u32>>()).await;
+        f.decode.worker.script(vec![token_frame(7), stop_frame()]);
+        let control = f
+            .router
+            .generate(Context::new(request()), Arc::new(NeverNext))
+            .await
+            .unwrap();
+        let frames: Vec<_> = control.collect().await;
+        assert!(
+            frames[0]
+                .event
+                .as_deref()
+                .is_some_and(|event| event == super::BYPASS_REMOTE_PREFILL_ANNOTATION)
+        );
+        assert!(f.prefill.worker.seen().is_empty());
+        wait_until_released(&f).await;
+
+        let mut body = request();
+        body.migration_state = Some(Default::default());
+        body.migration_state.as_ref().unwrap().record_failure(
+            f.prefill.worker_id,
+            Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::WorkerOverloaded)
+                    .message("the previous prefill attempt failed")
+                    .build(),
+            ),
+        );
+        f.decode.worker.script(vec![token_frame(8), stop_frame()]);
+        let response = f
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await;
+        let succeeded = match response {
+            Ok(response) => {
+                let frames: Vec<_> = response.collect().await;
+                frames.iter().all(|frame| frame.err().is_none())
+            }
+            Err(_) => false,
+        };
+        wait_until_released(&f).await;
+        let prefill_seen = f.prefill.worker.seen();
+        let decode_seen = f.decode.worker.seen();
+        f.runtime.shutdown();
+        assert!(prefill_seen.is_empty());
+        assert!(
+            succeeded,
+            "a cached decode bypass must not be refused because its unused prefill pool is exhausted"
+        );
+        assert_eq!(decode_seen.len(), 2);
+    }
+
+    /// The reviewer's control: a client that stops or is killed while prefill
+    /// is being dispatched still gets its decode leg, which carries the
+    /// staged-KV cleanup, and every projected charge clears afterwards.
+    #[tokio::test]
+    async fn reviewer_monitor_after_prefill_cancellation_keeps_cleanup() {
+        use dynamo_kv_router::router::{ClassTable, MultiStageRouter, StageList};
+
+        for (deferred, kill) in [(false, false), (false, true), (true, false), (true, true)] {
+            let namespace = match (deferred, kill) {
+                (false, false) => "review-upfront-prefill-stop",
+                (false, true) => "review-upfront-prefill-kill",
+                (true, false) => "review-deferred-prefill-stop",
+                (true, true) => "review-deferred-prefill-kill",
+            };
+            let fixture = fixture(namespace).await;
+            if deferred {
+                fixture
+                    .router
+                    .set_plan_router_factory(Arc::new(|parts| {
+                        let router = MultiStageRouter::builder()
+                            .set(WorkerType::Prefill, parts.prefill)
+                            .set(WorkerType::Decode, parts.decode)
+                            .classes(ClassTable::new(StageList::prefill_decode_deferred(
+                                Duration::from_secs(1),
+                            )))
+                            .build()?;
+                        Ok(Arc::new(router) as Arc<dyn Router>)
+                    }))
+                    .unwrap();
+            }
+            fixture.prefill.worker.script(vec![bootstrap_frame()]);
+            fixture.decode.worker.script(vec![stop_frame()]);
+            let context = Context::new(request());
+            let client = context.context();
+            let cancel = Arc::clone(&client);
+            *fixture.prefill.worker.on_dispatch.lock().unwrap() = Some(Box::new(move || {
+                if kill {
+                    cancel.kill();
+                } else {
+                    cancel.stop_generating();
+                }
+            }));
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.router.generate(context, Arc::new(NeverNext)),
+            )
+            .await
+            .expect("routing terminates");
+            if let Ok(response) = response {
+                tokio::time::timeout(Duration::from_secs(5), response.collect::<Vec<_>>())
+                    .await
+                    .expect("cleanup stream terminates");
+            }
+            assert!(
+                client.is_stopped() || client.is_killed(),
+                "client cancellation happened during prefill dispatch"
+            );
+            let prefill_seen = fixture.prefill.worker.seen();
+            let decode_seen = fixture.decode.worker.seen();
+            wait_until_released(&fixture).await;
+            for set in [&fixture.prefill, &fixture.decode] {
+                let loads = set
+                    .chooser
+                    .get_potential_loads(&[], None, None, None, None)
+                    .await
+                    .unwrap();
+                assert!(
+                    loads.iter().all(|load| load.active_requests == 0
+                        && load.potential_prefill_tokens == 0
+                        && load.potential_decode_blocks == 0),
+                    "all projected charges clear after the cancelled flow: {loads:?}"
+                );
+            }
+            fixture.runtime.shutdown();
+            assert_eq!(
+                prefill_seen.len(),
+                1,
+                "prefill was dispatched before cancellation"
+            );
+            assert_eq!(
+                decode_seen.len(),
+                1,
+                "decode must still receive the staged KV cleanup request"
+            );
+            let (worker, body) = &decode_seen[0];
+            assert_eq!(*worker, fixture.decode.worker_id);
+            assert!(body.staged_kv_cleanup);
+            assert!(
+                body.bootstrap_info.is_some(),
+                "cleanup dispatch carries the prefill handoff"
+            );
+            assert_eq!(
+                body.routing.as_ref().and_then(|r| r.prefill_worker_id),
+                Some(fixture.prefill.worker_id)
+            );
+        }
     }
 }
