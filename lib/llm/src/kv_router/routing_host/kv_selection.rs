@@ -192,28 +192,13 @@ impl RoutingHost {
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
         let mut allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
-        let migration_excluded_worker_ids = request
-            .migration_state
-            .as_ref()
-            .map(|state| state.excluded_worker_ids())
-            .unwrap_or_default();
-        if explicit_pin.is_none() && !migration_excluded_worker_ids.is_empty() {
-            let workers = self.kv_router().workers_with_configs.borrow();
-            let eligible =
-                allowed_worker_ids.get_or_insert_with(|| workers.keys().copied().collect());
-            eligible.retain(|worker_id| {
-                workers.get(worker_id).is_some_and(|config| {
-                    routing_constraints.is_compatible_with_worker_taints(&config.taints)
-                }) && !migration_excluded_worker_ids.contains(worker_id)
-            });
-            if eligible.is_empty()
-                && let Some(error) = request
-                    .migration_state
-                    .as_ref()
-                    .and_then(|state| state.exhausted_error())
-            {
-                return Err(anyhow::anyhow!(error));
-            }
+        if let Some(eligible) = self.migration_eligible_workers(
+            request,
+            phase,
+            &routing_constraints,
+            allowed_worker_ids.as_ref(),
+        )? {
+            allowed_worker_ids = Some(eligible);
         }
         let return_routing_hashes =
             !is_query_only && self.kv_router().indexer().records_routing_decisions();
@@ -423,6 +408,51 @@ pub(crate) fn pinned_worker_hint(
             let worker_id = routing.decode_worker_id.or(routing.backend_instance_id)?;
             Some((worker_id, routing.dp_rank))
         }
+    }
+}
+
+impl RoutingHost {
+    /// The workers a migration retry may still use on this host for `phase`,
+    /// when the request's `migration_state` excludes any: the request's
+    /// allowed set (every worker of the set by default), kept to those
+    /// compatible with its constraints and not recorded as failed. `None`
+    /// when nothing is excluded or the caller pinned a worker (the pin
+    /// stands). The migration's own exhaustion error when no eligible worker
+    /// remains. Every admission on this host, direct or from a plan, goes
+    /// through this one rule.
+    pub(crate) fn migration_eligible_workers(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+        routing_constraints: &RoutingConstraints,
+        allowed_worker_ids: Option<&HashSet<WorkerId>>,
+    ) -> Result<Option<HashSet<WorkerId>>, Error> {
+        let excluded = request
+            .migration_state
+            .as_ref()
+            .map(|state| state.excluded_worker_ids())
+            .unwrap_or_default();
+        if excluded.is_empty() || pinned_worker_hint(phase, request.routing.as_ref()).is_some() {
+            return Ok(None);
+        }
+        let workers = self.kv_router().workers_with_configs.borrow();
+        let mut eligible: HashSet<WorkerId> = allowed_worker_ids
+            .cloned()
+            .unwrap_or_else(|| workers.keys().copied().collect());
+        eligible.retain(|worker_id| {
+            workers.get(worker_id).is_some_and(|config| {
+                routing_constraints.is_compatible_with_worker_taints(&config.taints)
+            }) && !excluded.contains(worker_id)
+        });
+        if eligible.is_empty()
+            && let Some(error) = request
+                .migration_state
+                .as_ref()
+                .and_then(|state| state.exhausted_error())
+        {
+            return Err(anyhow::anyhow!(error));
+        }
+        Ok(Some(eligible))
     }
 }
 
