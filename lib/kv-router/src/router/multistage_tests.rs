@@ -17,7 +17,8 @@ use crate::protocols::{KvTransferEnforcement, RoutingConstraints, WorkerWithDpRa
 use crate::scheduling::KvSchedulerError;
 use crate::scheduling::policy_config::RouterPolicyConfig;
 use crate::services::selection::{
-    MmRoutingInfoRequest, PromptRequest, SelectAndReserveRequest, SelectionError,
+    MmRoutingInfoRequest, PromptRequest, SelectAndReserveRequest, SelectRequest, SelectResponse,
+    SelectionError,
 };
 use crate::test_utils::SimpleWorkerConfig;
 
@@ -1525,4 +1526,127 @@ async fn two_decode_pools_are_booked_independently_by_name() {
     let parsed: StageList =
         serde_yaml::from_str("[prefill, { set: decode, pool: canary, inputs: [0] }]").unwrap();
     assert_eq!(parsed.stages[1].pool.as_deref(), Some("canary"));
+}
+
+/// A custom `Router` composed over the built-in one that steers a later
+/// stage from what an earlier stage recorded on the plan: when prefill
+/// landed on worker 11, the deferred decode is pinned to worker 22. The
+/// plan's per-stage record (worker, config, hint, the scheduler's answer)
+/// is a custom policy's view; the host loop does not change.
+struct SteerDecodeByPrefill(MultiStageRouter);
+
+#[async_trait::async_trait]
+impl Router for SteerDecodeByPrefill {
+    async fn select(&self, req: SelectRequest) -> Result<SelectResponse, SelectionError> {
+        self.0.select(req).await
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        self.0.plan(req)
+    }
+
+    async fn schedule(
+        &self,
+        req: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        self.0.schedule(req, plan).await?;
+        let prefill_on_11 = plan.worker(0).is_some_and(|worker| worker.worker_id == 11);
+        let decode_pending = plan.state_of(1).is_some_and(StageState::is_pending);
+        let decode_unpinned = plan.stage(1).is_some_and(|stage| {
+            !stage
+                .constraints
+                .iter()
+                .any(|constraint| matches!(constraint, Constraint::Pin(_)))
+        });
+        if prefill_on_11 && decode_pending && decode_unpinned {
+            plan.constrain(1, Constraint::Pin(WorkerWithDpRank::new(22, 0)))?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_custom_router_steers_a_later_stage_from_an_earlier_stages_record() {
+    let fixture = Fixture::new();
+    let mut list = StageList::prefill_decode_deferred(Duration::from_secs(2));
+    list.stages[0]
+        .constraints
+        .push(Constraint::Pin(WorkerWithDpRank::new(11, 0)));
+    let router = SteerDecodeByPrefill(fixture.router(list));
+    let req = request("steer-1");
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.worker(0).unwrap().worker_id, 11);
+    assert!(
+        state(&plan, 1).is_pending(),
+        "decode is deferred until prefill completes"
+    );
+    let attempt = plan.mark_dispatched(0).unwrap();
+    plan.mark_completed(0, attempt, plan.worker(0).unwrap())
+        .unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(
+        plan.worker(1).unwrap().worker_id,
+        22,
+        "decode followed the custom router's reading of prefill's record"
+    );
+    plan.release().await.unwrap();
+    assert_eq!(fixture.outstanding(), 0);
+}
+
+/// A set router that returns without booking the stage it was handed (a
+/// policy that finishes early, or wants to wait where nothing may wait) is
+/// an error at the composition, never a silently partial plan. The stages
+/// other sets booked stay with the host to release.
+struct NeverBooks(WorkerType);
+
+#[async_trait::async_trait]
+impl Router for NeverBooks {
+    async fn select(&self, _req: SelectRequest) -> Result<SelectResponse, SelectionError> {
+        Err(SelectionError::NotReady("no preview".to_string()))
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        Ok(Plan::new(
+            super::plan::PlanId::from(req.selection_id.clone().unwrap_or_default()),
+            crate::identity::RoutingPartitionId::new(&req.model_name, &req.routing_group),
+            vec![Stage::new(self.0)],
+        )?)
+    }
+
+    async fn schedule(
+        &self,
+        _req: &SelectAndReserveRequest,
+        _plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_set_router_that_finishes_without_booking_is_an_error() {
+    let fixture = Fixture::new();
+    let router = MultiStageRouter::builder()
+        .set(WorkerType::Prefill, fixture.prefill.clone())
+        .set(WorkerType::Decode, Arc::new(NeverBooks(WorkerType::Decode)))
+        .classes(ClassTable::new(StageList::prefill_decode()))
+        .build()
+        .unwrap();
+    for req in [request("finish-3"), all_now(request("finish-4"))] {
+        let mut plan = router.plan(&req).unwrap();
+        let error = router.schedule(&req, &mut plan).await.unwrap_err();
+        assert!(
+            matches!(&error, SelectionError::Internal(message) if message.contains("without booking stage 1")),
+            "{error}"
+        );
+        assert_eq!(
+            state(&plan, 0),
+            &StageState::Booked,
+            "prefill stays booked for the host"
+        );
+        assert!(state(&plan, 1).is_pending());
+        plan.release().await.unwrap();
+    }
+    assert_eq!(fixture.outstanding(), 0);
 }
