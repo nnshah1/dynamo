@@ -28,6 +28,7 @@ impl Router for SelectionCore {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut stage = Stage::new(self.worker_type);
+        stage.pool = self.pool().map(str::to_string);
         if req.all_now {
             stage.wait = Budget::Immediate;
         }
@@ -51,9 +52,12 @@ impl Router for SelectionCore {
         let session_context =
             resolve_session_context(req.session_context.clone(), req.session_id.clone());
         loop {
+            // This core's stages: its worker type, and its pool when the
+            // host routes more than one set of that type.
             let next = plan.schedulable().find(|&k| {
-                plan.stage(k)
-                    .is_some_and(|stage| stage.set == self.worker_type)
+                plan.stage(k).is_some_and(|stage| {
+                    stage.set == self.worker_type && stage.pool.as_deref() == self.pool()
+                })
             });
             let Some(k) = next else { break };
             self.book_stage(req, plan, k, session_context.as_ref())
@@ -974,5 +978,39 @@ mod tests {
         plan.release().await.unwrap();
         other.release().await.unwrap();
         core.free_reservation("held").await.unwrap();
+    }
+
+    /// A core named as one worker set of its type books only the stages
+    /// that name that pool; the other decode set's stage is left for its
+    /// own core, and the core's one-stage plan names its pool.
+    #[tokio::test]
+    async fn a_pooled_core_books_only_its_own_pools_stages() {
+        let core = local_core(test_config(false));
+        core.set_pool("canary").unwrap();
+        assert!(core.set_pool("main").is_err(), "a core is one pool");
+        core.upsert_worker(worker(1)).await.expect("worker upsert");
+        let req = reserve_request("pooled");
+        let own = Router::plan(&core, &req).unwrap();
+        assert_eq!(own.stage(0).unwrap().pool.as_deref(), Some("canary"));
+
+        let mut plan = Plan::new(
+            PlanId::from("pooled"),
+            default_key(),
+            vec![
+                Stage {
+                    pool: Some("canary".to_string()),
+                    ..Stage::new(WorkerType::Aggregated)
+                },
+                Stage::new(WorkerType::Aggregated),
+            ],
+        )
+        .unwrap();
+        Router::schedule(&core, &req, &mut plan).await.unwrap();
+        assert_eq!(plan.state_of(0), Some(&StageState::Booked));
+        assert!(
+            plan.state_of(1).unwrap().is_pending(),
+            "the unnamed set's stage is not this core's"
+        );
+        plan.release().await.unwrap();
     }
 }

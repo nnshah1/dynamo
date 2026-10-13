@@ -6,9 +6,9 @@
 //! in `run`, reservations in `reservations`, worker membership in `workers`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dynamo_tokens::SequenceHash;
@@ -280,6 +280,10 @@ pub struct SelectionCore {
     worker_selection_policy_factory: WorkerSelectionPolicyFactory,
     host: SelectionHost,
     worker_type: WorkerType,
+    /// The worker set this core is, when the host routes more than one set
+    /// of its type: as a `Router` it books only the plan stages that name
+    /// this pool. Unset, it is the type's one unnamed set.
+    pool: OnceLock<String>,
     cancel_token: CancellationToken,
     replica_config: Option<ReplicaSyncConfig>,
     /// Booking inputs captured by `select`, keyed by `selection_id`, so a later
@@ -358,6 +362,23 @@ impl SelectionCore {
         self.entry(key).map(SelectionPartition)
     }
 
+    /// Name the worker set this core is, once, before it serves plans. A
+    /// host that routes several sets of one worker type gives each core its
+    /// pool name; a stage then books into the core whose pool it names.
+    pub fn set_pool(&self, pool: impl Into<String>) -> Result<(), String> {
+        self.pool.set(pool.into()).map_err(|pool| {
+            format!(
+                "the core is already pool {:?}, not {pool:?}",
+                self.pool.get()
+            )
+        })
+    }
+
+    /// The worker set this core is; `None` is the type's unnamed set.
+    pub fn pool(&self) -> Option<&str> {
+        self.pool.get().map(String::as_str)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_inner(
         kv_router_config: crate::config::KvRouterConfig,
@@ -395,6 +416,7 @@ impl SelectionCore {
             worker_selection_policy_factory,
             host,
             worker_type,
+            pool: OnceLock::new(),
             cancel_token,
             replica_config,
             selection_cache: SelectionCache::new(&cache_config),
