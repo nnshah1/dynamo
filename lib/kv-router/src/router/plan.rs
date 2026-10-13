@@ -332,6 +332,12 @@ pub struct Stage {
     pub constraints: Vec<Constraint>,
     pub skip: Option<SkipRule>,
     /// Overrides the accounting derived from the set; see [`Plan::work_of`].
+    ///
+    /// Precedence for what a stage says (`work`, `scoring`): the stage list
+    /// wins over the request's own `router_config_override`, which wins over
+    /// the set's configuration. A stage that says nothing, and the derived
+    /// defaults that amount to "as configured", leave the request's and the
+    /// set's choice alone.
     pub work: Option<StageWork>,
     /// Overrides the scoring derived from the work; see [`Plan::scoring_of`].
     pub scoring: Option<StageScoring>,
