@@ -197,7 +197,15 @@ impl RoutingHost {
             phase,
             &routing_constraints,
             allowed_worker_ids.as_ref(),
-        )? {
+        ) {
+            if eligible.is_empty()
+                && let Some(error) = request
+                    .migration_state
+                    .as_ref()
+                    .and_then(|state| state.exhausted_error())
+            {
+                return Err(anyhow::anyhow!(error));
+            }
             allowed_worker_ids = Some(eligible);
         }
         let return_routing_hashes =
@@ -417,23 +425,24 @@ impl RoutingHost {
     /// allowed set (every worker of the set by default), kept to those
     /// compatible with its constraints and not recorded as failed. `None`
     /// when nothing is excluded or the caller pinned a worker (the pin
-    /// stands). The migration's own exhaustion error when no eligible worker
-    /// remains. Every admission on this host, direct or from a plan, goes
-    /// through this one rule.
+    /// stands). An empty set means this host is exhausted for the retry;
+    /// the caller decides when that matters (a direct admission at once, a
+    /// plan only for a stage that still needs this set). Every admission on
+    /// this host, direct or from a plan, goes through this one rule.
     pub(crate) fn migration_eligible_workers(
         &self,
         request: &PreprocessedRequest,
         phase: RequestPhase,
         routing_constraints: &RoutingConstraints,
         allowed_worker_ids: Option<&HashSet<WorkerId>>,
-    ) -> Result<Option<HashSet<WorkerId>>, Error> {
+    ) -> Option<HashSet<WorkerId>> {
         let excluded = request
             .migration_state
             .as_ref()
             .map(|state| state.excluded_worker_ids())
             .unwrap_or_default();
         if excluded.is_empty() || pinned_worker_hint(phase, request.routing.as_ref()).is_some() {
-            return Ok(None);
+            return None;
         }
         let workers = self.kv_router().workers_with_configs.borrow();
         let mut eligible: HashSet<WorkerId> = allowed_worker_ids
@@ -444,15 +453,7 @@ impl RoutingHost {
                 routing_constraints.is_compatible_with_worker_taints(&config.taints)
             }) && !excluded.contains(worker_id)
         });
-        if eligible.is_empty()
-            && let Some(error) = request
-                .migration_state
-                .as_ref()
-                .and_then(|state| state.exhausted_error())
-        {
-            return Err(anyhow::anyhow!(error));
-        }
-        Ok(Some(eligible))
+        Some(eligible)
     }
 }
 
