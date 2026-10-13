@@ -269,6 +269,10 @@ impl StageState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage {
     pub set: WorkerType,
+    /// The worker set this stage books into when more than one set of this
+    /// type is routed (a rolling update's new generation, a canary, a second
+    /// hardware pool). `None` is the one unnamed set of the type.
+    pub pool: Option<String>,
     pub when: When,
     /// Stages whose outcome this one needs before it is forwarded.
     pub inputs: Vec<usize>,
@@ -285,6 +289,7 @@ impl Stage {
     pub fn new(set: WorkerType) -> Self {
         Self {
             set,
+            pool: None,
             when: When::Now,
             inputs: Vec::new(),
             wait: Budget::Full,
