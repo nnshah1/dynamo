@@ -50,7 +50,7 @@ use super::{
 use crate::kv_router::RoutingHost;
 use crate::kv_router::plan_host::{frontend_error, routing_request};
 use crate::kv_router::routing_host::{
-    CleanupBudget, cancelled_error,
+    CleanupBudget, StagedKv, await_with_cleanup_policy, cancelled_error,
     kv_selection::{WorkerSelection, pinned_worker_hint, resolve_pinned_worker_rank},
 };
 use crate::protocols::common::{
@@ -184,6 +184,7 @@ impl PrefillRouter {
             // legacy host uses.
             budget: CleanupBudget::default(),
             affinity: None,
+            prefill_affinity: None,
             lifecycle: None,
             lifecycle_selected: false,
             staged_kv_cleanup: false,
@@ -229,6 +230,8 @@ struct PlannedFlow<'a> {
     budget: CleanupBudget,
     /// The decode phase's session-affinity hold, bound to the decode stream.
     affinity: Option<Hold>,
+    /// The prefill phase's hold, bound to the prefill stream at dispatch.
+    prefill_affinity: Option<Hold>,
     /// The request's classifier lifecycle, owned by the decode leg.
     lifecycle: Option<Box<RequestLifecycle>>,
     lifecycle_selected: bool,
@@ -325,6 +328,7 @@ impl PlannedFlow<'_> {
                 .plan(routing)
                 .map_err(|error| self.routing_error(frontend_error(error)))?;
             self.pin_caller_targets(&mut plan)?;
+            self.exclude_migration_failures(routing, &mut plan)?;
             *slot = Some(plan);
         }
         self.schedule_first(&multistage, shared).await?;
@@ -332,10 +336,26 @@ impl PlannedFlow<'_> {
         let (routing, plan) = &mut *guard;
         let plan = plan.as_mut().expect("plan set above");
         loop {
-            if plan.ready().next().is_none()
-                && let Err(error) = multistage.schedule(routing, plan).await
-            {
-                return Err(self.routing_error(frontend_error(error)));
+            if plan.ready().next().is_none() {
+                // A deferred stage waits in its queue under the host's
+                // cancellation policy: a stopped client withdraws it, unless
+                // a remote prefill staged KV that only decode can release.
+                let staged_kv = if self.staged_kv_cleanup {
+                    StagedKv::Present
+                } else {
+                    StagedKv::Absent
+                };
+                await_with_cleanup_policy(
+                    engine_ctx.as_ref(),
+                    RequestPhase::Decode,
+                    staged_kv,
+                    "plan schedule",
+                    &self.budget,
+                    multistage.schedule(routing, plan),
+                )
+                .await
+                .map_err(|error| self.routing_error(error))?
+                .map_err(|error| self.routing_error(frontend_error(error)))?;
             }
             let Some(k) = plan.ready().next() else {
                 return Err(anyhow!(
@@ -379,6 +399,8 @@ impl PlannedFlow<'_> {
         let prefill_host = &self.binding.router;
         let decode_host = self.decode_host;
         let budget = &self.budget;
+        let engine_ctx = decode_request.context();
+        let engine_ctx: &dyn AsyncEngineContext = engine_ctx.as_ref();
         let select = || {
             prefill_host.select_with_session_affinity(
                 prefill_request,
@@ -409,17 +431,26 @@ impl PlannedFlow<'_> {
                                 decode_target,
                                 decode_host,
                             )?;
-                            multistage
-                                .schedule(routing, plan)
-                                .await
-                                .map_err(frontend_error)?;
+                            // Nothing is dispatched yet: a stopped client
+                            // withdraws the queued admission, as the host's
+                            // own admission does.
+                            await_with_cleanup_policy(
+                                engine_ctx,
+                                RequestPhase::Decode,
+                                StagedKv::Absent,
+                                "plan schedule",
+                                budget,
+                                multistage.schedule(routing, plan),
+                            )
+                            .await?
+                            .map_err(frontend_error)?;
                             Ok(decode_worker(plan))
                         },
                     )
                 },
             )
         };
-        let (((decode_worker, decode_hold), _prefill_hold), lifecycle) = decode_host
+        let (((decode_worker, decode_hold), prefill_hold), lifecycle) = decode_host
             .with_request_lifecycle(
                 decode_request,
                 RequestPhase::Decode,
@@ -431,6 +462,51 @@ impl PlannedFlow<'_> {
         self.lifecycle_selected = decode_worker.is_some();
         self.lifecycle = lifecycle;
         self.affinity = decode_hold;
+        self.prefill_affinity = prefill_hold;
+        Ok(())
+    }
+
+    /// A migration retry may not reuse a worker a previous attempt failed on.
+    /// Each host applies its one eligibility rule (allowed set, constraints,
+    /// recorded failures, exhaustion); the plan records the exclusions on
+    /// that set's pending stages so the core selects around them.
+    fn exclude_migration_failures(
+        &self,
+        routing: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<()> {
+        let body = self
+            .decode_request
+            .as_ref()
+            .ok_or_else(|| anyhow!("decode request already consumed"))?
+            .content();
+        let Some(state) = body.migration_state.as_ref() else {
+            return Ok(());
+        };
+        let phases = [
+            (
+                WorkerType::Prefill,
+                RequestPhase::Prefill,
+                &self.binding.router,
+            ),
+            (WorkerType::Decode, RequestPhase::Decode, self.decode_host),
+        ];
+        for (set, phase, host) in phases {
+            let eligible = host
+                .migration_eligible_workers(
+                    body,
+                    phase,
+                    &routing.routing_constraints,
+                    routing.allowed_worker_ids.as_ref(),
+                )
+                .map_err(|error| self.routing_error(error))?;
+            if eligible.is_none() {
+                continue;
+            }
+            for worker_id in state.excluded_worker_ids() {
+                exclude_set(plan, set, worker_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -488,10 +564,17 @@ impl PlannedFlow<'_> {
             target,
             &self.binding.endpoint_id,
         )?;
+        let prefill_affinity = self.prefill_affinity.take();
         let prefill_stream = match self
             .binding
             .router
-            .dispatch_worker_selection(prefill_request, selection, None, None, &self.budget)
+            .dispatch_worker_selection(
+                prefill_request,
+                selection,
+                None,
+                prefill_affinity,
+                &self.budget,
+            )
             .await
         {
             Ok(stream) => stream,
@@ -757,6 +840,18 @@ fn pin_set(plan: &mut Plan, set: WorkerType, worker: WorkerWithDpRank) -> Result
     Ok(())
 }
 
+/// Exclude `worker_id` from every pending stage of `set`.
+fn exclude_set(plan: &mut Plan, set: WorkerType, worker_id: u64) -> Result<()> {
+    for k in 0..plan.stage_count() {
+        let Some(stage) = plan.stage(k) else { continue };
+        if stage.set != set || !plan.state_of(k).is_some_and(StageState::is_pending) {
+            continue;
+        }
+        plan.constrain(k, Constraint::Exclude(worker_id))?;
+    }
+    Ok(())
+}
+
 fn decode_worker(plan: &Plan) -> Option<WorkerWithDpRank> {
     (0..plan.stage_count())
         .find(|&k| {
@@ -937,16 +1032,6 @@ mod tests {
         conditional: bool,
         worker_config: ModelRuntimeConfig,
     ) -> KvSet {
-        let endpoint = distributed
-            .namespace(namespace.to_string())
-            .unwrap()
-            .component(role.to_string())
-            .unwrap()
-            .endpoint("generate".to_string());
-        let client = endpoint.client().await.unwrap();
-        endpoint.register_endpoint_instance().await.unwrap();
-        let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-        let (_workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
         // The deployment's flag reaches each set's router, as the model
         // manager passes it: a decode set that may run prefill locally keeps
         // cache-aware selection, a plain one scores on load alone.
@@ -957,6 +1042,26 @@ mod tests {
             conditional_disagg_enabled: conditional,
             ..Default::default()
         };
+        kv_set_with_config(distributed, namespace, role, config, worker_config).await
+    }
+
+    async fn kv_set_with_config(
+        distributed: &DistributedRuntime,
+        namespace: &str,
+        role: &'static str,
+        config: KvRouterConfig,
+        worker_config: ModelRuntimeConfig,
+    ) -> KvSet {
+        let endpoint = distributed
+            .namespace(namespace.to_string())
+            .unwrap()
+            .component(role.to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let worker_id = client.wait_for_instances().await.unwrap()[0].id();
+        let (_workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
         // The role types the core's `Router`: it books only the stages of
         // its own set, as production's discovery-managed hosts do.
         let worker_role = match role {
@@ -1767,5 +1872,298 @@ mod tests {
         assert_eq!(decode_body.stop_conditions.max_tokens, Some(32));
         wait_until_released(&fixture).await;
         fixture.runtime.shutdown();
+    }
+
+    /// The reviewer's acceptance probe: a hard prefill session bound through
+    /// the planned path names the same worker a direct admission binds.
+    #[tokio::test]
+    async fn reviewer_direct_host_preserves_prefill_affinity_binding() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::extensions::{
+            SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
+        };
+        use crate::protocols::common::timing::RequestPhase;
+        use crate::session_affinity::{AffinityCoordinator, SessionAffinityMode};
+
+        let mut f = fixture("review-direct-prefill-affinity").await;
+        let affinity =
+            AffinityCoordinator::new(Duration::from_secs(30), SessionAffinityMode::Hard).unwrap();
+        let inner = PushRouter::from_client_with_dispatch(
+            f.prefill.chooser.client().clone(),
+            RouterMode::KV,
+            Arc::clone(&f.prefill.worker) as Arc<dyn StreamingDispatch<_, _>>,
+        )
+        .await
+        .unwrap();
+        f.prefill.host = Arc::new(RoutingHost::new_with_coordinator(
+            inner,
+            Arc::clone(&f.prefill.chooser),
+            Some(affinity.clone()),
+        ));
+        let previous = f.router.binding.load_full().unwrap();
+        f.router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: previous.target_id.clone(),
+            endpoint_id: previous.endpoint_id.clone(),
+            router: Arc::clone(&f.prefill.host),
+            prefill_router_mode: RouterMode::KV,
+        })));
+        f.prefill.worker.script(vec![bootstrap_frame()]);
+        f.decode.worker.script(vec![token_frame(7), stop_frame()]);
+        let planned_id = SessionAffinityId::new("planned-prefill-session");
+        let mut planned = Context::new(request());
+        planned.insert(SESSION_AFFINITY_CONTEXT_KEY, planned_id.clone());
+        let response = f
+            .router
+            .generate(planned, Arc::new(NeverNext))
+            .await
+            .unwrap();
+        let frames: Vec<_> = response.collect().await;
+        assert!(frames.iter().all(|frame| frame.err().is_none()));
+        wait_until_released(&f).await;
+        let planned_target = affinity.query_target(&planned_id, None).unwrap();
+
+        f.prefill.worker.script(vec![bootstrap_frame()]);
+        let direct_id = SessionAffinityId::new("direct-prefill-session");
+        let mut direct = Context::new(request());
+        direct.insert(SESSION_AFFINITY_CONTEXT_KEY, direct_id.clone());
+        let route = f
+            .prefill
+            .host
+            .admit_kv_route(
+                &direct,
+                RequestPhase::Prefill,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let response = f
+            .prefill
+            .host
+            .dispatch_kv_plan(direct, route)
+            .await
+            .unwrap();
+        let _: Vec<_> = response.collect().await;
+        wait_until_released(&f).await;
+        let direct_target = affinity.query_target(&direct_id, None).unwrap();
+        f.runtime.shutdown();
+        assert_eq!(
+            direct_target.map(|target| target.worker_id),
+            Some(f.prefill.worker_id)
+        );
+        assert_eq!(
+            planned_target, direct_target,
+            "planned prefill dispatch must bind the same affinity target as direct dispatch"
+        );
+    }
+
+    /// The reviewer's acceptance probe: a migration retry never reaches the
+    /// decode worker the previous attempt failed on.
+    #[tokio::test]
+    async fn reviewer_direct_host_preserves_migration_exclusions() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::timing::RequestPhase;
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let f = fixture("review-direct-migration-exclusions").await;
+        let mut body = request();
+        body.migration_state = Some(Default::default());
+        body.migration_state.as_ref().unwrap().record_failure(
+            f.decode.worker_id,
+            Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::WorkerOverloaded)
+                    .message("the previous attempt failed on this decode worker")
+                    .build(),
+            ),
+        );
+        let direct = f
+            .decode
+            .host
+            .admit_kv_route(
+                &Context::new(body.clone()),
+                RequestPhase::Decode,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await;
+        assert!(
+            direct.is_err(),
+            "the direct control rejects its only excluded decode worker"
+        );
+        f.prefill.worker.script(vec![bootstrap_frame()]);
+        f.decode.worker.script(vec![token_frame(7), stop_frame()]);
+        let response = f
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await;
+        if let Ok(response) = response {
+            let _: Vec<_> = response.collect().await;
+        }
+        wait_until_released(&f).await;
+        let sent = f.decode.worker.seen();
+        f.runtime.shutdown();
+        assert!(
+            sent.is_empty(),
+            "the planned host must not dispatch to the decode worker excluded by the prior migration attempt"
+        );
+    }
+
+    /// The reviewer's acceptance probe: a planned admission waiting in a
+    /// saturated queue withdraws when the client stops, as a direct
+    /// admission does, without the task being aborted from outside.
+    #[tokio::test]
+    async fn reviewer_direct_host_cancels_queued_admission() {
+        use crate::kv_router::plan_host::routing_request;
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::timing::RequestPhase;
+        use dynamo_kv_router::router::{ClassTable, MultiStageRouter, Stage, StageList};
+        use dynamo_kv_router::scheduling::config::RouterPrefillLoadModel;
+
+        let original = fixture("review-direct-queued-cancellation").await;
+        let distributed =
+            DistributedRuntime::new(original.runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let policy =
+            std::env::temp_dir().join(format!("review-direct-cancel-{}.yaml", std::process::id()));
+        std::fs::write(
+            &policy,
+            "default_policy_family: regular\nuncached_isl_buckets:\n  - min_tokens: 0\n    bucket: all\npolicy_classes:\n  - name: saturated\n    policy_family: regular\n    cache_bucket: all\n    quantum: 1\n    prefill_busy_threshold_frac: 0.0\n    request_queue_limit_per_worker: 1\n",
+        )
+        .unwrap();
+        let config = KvRouterConfig {
+            skip_initial_worker_wait: true,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            router_prefill_load_model: RouterPrefillLoadModel::Ais,
+            router_policy_config: Some(policy.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let decode = kv_set_with_config(
+            &distributed,
+            "review-direct-queued-cancellation",
+            "decode",
+            config,
+            ModelRuntimeConfig {
+                max_num_batched_tokens: Some(8192),
+                total_kv_blocks: Some(1_000_000),
+                ..Default::default()
+            },
+        )
+        .await;
+        let binding = original.router.binding.load_full().unwrap();
+        let router = PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+        router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: binding.target_id.clone(),
+            endpoint_id: binding.endpoint_id.clone(),
+            router: Arc::clone(&original.prefill.host),
+            prefill_router_mode: RouterMode::KV,
+        })));
+        router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        router
+            .set_decode_routing_host(Arc::clone(&decode.host))
+            .unwrap();
+        router
+            .set_plan_router_factory(Arc::new(|parts| {
+                Ok(Arc::new(
+                    MultiStageRouter::builder()
+                        .set(WorkerType::Decode, parts.decode)
+                        .classes(ClassTable::new(StageList::new(vec![Stage::new(
+                            WorkerType::Decode,
+                        )])))
+                        .build()?,
+                ) as Arc<dyn Router>)
+            }))
+            .unwrap();
+        let f = Fixture {
+            router,
+            prefill: original.prefill,
+            decode,
+            runtime: original.runtime,
+        };
+        // Hold the worker's one slot so the next admissions queue.
+        let context = Context::new(request());
+        let core = f.decode.chooser.plan_router();
+        let req = routing_request(&context, &f.decode.chooser.partition(), None, false);
+        let mut held = core.plan(&req).unwrap();
+        core.schedule(&req, &mut held).await.unwrap();
+
+        let chooser = Arc::clone(&f.decode.chooser);
+        let wait_for_pending = |expected: usize| {
+            let chooser = Arc::clone(&chooser);
+            async move {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while chooser.pending_count() != expected {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("the queue did not reach {expected} pending"));
+            }
+        };
+
+        // Direct control: stop withdraws the queued admission.
+        let direct_context = Context::new(request());
+        let direct_engine = direct_context.context();
+        let host = Arc::clone(&f.decode.host);
+        let mut direct = tokio::spawn(async move {
+            host.admit_kv_route(
+                &direct_context,
+                RequestPhase::Decode,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await
+        });
+        wait_for_pending(1).await;
+        direct_engine.stop();
+        let direct_cancelled =
+            match tokio::time::timeout(Duration::from_millis(250), &mut direct).await {
+                Ok(result) => result.unwrap().is_err(),
+                Err(_) => {
+                    direct.abort();
+                    let _ = direct.await;
+                    false
+                }
+            };
+        wait_for_pending(0).await;
+
+        // Planned: the same stop withdraws the same queue entry.
+        let planned_context = Context::new(request());
+        let planned_engine = planned_context.context();
+        let router = Arc::clone(&f.router);
+        let mut planned =
+            tokio::spawn(
+                async move { router.generate(planned_context, Arc::new(NeverNext)).await },
+            );
+        wait_for_pending(1).await;
+        planned_engine.stop();
+        let planned_cancelled =
+            match tokio::time::timeout(Duration::from_millis(250), &mut planned).await {
+                Ok(result) => result.unwrap().is_err(),
+                Err(_) => {
+                    planned.abort();
+                    let _ = planned.await;
+                    false
+                }
+            };
+        wait_for_pending(0).await;
+        held.release().await.unwrap();
+        wait_until_released(&f).await;
+        assert!(f.prefill.worker.seen().is_empty() && f.decode.worker.seen().is_empty());
+        std::fs::remove_file(policy).unwrap();
+        f.runtime.shutdown();
+        assert!(direct_cancelled, "direct control responds to stop");
+        assert!(
+            planned_cancelled,
+            "planned admission must retract on stop without external task abortion"
+        );
     }
 }
