@@ -391,6 +391,12 @@ impl SessionContext {
         static EMPTY: BTreeMap<String, Vec<String>> = BTreeMap::new();
         self.agent_headers.as_deref().unwrap_or(&EMPTY)
     }
+
+    /// The shared header map as attached, for a caller that passes it on
+    /// without copying its contents; `None` when none was attached.
+    pub fn shared_agent_headers(&self) -> Option<&Arc<BTreeMap<String, Vec<String>>>> {
+        self.agent_headers.as_ref()
+    }
 }
 
 /// Validated request accepted by [`LocalScheduler`](super::LocalScheduler).
