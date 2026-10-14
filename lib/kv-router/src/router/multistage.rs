@@ -313,19 +313,39 @@ impl MultiStageRouter {
     }
 
     /// The first stage could not be booked for capacity and the class
-    /// allows it: book the decode set as one stage instead.
+    /// allows it: book the decode set as one stage instead. The decode
+    /// stage keeps what was said about it alone: its pool and the worker
+    /// restrictions a caller or a migration retry placed on it (pins and
+    /// exclusions). Constraints that read other stages are dropped with
+    /// those stages.
     async fn fall_back(
         &self,
         req: &SelectAndReserveRequest,
         plan: &mut Plan,
     ) -> Result<(), SelectionError> {
+        let original = plan.stages().find(|stage| stage.set == WorkerType::Decode);
         let mut decode = Stage::new(WorkerType::Decode);
+        if let Some(original) = original {
+            decode.pool = original.pool.clone();
+            decode.constraints = original
+                .constraints
+                .iter()
+                .filter(|constraint| {
+                    matches!(
+                        constraint,
+                        Constraint::Pin(_) | Constraint::Previewed(_) | Constraint::Exclude(_)
+                    )
+                })
+                .cloned()
+                .collect();
+        }
         if req.all_now {
             decode.wait = Budget::Immediate;
         }
+        let pool = decode.pool.clone();
         *plan = Plan::new(plan.id().clone(), plan.partition().clone(), vec![decode])
             .map_err(internal)?;
-        self.set_router(WorkerType::Decode, None)?
+        self.set_router(WorkerType::Decode, pool.as_deref())?
             .schedule(req, plan)
             .await
     }

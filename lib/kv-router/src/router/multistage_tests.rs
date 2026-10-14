@@ -1650,3 +1650,46 @@ async fn a_set_router_that_finishes_without_booking_is_an_error() {
     }
     assert_eq!(fixture.outstanding(), 0);
 }
+
+/// Falling back to the decode set keeps the worker restrictions placed on
+/// the decode stage: a migration retry's excluded worker is still avoided,
+/// and with every decode worker excluded the fallback fails rather than
+/// reusing one. Constraints that read the removed prefill stage are dropped.
+#[tokio::test]
+async fn fallback_keeps_the_decode_stages_exclusions() {
+    let fixture = Fixture::new();
+    fixture.prefill.set_admission_open(false);
+    let mut list = StageList::prefill_decode().with_fallback(Fallback::Aggregated);
+    list.stages[1].constraints.push(Constraint::Exclude(21));
+    let router = fixture.router(list);
+    let req = all_now(request("fallback-excluded"));
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(plan.stage_count(), 1, "fell back to decode alone");
+    assert_eq!(
+        plan.worker(0).unwrap().worker_id,
+        22,
+        "the excluded worker is still avoided"
+    );
+    assert!(
+        plan.stage(0)
+            .unwrap()
+            .constraints
+            .iter()
+            .all(|constraint| !matches!(constraint, Constraint::TransferCompatible(_))),
+        "a constraint reading the removed prefill stage is dropped"
+    );
+    plan.release().await.unwrap();
+
+    let mut list = StageList::prefill_decode().with_fallback(Fallback::Aggregated);
+    list.stages[1].constraints.push(Constraint::Exclude(21));
+    list.stages[1].constraints.push(Constraint::Exclude(22));
+    let router = fixture.router(list);
+    let req = all_now(request("fallback-exhausted"));
+    let mut plan = router.plan(&req).unwrap();
+    assert!(
+        router.schedule(&req, &mut plan).await.is_err(),
+        "no decode worker is left to fall back to"
+    );
+    assert_eq!(fixture.outstanding(), 0);
+}

@@ -968,7 +968,7 @@ fn handoff_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1113,6 +1113,26 @@ mod tests {
         config: KvRouterConfig,
         worker_config: ModelRuntimeConfig,
     ) -> KvSet {
+        kv_set_with_policy(
+            distributed,
+            namespace,
+            role,
+            config,
+            worker_config,
+            SelectionPolicySource::Registry,
+        )
+        .await
+    }
+
+    /// A set whose core runs `policy` for worker selection.
+    async fn kv_set_with_policy(
+        distributed: &DistributedRuntime,
+        namespace: &str,
+        role: &'static str,
+        config: KvRouterConfig,
+        worker_config: ModelRuntimeConfig,
+        policy: SelectionPolicySource,
+    ) -> KvSet {
         let endpoint = distributed
             .namespace(namespace.to_string())
             .unwrap()
@@ -1137,7 +1157,7 @@ mod tests {
                 workers,
                 None,
                 16,
-                SelectionPolicySource::Registry,
+                policy,
                 Some(config),
                 None,
                 Some(worker_role),
@@ -2490,5 +2510,225 @@ mod tests {
                 Some(fixture.prefill.worker_id)
             );
         }
+    }
+
+    /// The reviewer's probe: the aggregated fallback keeps a migration
+    /// retry's excluded decode worker excluded, so a request that fell back
+    /// once does not reach the worker it then failed on.
+    #[tokio::test]
+    async fn reviewer_independent_fallback_preserves_failed_decode_exclusion() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::preprocessor::RoutingHints;
+        use crate::protocols::common::timing::RequestPhase;
+        use dynamo_kv_router::router::{ClassTable, Fallback, MultiStageRouter, StageList};
+        use dynamo_runtime::error::{DynamoError, ErrorType};
+
+        let f = distinct_prefill_fixture("review-fallback-exclusion", false).await;
+        f.router
+            .set_plan_router_factory(Arc::new(|parts| {
+                Ok(Arc::new(
+                    MultiStageRouter::builder()
+                        .set(WorkerType::Prefill, parts.prefill)
+                        .set(WorkerType::Decode, parts.decode)
+                        .classes(ClassTable::new(
+                            StageList::prefill_decode().with_fallback(Fallback::Aggregated),
+                        ))
+                        .build()?,
+                ) as Arc<dyn Router>)
+            }))
+            .unwrap();
+        let mut body = request();
+        body.routing = Some(RoutingHints {
+            allowed_worker_ids: Some(HashSet::from([f.decode.worker_id])),
+            ..Default::default()
+        });
+        f.decode.worker.script(vec![token_frame(7), stop_frame()]);
+        let control = f
+            .router
+            .generate(Context::new(body.clone()), Arc::new(NeverNext))
+            .await
+            .unwrap();
+        let frames: Vec<_> = control.collect().await;
+        assert!(frames.iter().all(|frame| frame.err().is_none()));
+        wait_until_released(&f).await;
+        assert!(
+            f.prefill.worker.seen().is_empty(),
+            "the control used the decode fallback"
+        );
+        assert_eq!(f.decode.worker.seen().len(), 1);
+
+        body.migration_state = Some(Default::default());
+        body.migration_state.as_ref().unwrap().record_failure(
+            f.decode.worker_id,
+            Some(
+                DynamoError::builder()
+                    .error_type(ErrorType::WorkerOverloaded)
+                    .message("decode already failed")
+                    .build(),
+            ),
+        );
+        let direct = f
+            .decode
+            .host
+            .admit_kv_route(
+                &Context::new(body.clone()),
+                RequestPhase::Decode,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await;
+        assert!(direct.is_err(), "direct decode refuses the failed worker");
+        f.decode.worker.script(vec![token_frame(8), stop_frame()]);
+        let result = f
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await;
+        if let Ok(response) = result {
+            let _: Vec<_> = response.collect().await;
+        }
+        wait_until_released(&f).await;
+        let seen = f.decode.worker.seen();
+        f.runtime.shutdown();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the fallback must not dispatch a second request to the excluded decode worker"
+        );
+    }
+
+    /// A worker picker that records the session context each selection
+    /// hands it: what a compiled custom policy gets to decide on.
+    struct SessionRecordingPicker {
+        observed: Arc<Mutex<Vec<Option<dynamo_kv_router::SessionContext>>>>,
+    }
+
+    impl dynamo_kv_router::plugins::worker_selection::WorkerPicker for SessionRecordingPicker {
+        fn pick(
+            &mut self,
+            context: &dynamo_kv_router::plugins::worker_selection::WorkerSelectionContext<'_>,
+            _input: dynamo_kv_router::plugins::worker_selection::WorkerInputView<'_>,
+        ) -> std::result::Result<
+            usize,
+            dynamo_kv_router::plugins::worker_selection::WorkerSelectionPolicyError,
+        > {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(context.session_context().cloned());
+            Ok(0)
+        }
+    }
+
+    /// The reviewer's probe: a compiled custom picker on the decode core sees
+    /// the same agent session context through the planned path as through a
+    /// direct admission.
+    #[tokio::test]
+    async fn reviewer_independent_custom_picker_receives_agent_context() {
+        use crate::kv_router::routing_host::CleanupBudget;
+        use crate::protocols::common::extensions::{AgentContextBuilder, InputTrigger};
+        use crate::protocols::common::timing::RequestPhase;
+
+        let mut f = fixture("review-custom-session-context").await;
+        let drt = DistributedRuntime::new(f.runtime.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&observed);
+        let factory: dynamo_kv_router::WorkerSelectionPolicyFactory =
+            Arc::new(move |config, role, _| {
+                dynamo_kv_router::WorkerSelectionPolicy::new(
+                    config.clone(),
+                    role.as_str(),
+                    Vec::new(),
+                    Box::new(SessionRecordingPicker {
+                        observed: Arc::clone(&capture),
+                    }),
+                )
+            });
+        f.decode = kv_set_with_policy(
+            &drt,
+            "review-custom-session-context-decode",
+            "decode",
+            KvRouterConfig {
+                skip_initial_worker_wait: true,
+                use_kv_events: false,
+                router_track_active_blocks: false,
+                ..Default::default()
+            },
+            ModelRuntimeConfig::default(),
+            SelectionPolicySource::Factory(factory),
+        )
+        .await;
+        // The decode host is set once per router: rebuild the router around
+        // the recording decode set.
+        let binding = f.router.binding.load_full().unwrap();
+        let router = PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+        router.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: binding.target_id.clone(),
+            endpoint_id: binding.endpoint_id.clone(),
+            router: Arc::clone(&f.prefill.host),
+            prefill_router_mode: RouterMode::KV,
+        })));
+        router.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        router
+            .set_decode_routing_host(Arc::clone(&f.decode.host))
+            .unwrap();
+        f.router = router;
+
+        let mut agent = AgentContextBuilder::default();
+        agent.session_id("session-a".to_string());
+        agent.parent_session_id("parent-a".to_string());
+        agent.session_final(false);
+        agent.input_trigger(InputTrigger::ToolResult);
+        let mut body = request();
+        body.agent_context = Some(agent.build().unwrap());
+        let expected = crate::kv_router::to_worker_selection_session_context(
+            body.agent_context.as_ref().unwrap(),
+        );
+        let control = f
+            .decode
+            .host
+            .admit_kv_route(
+                &Context::new(body.clone()),
+                RequestPhase::Decode,
+                None,
+                CleanupBudget::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        control.abort().await;
+        wait_until_released(&f).await;
+        {
+            let seen = observed.lock().unwrap();
+            assert!(!seen.is_empty());
+            assert!(
+                seen.iter().all(|item| item.as_ref() == Some(&expected)),
+                "the direct picker sees the session metadata: {seen:?}"
+            );
+        }
+        observed.lock().unwrap().clear();
+
+        f.prefill.worker.script(vec![bootstrap_frame()]);
+        f.decode.worker.script(vec![token_frame(8), stop_frame()]);
+        let response = f
+            .router
+            .generate(Context::new(body), Arc::new(NeverNext))
+            .await
+            .unwrap();
+        let frames: Vec<_> = response.collect().await;
+        assert!(frames.iter().all(|frame| frame.err().is_none()));
+        wait_until_released(&f).await;
+        let seen = observed.lock().unwrap().clone();
+        f.runtime.shutdown();
+        assert!(!seen.is_empty(), "the planned admission called the picker");
+        assert!(
+            seen.iter().all(|item| item.as_ref() == Some(&expected)),
+            "the planned picker sees the same agent context as a direct admission: {seen:?}"
+        );
     }
 }

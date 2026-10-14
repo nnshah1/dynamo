@@ -556,6 +556,27 @@ impl From<SelectionSessionContext> for SessionContext {
     }
 }
 
+/// The in-process session metadata in its wire form, for a host that builds
+/// a plan-level request from a request it already converted.
+impl From<SessionContext> for SelectionSessionContext {
+    fn from(session: SessionContext) -> Self {
+        // The headers travel as given, an empty map included, so a context
+        // that went out and came back compares equal to the original.
+        let agent_headers = Some(Arc::new(session.agent_headers().clone()));
+        Self {
+            session_id: session.session_id().to_string(),
+            parent_session_id: session.parent_session_id().map(str::to_string),
+            session_final: session.session_final(),
+            input_trigger: session.input_trigger().map(|trigger| match trigger {
+                WorkerSelectionInputTrigger::UserMessage => SelectionInputTrigger::UserMessage,
+                WorkerSelectionInputTrigger::ToolResult => SelectionInputTrigger::ToolResult,
+                WorkerSelectionInputTrigger::Other => SelectionInputTrigger::Other,
+            }),
+            agent_headers,
+        }
+    }
+}
+
 pub(super) fn resolve_session_context(
     session_context: Option<SelectionSessionContext>,
     session_id: Option<String>,
