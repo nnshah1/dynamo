@@ -560,9 +560,9 @@ impl From<SelectionSessionContext> for SessionContext {
 /// a plan-level request from a request it already converted.
 impl From<SessionContext> for SelectionSessionContext {
     fn from(session: SessionContext) -> Self {
-        // The headers travel as given, an empty map included, so a context
-        // that went out and came back compares equal to the original.
-        let agent_headers = Some(Arc::new(session.agent_headers().clone()));
+        // The shared map travels as attached (an empty one included), never
+        // copied: the request envelope already holds it in an Arc.
+        let agent_headers = session.shared_agent_headers().cloned();
         Self {
             session_id: session.session_id().to_string(),
             parent_session_id: session.parent_session_id().map(str::to_string),
