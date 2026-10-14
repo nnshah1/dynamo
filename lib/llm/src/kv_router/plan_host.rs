@@ -10,7 +10,7 @@ use anyhow::Error;
 use dynamo_kv_router::identity::RoutingPartitionId;
 use dynamo_kv_router::scheduling::KvSchedulerError;
 use dynamo_kv_router::services::selection::{
-    PromptRequest, SelectAndReserveRequest, SelectionError,
+    PromptRequest, SelectAndReserveRequest, SelectionError, SelectionSessionContext,
 };
 use dynamo_runtime::pipeline::SingleIn;
 
@@ -44,7 +44,13 @@ pub fn routing_request(
         priority_jump: routing.and_then(|hints| hints.priority_jump),
         strict_priority: routing.and_then(|hints| hints.strict_priority),
         session_id: None,
-        session_context: None,
+        // The agent's session, parent, finality and trigger, as the host's
+        // own admission hands them to the worker-selection policy.
+        session_context: body
+            .agent_context
+            .as_ref()
+            .map(crate::kv_router::to_worker_selection_session_context)
+            .map(SelectionSessionContext::from),
         affinity_target: None,
         pinned_worker: None,
         allowed_worker_ids: routing.and_then(|hints| hints.allowed_worker_ids.clone()),
