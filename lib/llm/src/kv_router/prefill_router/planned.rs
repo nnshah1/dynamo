@@ -1084,6 +1084,8 @@ mod tests {
         chooser: Arc<KvRouter>,
         worker: Arc<ScriptedWorker>,
         worker_id: u64,
+        /// The set's admitted membership, as discovery publishes it.
+        workers_tx: watch::Sender<HashMap<u64, ModelRuntimeConfig>>,
     }
 
     async fn kv_set(
@@ -1142,7 +1144,7 @@ mod tests {
         let client = endpoint.client().await.unwrap();
         endpoint.register_endpoint_instance().await.unwrap();
         let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-        let (_workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
+        let (workers_tx, workers) = watch::channel(HashMap::from([(worker_id, worker_config)]));
         // The role types the core's `Router`: it books only the stages of
         // its own set, as production's discovery-managed hosts do.
         let worker_role = match role {
@@ -1184,6 +1186,7 @@ mod tests {
             chooser,
             worker,
             worker_id,
+            workers_tx,
         }
     }
 
@@ -2730,5 +2733,79 @@ mod tests {
             seen.iter().all(|item| item.as_ref() == Some(&expected)),
             "the planned picker sees the same agent context as a direct admission: {seen:?}"
         );
+    }
+
+    /// A rolling replacement as the planned path sees it: the set's admitted
+    /// membership is the one input it routes by, intersected with discovered
+    /// endpoints as the direct path does. A plan booked on the retiring
+    /// worker keeps its booking and releases it after the worker has left
+    /// the membership. Once withdrawn, the worker's still-present endpoint
+    /// instance is not a placement: with no admitted worker left a new plan
+    /// is refused rather than routed to the retired instance or to an
+    /// instance without metadata.
+    #[tokio::test]
+    async fn membership_withdrawal_keeps_the_retiring_booking_and_refuses_new_plans() {
+        use crate::kv_router::plan_host::routing_request;
+        use dynamo_kv_router::services::selection::SelectionError;
+
+        let f = fixture("plan-host-membership-withdrawal").await;
+        let retiring = f.decode.worker_id;
+        let router = f.decode.chooser.plan_router();
+        let partition = f.decode.chooser.partition();
+        let loads = || async {
+            f.decode
+                .chooser
+                .get_potential_loads(&[], None, None, None, None)
+                .await
+                .unwrap()
+        };
+
+        // In flight on the retiring worker.
+        let before = Context::new(request());
+        let before_req = routing_request(&before, &partition, None, false);
+        let mut in_flight = router.plan(&before_req).unwrap();
+        router.schedule(&before_req, &mut in_flight).await.unwrap();
+        assert_eq!(in_flight.worker(0).unwrap().worker_id, retiring);
+
+        // Discovery withdraws the worker from the admitted membership; its
+        // endpoint instance is still registered.
+        f.decode.workers_tx.send_modify(|members| {
+            members.remove(&retiring);
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while loads().await.iter().any(|load| load.worker_id == retiring) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the core follows the admitted membership");
+        assert!(
+            f.decode
+                .chooser
+                .client()
+                .instances()
+                .iter()
+                .any(|instance| instance.id() == retiring),
+            "the endpoint instance itself is still discovered"
+        );
+
+        // A new plan is refused: the retired instance is not a placement.
+        let after = Context::new(request());
+        let after_req = routing_request(&after, &partition, None, false);
+        let mut fresh = router.plan(&after_req).unwrap();
+        let error = router.schedule(&after_req, &mut fresh).await.unwrap_err();
+        assert!(
+            matches!(error, SelectionError::Scheduler(_)),
+            "a scheduler refusal, not a placement: {error}"
+        );
+        assert!(fresh.booking(0).is_none());
+
+        // The retiring booking is still the plan's to release.
+        in_flight.release().await.unwrap();
+        assert!(
+            loads().await.iter().all(|load| load.active_requests == 0),
+            "nothing is charged after the release"
+        );
+        f.runtime.shutdown();
     }
 }
