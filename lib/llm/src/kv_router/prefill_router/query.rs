@@ -12,6 +12,7 @@ use dynamo_kv_router::{
 };
 
 use super::{PrefillError, PrefillLifecycleState, PrefillRouter};
+use crate::kv_router::KvRouter;
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 
 /// A prefill booking that owns cleanup of the exact scheduler attempt it admitted.
@@ -28,6 +29,9 @@ pub struct PrefillReservation {
     /// places later stages against it.
     config: WorkerConfig,
     booking: Option<BookingHandle>,
+    /// The set that admitted the booking; [`Self::enroll`] hands the booking
+    /// to this set's request-lease manager, never to a later binding's.
+    chooser: Option<Arc<KvRouter>>,
 }
 
 impl PrefillReservation {
@@ -41,6 +45,21 @@ impl PrefillReservation {
 
     pub fn config(&self) -> &WorkerConfig {
         &self.config
+    }
+
+    /// Hand the booking to the admitting set's request-lease manager under
+    /// the reservation id. From here the host drives it by id
+    /// ([`PrefillRouter::free_prefill_reservation`]), and a request that never
+    /// calls back expires with its lease, as a public decode admission does.
+    /// A built-in-mode reservation has no booking and nothing to enroll.
+    pub async fn enroll(mut self) -> Result<()> {
+        let (Some(booking), Some(chooser)) = (self.booking.take(), self.chooser.take()) else {
+            return Ok(());
+        };
+        chooser
+            .enroll_public_request_attempt(booking, None)
+            .await
+            .map_err(|error| anyhow::anyhow!("enrolling the prefill reservation: {error}"))
     }
 
     /// Release this booking and wait for the scheduler to acknowledge it.
@@ -97,6 +116,7 @@ impl PrefillRouter {
                 // published on this path, so an empty config is exact.
                 config: Arc::new(ModelRuntimeConfig::default()),
                 booking: None,
+                chooser: None,
             });
         };
         let admitted = chooser
@@ -144,6 +164,7 @@ impl PrefillRouter {
                     dp_rank: Some(worker.dp_rank),
                     config,
                     booking: Some(booking),
+                    chooser: Some(Arc::clone(chooser)),
                 })
             }
             crate::kv_router::FindBestMatchOutcome::QueueRejected { rejection } => {

@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLo
 use std::time::Duration;
 
 use anyhow::Result;
-use dashmap::DashMap;
 use dynamo_kv_router::WorkerType;
 use dynamo_kv_router::config::{RouterConfigOverride, try_kv_router_config_from_dynamo_env};
 use dynamo_kv_router::identity::RoutingPartitionId;
@@ -152,9 +151,9 @@ fn prefill_error(error: anyhow::Error) -> SelectionError {
     }
 }
 
-/// The wire id of a prefill stage's reservation: the plan id for a one-stage
-/// first attempt, else `"{plan}/{k}/{attempt}"`, the rule the core names its
-/// own bookings by.
+/// The wire id of stage `k`'s booking: the plan id for a one-stage first
+/// attempt, else `"{plan}/{k}/{attempt}"`, the rule the core names its own
+/// bookings by.
 fn stage_booking_id(plan: &Plan, k: usize) -> String {
     let attempt = plan.attempt(k).unwrap_or(StageAttempt::FIRST);
     if plan.stage_count() == 1 && attempt == StageAttempt::FIRST {
@@ -165,10 +164,11 @@ fn stage_booking_id(plan: &Plan, k: usize) -> String {
 }
 
 /// The EPP's prefill set as a Plan [`PlanRouter`]: a custom router over
-/// [`PrefillRouter::reserve_prefill_worker`], booked under the stage's wire
-/// id. The reservation is parked here until the pick moves it into
-/// `prefill_bookings`, where the response callbacks release it as they always
-/// have; the plan records the worker untracked.
+/// [`PrefillRouter::reserve_prefill_worker`], booked under the decode stage's
+/// wire id, the one id the pick hands back. The reservation is parked here
+/// until the pick enrolls it in the prefill set's request-lease manager, from
+/// where the response callbacks free it by that id; the plan records the
+/// worker untracked.
 struct PrefillReservationRouter {
     prefill_router: Arc<PrefillRouter>,
     base: Context<PreprocessedRequest>,
@@ -262,7 +262,15 @@ impl PlanRouter for PrefillReservationRouter {
                         .filter(|id| !excluded.contains(id))
                         .collect::<HashSet<u64>>()
                 });
-            let id = stage_booking_id(plan, k);
+            // Booked under the decode stage's id, which the pick hands back:
+            // both sets then free and expire this request by one id.
+            let decode_stage = (0..plan.stage_count())
+                .find(|&j| {
+                    plan.stage(j)
+                        .is_some_and(|stage| stage.set == WorkerType::Decode)
+                })
+                .unwrap_or(k);
+            let id = stage_booking_id(plan, decode_stage);
             let reservation = self
                 .prefill_router
                 .reserve_prefill_worker(
@@ -320,7 +328,8 @@ struct Picked {
     decode_worker: WorkerWithDpRank,
     /// The prefill worker and its rank, when the pick is disaggregated.
     prefill_worker: Option<(u64, Option<u32>)>,
-    /// Keys `prefill_bookings` and names the decode booking in the router.
+    /// The one id both sets' bookings are driven by: `mark_prefill_complete`
+    /// and `free_request` name it, and each set's lease expires it.
     reservation_id: String,
 }
 
@@ -330,7 +339,6 @@ struct Picked {
 /// without the `block_on` / unsafe FFI overhead.
 pub struct Router {
     prefill_router: Arc<PrefillRouter>,
-    prefill_bookings: DashMap<String, PrefillReservation>,
     decode_router: ManagedKvRouter,
     preprocessor: Arc<OpenAIPreprocessor>,
     runtime: Runtime,
@@ -339,23 +347,6 @@ pub struct Router {
     served_model: String,
 }
 
-/// Remove and release a booking once. Both response lifecycle callbacks use
-/// this helper so terminal completion before first output and duplicate signals
-/// have identical behavior.
-async fn release_prefill_booking(
-    prefill_bookings: &DashMap<String, PrefillReservation>,
-    booking_id: &str,
-) {
-    if let Some((_, reservation)) = prefill_bookings.remove(booking_id)
-        && let Err(error) = reservation.release().await
-    {
-        tracing::debug!(
-            reservation_id = booking_id,
-            %error,
-            "Failed to release native EPP prefill reservation"
-        );
-    }
-}
 impl Router {
     /// Initialize the router from discovery.
     ///
@@ -458,7 +449,6 @@ impl Router {
         // does not tear down any background work.
         Ok(Self {
             prefill_router,
-            prefill_bookings: DashMap::new(),
             decode_router,
             preprocessor: bootstrap.preprocessor,
             runtime,
@@ -864,7 +854,7 @@ impl Router {
         // router has been deactivated), fall back to aggregated routing.
         let prefill_booking = self
             .route_prefill(
-                &format!("epp-prefill/{reservation_id}"),
+                &reservation_id,
                 route.tokens,
                 route.cache_namespace.clone(),
                 route.priority_jump,
@@ -919,14 +909,22 @@ impl Router {
             );
         }
 
-        let prefill_worker = prefill_booking
-            .as_ref()
-            .ok()
-            .map(|booking| (booking.worker_id(), booking.dp_rank()));
-        if let Ok(booking) = prefill_booking {
-            self.prefill_bookings
-                .insert(reservation_id.clone(), booking);
-        }
+        let prefill_worker = match prefill_booking {
+            Ok(reservation) => {
+                let worker = (reservation.worker_id(), reservation.dp_rank());
+                // From here the prefill booking is driven by id and expires
+                // with its lease, like the decode registration above.
+                if let Err(error) = reservation.enroll().await {
+                    tracing::warn!(
+                        reservation_id = %reservation_id,
+                        %error,
+                        "Failed to enroll the prefill reservation; its booking was released"
+                    );
+                }
+                Some(worker)
+            }
+            Err(_) => None,
+        };
         Ok(Picked {
             decode_worker,
             prefill_worker,
@@ -1037,13 +1035,22 @@ impl Router {
                 return Err(error);
             }
         };
-        let prefill_worker = prefill_stage.and_then(|k| {
-            let reservation = prefill.take_reservation(k)?;
-            let worker = (reservation.worker_id(), reservation.dp_rank());
-            self.prefill_bookings
-                .insert(reservation_id.clone(), reservation);
-            Some(worker)
-        });
+        let prefill_worker = match prefill_stage.and_then(|k| prefill.take_reservation(k)) {
+            Some(reservation) => {
+                let worker = (reservation.worker_id(), reservation.dp_rank());
+                // The prefill booking joins its set's request-lease manager
+                // under the same id as the decode booking: both are driven by
+                // the response callbacks and expire with their leases.
+                if let Err(error) = reservation.enroll().await {
+                    self.release_pick(&reservation_id).await;
+                    return Err(PickError::RoutingFailed(format!(
+                        "enrolling the prefill reservation: {error}"
+                    )));
+                }
+                Some(worker)
+            }
+            None => None,
+        };
         Ok(Picked {
             decode_worker,
             prefill_worker,
@@ -1051,9 +1058,26 @@ impl Router {
         })
     }
 
+    /// Free the prefill booking enrolled under `reservation_id`. Nothing
+    /// under the id (an aggregated pick, a duplicate or late callback, an
+    /// expired lease) is logged and otherwise ignored.
+    async fn free_prefill(&self, reservation_id: &str) {
+        if let Err(error) = self
+            .prefill_router
+            .free_prefill_reservation(reservation_id)
+            .await
+        {
+            tracing::debug!(
+                reservation_id,
+                %error,
+                "Failed to free the prefill reservation from router bookkeeping"
+            );
+        }
+    }
+
     /// Free everything a pick booked when no response will call back for it.
     async fn release_pick(&self, reservation_id: &str) {
-        release_prefill_booking(&self.prefill_bookings, reservation_id).await;
+        self.free_prefill(reservation_id).await;
         if let Err(error) = self.free_request(reservation_id).await {
             tracing::debug!(
                 reservation_id,
@@ -2005,7 +2029,7 @@ impl EndpointPicker for Router {
         if booking_id.is_empty() {
             return;
         }
-        release_prefill_booking(&self.prefill_bookings, booking_id).await;
+        self.free_prefill(booking_id).await;
         if let Err(e) = self.mark_prefill_complete(booking_id).await {
             tracing::debug!(
                 reservation_id = booking_id,
@@ -2029,7 +2053,7 @@ impl EndpointPicker for Router {
                 "Request complete with usage"
             );
         }
-        release_prefill_booking(&self.prefill_bookings, booking_id).await;
+        self.free_prefill(booking_id).await;
         if let Err(e) = self.free_request(booking_id).await {
             tracing::debug!(
                 reservation_id = booking_id,
@@ -3068,5 +3092,274 @@ mod tests {
             endpoint_in_subset(&endpoint, &candidates, &candidate_ips),
             "bracketed IPv6 endpoint must match its bare-IP candidate"
         );
+    }
+
+    /// Two real KV sets with scripted-free static workers, the real
+    /// `PrefillRouter` bound to the prefill set's host, and the production
+    /// `Router` over them. No engine, no HTTP: the picker, bookings and
+    /// lease managers are the production ones.
+    struct PlannedFixture {
+        router: Arc<Router>,
+        prefill: Arc<dynamo_llm::kv_router::KvRouter>,
+        decode: Arc<dynamo_llm::kv_router::KvRouter>,
+        _members: Vec<tokio::sync::watch::Sender<HashMap<u64, ModelRuntimeConfig>>>,
+        _distributed: DistributedRuntime,
+    }
+
+    type ModelRuntimeConfig = dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
+
+    async fn planned_fixture(
+        prefill_config: ModelRuntimeConfig,
+        decode_config: ModelRuntimeConfig,
+    ) -> PlannedFixture {
+        use dynamo_llm::discovery::LoadThresholdHandle;
+        use dynamo_llm::kv_router::{
+            KvRouter, RouterLoadSource, RoutingHost, RoutingLoadContext, SelectionPolicySource,
+        };
+        use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
+        use dynamo_runtime::protocols::annotated::Annotated;
+        use dynamo_runtime::{distributed::DistributedConfig, pipeline::PushRouter};
+
+        let runtime = Runtime::from_current().unwrap();
+        let distributed =
+            DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                .await
+                .unwrap();
+        let namespace = format!("epp-planned-{}", Uuid::new_v4());
+        let mut sets = Vec::new();
+        let mut members = Vec::new();
+        for (role, worker_type, config) in [
+            ("prefill", WorkerType::Prefill, prefill_config),
+            ("decode", WorkerType::Decode, decode_config),
+        ] {
+            let endpoint = distributed
+                .namespace(namespace.clone())
+                .unwrap()
+                .component(role.to_string())
+                .unwrap()
+                .endpoint("generate".to_string());
+            endpoint.register_endpoint_instance().await.unwrap();
+            let client = endpoint.client().await.unwrap();
+            let worker_id = client.wait_for_instances().await.unwrap()[0].id();
+            let (tx, rx) = tokio::sync::watch::channel(HashMap::from([(worker_id, config)]));
+            members.push(tx);
+            let router_config = dynamo_kv_router::config::KvRouterConfig {
+                skip_initial_worker_wait: true,
+                use_kv_events: false,
+                router_track_active_blocks: false,
+                ..Default::default()
+            };
+            let chooser = Arc::new(
+                KvRouter::new_with_worker_role(
+                    endpoint.clone(),
+                    client.clone(),
+                    rx,
+                    None,
+                    16,
+                    SelectionPolicySource::Registry,
+                    Some(router_config),
+                    None,
+                    Some(worker_type),
+                    role,
+                    Some("epp-model".into()),
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            sets.push((endpoint.id(), client, chooser, worker_id));
+        }
+        let (prefill_endpoint, prefill_client, prefill, _) = sets.remove(0);
+        let (_, decode_client, decode, decode_id) = sets.remove(0);
+        let push = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client(
+            prefill_client,
+            RouterMode::KV,
+        )
+        .await
+        .unwrap();
+        let prefill_host = Arc::new(RoutingHost::new(push, prefill.clone(), None).unwrap());
+        let prefill_router =
+            PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
+        prefill_router.bind_for_tests(prefill_endpoint, prefill_host);
+        let load = RoutingLoadContext::start(
+            decode_client,
+            RouterLoadSource::Encode,
+            LoadThresholdHandle::new(Default::default()),
+            &distributed.child_token(),
+            None,
+        )
+        .await
+        .unwrap();
+        let card = ModelDeploymentCard::load_from_disk(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../lib/llm/tests/data/sample-models/TinyLlama_v1.1"
+            ),
+            None,
+        )
+        .unwrap();
+        let mut index = WorkerEndpointIndex::new(false);
+        index
+            .endpoints
+            .insert(decode_id, "127.0.0.1:8000".to_string());
+        let router = Router {
+            prefill_router,
+            decode_router: ManagedKvRouter::new(load, decode.clone()),
+            preprocessor: OpenAIPreprocessor::new(card).unwrap(),
+            runtime,
+            worker_index: Arc::new(RwLock::new(index)),
+            pod_store_ready: Arc::new(AtomicBool::new(true)),
+            served_model: "epp-model".into(),
+        };
+        PlannedFixture {
+            router: Arc::new(router),
+            prefill,
+            decode,
+            _members: members,
+            _distributed: distributed,
+        }
+    }
+
+    fn planned_request() -> RequestInfo {
+        RequestInfo {
+            request_id: Uuid::new_v4().to_string(),
+            headers: vec![],
+            body: serde_json::to_vec(&serde_json::json!({
+                "model": "epp-model",
+                "prompt": (1..=64).collect::<Vec<u32>>(),
+                "max_tokens": 32
+            }))
+            .unwrap()
+            .into(),
+            model: "epp-model".into(),
+            candidate_subset: vec![],
+        }
+    }
+
+    /// (active requests on the prefill set, on the decode set).
+    async fn active(fixture: &PlannedFixture) -> (usize, usize) {
+        let mut counts = [0usize; 2];
+        for (i, chooser) in [&fixture.prefill, &fixture.decode].into_iter().enumerate() {
+            let loads = chooser
+                .get_potential_loads(&[], None, None, None, None)
+                .await
+                .unwrap();
+            counts[i] = loads.iter().map(|load| load.active_requests).sum();
+        }
+        (counts[0], counts[1])
+    }
+
+    async fn wait_for_active(fixture: &PlannedFixture, expected: (usize, usize), what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let seen = active(fixture).await;
+            if seen == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: active requests {seen:?}, expected {expected:?}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Both sets' projected charges are zero: nothing is held for any request.
+    async fn wait_for_zero_charges(fixture: &PlannedFixture) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let mut zero = true;
+                for chooser in [&fixture.prefill, &fixture.decode] {
+                    let loads = chooser
+                        .get_potential_loads(&[], None, None, None, None)
+                        .await
+                        .unwrap();
+                    zero &= loads.iter().all(|load| {
+                        load.active_requests == 0
+                            && load.potential_prefill_tokens == 0
+                            && load.potential_decode_blocks == 0
+                    });
+                }
+                if zero {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sets release every projected charge");
+    }
+
+    /// A request that never calls back is reclaimed by each set's own
+    /// request-lease reaper: the prefill booking by the prefill set's, the
+    /// decode booking by the decode set's. Late and duplicate callbacks for
+    /// it are no-ops, a live request touched between scans survives, and a
+    /// fresh pick succeeds afterwards. The reaper is driven by hand, two
+    /// scans as the timer does: a live lease goes quiet on one scan and
+    /// expires on the next.
+    #[tokio::test]
+    async fn missing_callbacks_expire_through_each_sets_own_lease() {
+        let fixture =
+            planned_fixture(ModelRuntimeConfig::default(), ModelRuntimeConfig::default()).await;
+        let router = &fixture.router;
+        let pick = || async {
+            let picked = router.pick(&planned_request(), &[]).await.expect("pick");
+            assert!(
+                picked
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "x-dynamo-routing-mode" && v == "disaggregated"),
+                "a P/D pick: {:?}",
+                picked.headers
+            );
+            picked.reservation_id.expect("a reservation id")
+        };
+        let abandoned = pick().await;
+        let live = pick().await;
+        wait_for_active(&fixture, (2, 2), "two picks booked on both sets").await;
+
+        // First scan: both leases go quiet on both sets.
+        fixture.prefill.reap_request_leases_now();
+        fixture.decode.reap_request_leases_now();
+        // The live request progresses: its prefill is done and its decode
+        // lease is touched.
+        router.on_prefill_complete(&live).await;
+        wait_for_active(
+            &fixture,
+            (1, 2),
+            "the live request's prefill booking is freed by id",
+        )
+        .await;
+
+        // Second scan: the abandoned request's leases expire on both sets;
+        // the live decode lease was touched and stays.
+        fixture.prefill.reap_request_leases_now();
+        fixture.decode.reap_request_leases_now();
+        wait_for_active(
+            &fixture,
+            (0, 1),
+            "the abandoned request expired on both sets",
+        )
+        .await;
+
+        // Late and duplicate callbacks for the expired request change nothing.
+        router.on_prefill_complete(&abandoned).await;
+        router
+            .on_request_complete_with_usage(&abandoned, None)
+            .await;
+        router
+            .on_request_complete_with_usage(&abandoned, None)
+            .await;
+        assert_eq!(active(&fixture).await, (0, 1));
+
+        // The gateway picks again, then completes both live requests.
+        let fresh = pick().await;
+        wait_for_active(&fixture, (1, 2), "a fresh pick after expiry").await;
+        router.on_request_complete_with_usage(&live, None).await;
+        router.on_prefill_complete(&fresh).await;
+        router.on_request_complete_with_usage(&fresh, None).await;
+        wait_for_zero_charges(&fixture).await;
     }
 }

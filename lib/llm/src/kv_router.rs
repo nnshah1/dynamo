@@ -1648,6 +1648,15 @@ impl KvRouter {
         self.selection.affinity_coordinator(ttl, mode)
     }
 
+    /// Run one request-lease reaper scan now, exactly as the timer would: a
+    /// lease touched since the last scan goes quiet, a quiet one expires and
+    /// its booking is released. Two scans expire an untouched lease. Test
+    /// hook for hosts that drive bookings by id; the timer stays in charge.
+    #[doc(hidden)]
+    pub fn reap_request_leases_now(&self) {
+        self.request_leases.reap_now();
+    }
+
     pub(crate) fn request_lease_manager(&self) -> &request_lease::RequestLeaseManager {
         &self.request_leases
     }
