@@ -62,7 +62,8 @@ pub mod encoder_router;
 pub mod indexer;
 pub mod metrics;
 pub(crate) mod metrics_subscriber;
-pub(crate) mod plan_host;
+#[doc(hidden)]
+pub mod plan_host;
 pub mod plugins;
 pub mod prefill_router;
 pub mod publisher;
@@ -1611,11 +1612,15 @@ impl KvRouter {
 
     /// This router's selection core as a plan [`Router`](dynamo_kv_router::router::Router):
     /// the frontend schedules a plan on it and dispatches from the plan.
-    pub(crate) fn partition(&self) -> dynamo_kv_router::identity::RoutingPartitionId {
+    /// The partition this router's selection core serves.
+    pub fn partition(&self) -> dynamo_kv_router::identity::RoutingPartitionId {
         self.selection.partition_key().clone()
     }
 
-    pub(crate) fn plan_router(&self) -> Arc<dyn dynamo_kv_router::router::Router> {
+    /// This worker set's selection core as the `Router` a plan is scheduled
+    /// on; a host takes each booked stage's booking from the plan to dispatch
+    /// and track it.
+    pub fn plan_router(&self) -> Arc<dyn dynamo_kv_router::router::Router> {
         Arc::clone(self.selection.core()) as Arc<dyn dynamo_kv_router::router::Router>
     }
 
@@ -1641,6 +1646,15 @@ impl KvRouter {
         mode: crate::session_affinity::SessionAffinityMode,
     ) -> anyhow::Result<crate::session_affinity::AffinityCoordinator> {
         self.selection.affinity_coordinator(ttl, mode)
+    }
+
+    /// Run one request-lease reaper scan now, exactly as the timer would: a
+    /// lease touched since the last scan goes quiet, a quiet one expires and
+    /// its booking is released. Two scans expire an untouched lease. Test
+    /// hook for hosts that drive bookings by id; the timer stays in charge.
+    #[doc(hidden)]
+    pub fn reap_request_leases_now(&self) {
+        self.request_leases.reap_now();
     }
 
     pub(crate) fn request_lease_manager(&self) -> &request_lease::RequestLeaseManager {
