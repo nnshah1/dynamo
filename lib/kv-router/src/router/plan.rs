@@ -73,7 +73,8 @@ impl std::fmt::Display for StageAttempt {
 pub enum When {
     /// On the first `schedule` call, with the other `Now` stages.
     Now,
-    /// Once stage `k` has completed or was skipped. Implies `inputs: [k]`.
+    /// Once stage `k` has handed off, completed or been skipped. Implies
+    /// `inputs: [k]`.
     After(usize),
 }
 
@@ -622,7 +623,8 @@ impl Plan {
         })
     }
 
-    /// Booked stages whose inputs have all completed: what the host forwards.
+    /// Booked stages whose inputs have all settled (handed off, completed or
+    /// skipped): what the host forwards.
     pub fn ready(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.slots.len())
             .filter(move |&k| self.slots[k].state == StageState::Booked && self.inputs_settled(k))
