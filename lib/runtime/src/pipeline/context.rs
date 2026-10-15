@@ -51,6 +51,19 @@ impl<T: Send + Sync + 'static> Context<T> {
         }
     }
 
+    /// A context over `current` that shares this context's controller (and
+    /// so its id and cancellation), stages, metadata, and shared registry
+    /// objects. Takable registry objects are not forked.
+    pub fn fork<U: Send + Sync + 'static>(&self, current: U) -> Context<U> {
+        Context {
+            current,
+            controller: self.controller.clone(),
+            registry: self.registry.fork_shared(),
+            stages: self.stages.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
     pub fn with_id_and_metadata(
         current: T,
         id: String,
@@ -501,6 +514,28 @@ impl AsyncEngineContext for Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_shares_the_controller_and_shared_registry_only() {
+        let mut source = Context::new(1u32);
+        source.insert_metadata("traceparent", "trace");
+        source.insert("shared", 7u64);
+        source.insert_unique("unique", 9u64);
+
+        let fork = source.fork("forked".to_string());
+        assert_eq!(fork.id(), source.id());
+        assert_eq!(
+            fork.metadata().get("traceparent").map(String::as_str),
+            Some("trace")
+        );
+        assert_eq!(*fork.get::<u64>("shared").unwrap(), 7);
+        assert!(fork.get_optional::<u64>("unique").unwrap().is_none());
+        assert_eq!(*source.get::<u64>("shared").unwrap(), 7);
+
+        // Cancellation is shared both ways.
+        source.controller().stop_generating();
+        assert!(fork.controller().is_stopped());
+    }
 
     #[derive(Debug, Clone)]
     struct Input {

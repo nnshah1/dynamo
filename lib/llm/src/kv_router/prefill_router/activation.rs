@@ -8,7 +8,8 @@ use anyhow::{Context as _, Result};
 use tokio::sync::{oneshot, watch};
 
 use dynamo_kv_router::{
-    PrefillLoadEstimator, conditional_disagg::make_conditional_disagg_policy,
+    PrefillLoadEstimator,
+    conditional_disagg::{ConditionalDisaggPolicy, make_conditional_disagg_policy},
     config::KvRouterConfig,
 };
 use dynamo_runtime::{
@@ -163,13 +164,14 @@ impl PrefillRouter {
             target: parking_lot::Mutex::new(None),
             target_tx: None,
             decode_routing_host: std::sync::OnceLock::new(),
+            plan_router_factory: std::sync::OnceLock::new(),
             selection_policy: None,
             model_manager,
             cancel_token: tokio_util::sync::CancellationToken::new(),
             decode_router_mode,
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
             session_affinity_mode,
-            conditional_disagg_policy: make_conditional_disagg_policy(None),
+            conditional_disagg_policy: Arc::from(make_conditional_disagg_policy(None)),
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
             prefill_load_estimator: None,
@@ -201,7 +203,8 @@ impl PrefillRouter {
     ) -> Arc<Self> {
         let cancel_token = parent_token.child_token();
         let (target_tx, target_rx) = watch::channel(None);
-        let conditional_disagg_policy = make_conditional_disagg_policy(kv_router_config.as_ref());
+        let conditional_disagg_policy: Arc<dyn ConditionalDisaggPolicy> =
+            Arc::from(make_conditional_disagg_policy(kv_router_config.as_ref()));
         let conditional_disagg_prefill_busy_threshold = kv_router_config.as_ref().and_then(|c| {
             c.conditional_disagg_prefill_busy_threshold
                 .or(c.router_queue_threshold)
@@ -215,6 +218,7 @@ impl PrefillRouter {
             target: parking_lot::Mutex::new(None),
             target_tx: Some(target_tx),
             decode_routing_host: std::sync::OnceLock::new(),
+            plan_router_factory: std::sync::OnceLock::new(),
             selection_policy: Some(selection_policy),
             model_manager: model_manager.clone(),
             cancel_token: cancel_token.clone(),

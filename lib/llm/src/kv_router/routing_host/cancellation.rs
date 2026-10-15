@@ -30,7 +30,7 @@ const CLEANUP_DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// The clock starts the first time a stage actually observes a stopped context,
 /// which means a live request never arms it and keeps today's semantics exactly.
 #[derive(Debug, Default)]
-pub(super) struct CleanupBudget {
+pub(crate) struct CleanupBudget {
     started: Mutex<Option<Instant>>,
 }
 
@@ -51,7 +51,7 @@ impl CleanupBudget {
 /// conditional-disaggregation bypass reaches decode without running remote
 /// prefill, so it has nothing staged and nothing to clean up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StagedKv {
+pub(crate) enum StagedKv {
     /// Blocks are staged on a prefill worker for one specific decode worker.
     Present,
     /// Nothing is staged, so abandoning the request releases everything it holds.
@@ -59,7 +59,7 @@ pub(super) enum StagedKv {
 }
 
 impl StagedKv {
-    pub(super) fn for_request(request: &PreprocessedRequest) -> Self {
+    pub(crate) fn for_request(request: &PreprocessedRequest) -> Self {
         if request.staged_kv_cleanup {
             Self::Present
         } else {
@@ -100,7 +100,7 @@ impl DispatchCancellation {
 ///
 /// `stage` names the routing stage for the log emitted when the budget runs out,
 /// so an exhausted cleanup is distinguishable from an ordinary client disconnect.
-pub(super) async fn await_with_cleanup_policy<T>(
+pub(crate) async fn await_with_cleanup_policy<T>(
     context: &dyn AsyncEngineContext,
     phase: RequestPhase,
     staged_kv: StagedKv,
@@ -157,7 +157,7 @@ fn cleanup_budget_exhausted(context_id: &str, stage: &'static str) -> Error {
         .into()
 }
 
-pub(super) fn cancelled_error(context_id: &str) -> Error {
+pub(crate) fn cancelled_error(context_id: &str) -> Error {
     DynamoError::builder()
         .error_type(ErrorType::Cancelled)
         .message(format!("Request {context_id} was cancelled"))

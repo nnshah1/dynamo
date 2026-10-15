@@ -421,7 +421,7 @@ struct OutputBlockTracker {
 
 /// Owns the shared attempt-scoped scheduler and approximate-LRU lifecycle after
 /// a KV worker is selected.
-pub(super) struct KvRequestCleanup {
+pub(crate) struct KvRequestCleanup {
     chooser: Arc<KvRouter>,
     context_id: String,
     worker: WorkerWithDpRank,

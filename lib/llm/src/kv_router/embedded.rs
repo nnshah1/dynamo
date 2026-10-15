@@ -26,7 +26,7 @@ use dynamo_kv_router::scheduling::{
 use dynamo_kv_router::sequences::ReplicaWorkerPolicy;
 use dynamo_kv_router::services::selection::{
     CatalogObserver, CatalogReconciler, DEFAULT_MODEL_NAME, HostCache, HostEligibility, HostLoad,
-    HostReplication, HostTelemetry, KvEventIngress, KvIndexSource, SelectionHost,
+    HostReplication, HostTelemetry, KvEventIngress, KvIndexSource, SelectionCore, SelectionHost,
     SelectionOperation, SelectionOutcome, SelectionPartition, SelectionRun, SelectionScheduler,
     SelectionService, SelectionServiceBuilder, WorkerCatalogRecord, WorkerCatalogSource,
     WorkerRequest,
@@ -212,6 +212,11 @@ impl dynamo_kv_router::services::selection::SchedulerLoadSink for SenderLoadSink
 }
 
 impl EmbeddedSelection {
+    /// The partition's selection core: the `Router` a plan is scheduled on.
+    pub(crate) fn core(&self) -> &Arc<SelectionCore> {
+        self.service.core()
+    }
+
     /// Returns the partition's inbound replica ingress, not yet running. The
     /// caller starts it only after the lease manager it passed as
     /// `request_leases` has its scheduler set, so no lifecycle event reaches

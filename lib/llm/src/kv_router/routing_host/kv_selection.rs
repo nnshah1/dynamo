@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use dynamo_kv_router::{
     RouterConfigOverride,
@@ -27,21 +28,21 @@ use crate::{
     session_affinity::AffinityTarget,
 };
 
-pub(super) struct WorkerSelection {
-    pub(super) worker: WorkerWithDpRank,
+pub(crate) struct WorkerSelection {
+    pub(crate) worker: WorkerWithDpRank,
     /// The booking's handle until the request's cleanup takes it over.
-    pub(super) booking: Option<BookingHandle>,
-    pub(super) overlap_amount: u32,
-    pub(super) effective_overlap_blocks: f64,
-    pub(super) cached_tokens: usize,
-    pub(super) selected_raw_cached_tokens: Option<usize>,
+    pub(crate) booking: Option<BookingHandle>,
+    pub(crate) overlap_amount: u32,
+    pub(crate) effective_overlap_blocks: f64,
+    pub(crate) cached_tokens: usize,
+    pub(crate) selected_raw_cached_tokens: Option<usize>,
     /// Greatest raw router-visible overlap among eligible workers, in tokens.
-    pub(super) max_raw_cached_tokens: Option<usize>,
-    pub(super) potential_decode_blocks: u64,
-    pub(super) selected_worker_load: Option<AdvisoryWorkerLoad>,
-    pub(super) routing_hashes: Option<RoutingDecisionHashes>,
-    pub(super) kv_hint: Option<KvHint>,
-    pub(super) request_lifecycle: Option<Box<RequestLifecycle>>,
+    pub(crate) max_raw_cached_tokens: Option<usize>,
+    pub(crate) potential_decode_blocks: u64,
+    pub(crate) selected_worker_load: Option<AdvisoryWorkerLoad>,
+    pub(crate) routing_hashes: Option<RoutingDecisionHashes>,
+    pub(crate) kv_hint: Option<KvHint>,
+    pub(crate) request_lifecycle: Option<Box<RequestLifecycle>>,
 }
 
 // Transient return value; `Routed` is moved into `WorkerSelection` right away.
@@ -77,6 +78,8 @@ impl<'a> RoutingRequestParts<'a> {
 }
 
 pub(super) struct SelectionOptions {
+    /// How long the queue may hold the request; a planned stage's wait budget.
+    pub(super) hold_budget: Option<Duration>,
     pub(super) pinned_target: Option<AffinityTarget>,
     pub(super) affinity_target: Option<AffinityTarget>,
     pub(super) planned_worker: Option<WorkerWithDpRank>,
@@ -103,6 +106,7 @@ struct BestMatchArgs<'a> {
     allowed_worker_ids: Option<HashSet<WorkerId>>,
     routing_constraints: RoutingConstraints,
     admission: FindBestMatchAdmission,
+    hold_budget: Option<Duration>,
 }
 
 impl RoutingHost {
@@ -128,6 +132,7 @@ impl RoutingHost {
                 args.allowed_worker_ids,
                 args.routing_constraints,
                 args.admission,
+                args.hold_budget,
             )
             .await?;
         match admitted.outcome {
@@ -187,20 +192,12 @@ impl RoutingHost {
             .and_then(|routing| routing.routing_constraints.clone())
             .unwrap_or_default();
         let mut allowed_worker_ids = routing.and_then(|routing| routing.allowed_worker_ids.clone());
-        let migration_excluded_worker_ids = request
-            .migration_state
-            .as_ref()
-            .map(|state| state.excluded_worker_ids())
-            .unwrap_or_default();
-        if explicit_pin.is_none() && !migration_excluded_worker_ids.is_empty() {
-            let workers = self.kv_router().workers_with_configs.borrow();
-            let eligible =
-                allowed_worker_ids.get_or_insert_with(|| workers.keys().copied().collect());
-            eligible.retain(|worker_id| {
-                workers.get(worker_id).is_some_and(|config| {
-                    routing_constraints.is_compatible_with_worker_taints(&config.taints)
-                }) && !migration_excluded_worker_ids.contains(worker_id)
-            });
+        if let Some(eligible) = self.migration_eligible_workers(
+            request,
+            phase,
+            &routing_constraints,
+            allowed_worker_ids.as_ref(),
+        ) {
             if eligible.is_empty()
                 && let Some(error) = request
                     .migration_state
@@ -209,10 +206,12 @@ impl RoutingHost {
             {
                 return Err(anyhow::anyhow!(error));
             }
+            allowed_worker_ids = Some(eligible);
         }
         let return_routing_hashes =
             !is_query_only && self.kv_router().indexer().records_routing_decisions();
         let SelectionOptions {
+            hold_budget,
             pinned_target,
             affinity_target,
             planned_worker,
@@ -280,6 +279,7 @@ impl RoutingHost {
                     context_id,
                     routing_parts,
                     router_config_override: request.router_config_override.as_ref(),
+                    hold_budget,
                     update_states: !is_query_only,
                     return_routing_hashes,
                     lora_name,
@@ -348,6 +348,7 @@ impl RoutingHost {
             context_id,
             routing_parts,
             router_config_override: request.router_config_override.as_ref(),
+            hold_budget,
             update_states: !is_query_only,
             return_routing_hashes,
             lora_name,
@@ -382,7 +383,7 @@ fn merge_affinity_pin(
     }
 }
 
-fn resolve_pinned_worker_rank(
+pub(crate) fn resolve_pinned_worker_rank(
     worker_id: WorkerId,
     requested_dp_rank: Option<u32>,
     unique_dp_rank: Option<u32>,
@@ -396,7 +397,7 @@ fn resolve_pinned_worker_rank(
     Ok(WorkerWithDpRank::new(worker_id, dp_rank))
 }
 
-fn pinned_worker_hint(
+pub(crate) fn pinned_worker_hint(
     phase: RequestPhase,
     routing: Option<&RoutingHints>,
 ) -> Option<(u64, Option<u32>)> {
@@ -415,6 +416,44 @@ fn pinned_worker_hint(
             let worker_id = routing.decode_worker_id.or(routing.backend_instance_id)?;
             Some((worker_id, routing.dp_rank))
         }
+    }
+}
+
+impl RoutingHost {
+    /// The workers a migration retry may still use on this host for `phase`,
+    /// when the request's `migration_state` excludes any: the request's
+    /// allowed set (every worker of the set by default), kept to those
+    /// compatible with its constraints and not recorded as failed. `None`
+    /// when nothing is excluded or the caller pinned a worker (the pin
+    /// stands). An empty set means this host is exhausted for the retry;
+    /// the caller decides when that matters (a direct admission at once, a
+    /// plan only for a stage that still needs this set). Every admission on
+    /// this host, direct or from a plan, goes through this one rule.
+    pub(crate) fn migration_eligible_workers(
+        &self,
+        request: &PreprocessedRequest,
+        phase: RequestPhase,
+        routing_constraints: &RoutingConstraints,
+        allowed_worker_ids: Option<&HashSet<WorkerId>>,
+    ) -> Option<HashSet<WorkerId>> {
+        let excluded = request
+            .migration_state
+            .as_ref()
+            .map(|state| state.excluded_worker_ids())
+            .unwrap_or_default();
+        if excluded.is_empty() || pinned_worker_hint(phase, request.routing.as_ref()).is_some() {
+            return None;
+        }
+        let workers = self.kv_router().workers_with_configs.borrow();
+        let mut eligible: HashSet<WorkerId> = allowed_worker_ids
+            .cloned()
+            .unwrap_or_else(|| workers.keys().copied().collect());
+        eligible.retain(|worker_id| {
+            workers.get(worker_id).is_some_and(|config| {
+                routing_constraints.is_compatible_with_worker_taints(&config.taints)
+            }) && !excluded.contains(worker_id)
+        });
+        Some(eligible)
     }
 }
 
