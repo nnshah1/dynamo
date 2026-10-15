@@ -1657,6 +1657,17 @@ impl KvRouter {
         self.request_leases.reap_now();
     }
 
+    /// Finish the request lease enrolled under `request_id`, releasing its
+    /// booking. `false` when nothing is enrolled under that id here.
+    pub(crate) async fn free_enrolled(&self, request_id: &str) -> bool {
+        self.request_leases.finish_request(request_id).await
+    }
+
+    /// Whether this router still holds enrolled request leases.
+    pub(crate) fn has_enrolled_requests(&self) -> bool {
+        self.request_leases.has_active()
+    }
+
     pub(crate) fn request_lease_manager(&self) -> &request_lease::RequestLeaseManager {
         &self.request_leases
     }

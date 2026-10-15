@@ -3102,23 +3102,98 @@ mod tests {
         router: Arc<Router>,
         prefill: Arc<dynamo_llm::kv_router::KvRouter>,
         decode: Arc<dynamo_llm::kv_router::KvRouter>,
+        namespace: String,
         _members: Vec<tokio::sync::watch::Sender<HashMap<u64, ModelRuntimeConfig>>>,
-        _distributed: DistributedRuntime,
+        distributed: DistributedRuntime,
     }
 
     type ModelRuntimeConfig = dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
+
+    /// One real KV set: a registered endpoint instance, its admitted
+    /// membership (one worker with `config`) and a `KvRouter` over it.
+    struct PlannedSet {
+        endpoint_id: dynamo_runtime::protocols::EndpointId,
+        client: dynamo_runtime::component::Client,
+        chooser: Arc<dynamo_llm::kv_router::KvRouter>,
+        worker_id: u64,
+        members: tokio::sync::watch::Sender<HashMap<u64, ModelRuntimeConfig>>,
+    }
+
+    async fn planned_set(
+        distributed: &DistributedRuntime,
+        namespace: &str,
+        role: &'static str,
+        worker_type: WorkerType,
+        config: ModelRuntimeConfig,
+    ) -> PlannedSet {
+        use dynamo_llm::kv_router::{KvRouter, SelectionPolicySource};
+        let endpoint = distributed
+            .namespace(namespace.to_string())
+            .unwrap()
+            .component(role.to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        endpoint.register_endpoint_instance().await.unwrap();
+        let client = endpoint.client().await.unwrap();
+        let worker_id = client.wait_for_instances().await.unwrap()[0].id();
+        let (members, rx) = tokio::sync::watch::channel(HashMap::from([(worker_id, config)]));
+        let router_config = dynamo_kv_router::config::KvRouterConfig {
+            skip_initial_worker_wait: true,
+            use_kv_events: false,
+            router_track_active_blocks: false,
+            ..Default::default()
+        };
+        let chooser = Arc::new(
+            KvRouter::new_with_worker_role(
+                endpoint.clone(),
+                client.clone(),
+                rx,
+                None,
+                16,
+                SelectionPolicySource::Registry,
+                Some(router_config),
+                None,
+                Some(worker_type),
+                role,
+                Some("epp-model".into()),
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        PlannedSet {
+            endpoint_id: endpoint.id(),
+            client,
+            chooser,
+            worker_id,
+            members,
+        }
+    }
+
+    /// The prefill set's host, as the `PrefillRouter` binds to it.
+    async fn prefill_host(set: &PlannedSet) -> Arc<dynamo_llm::kv_router::RoutingHost> {
+        use dynamo_llm::kv_router::RoutingHost;
+        use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
+        use dynamo_runtime::pipeline::PushRouter;
+        use dynamo_runtime::protocols::annotated::Annotated;
+        let push = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client(
+            set.client.clone(),
+            RouterMode::KV,
+        )
+        .await
+        .unwrap();
+        Arc::new(RoutingHost::new(push, set.chooser.clone(), None).unwrap())
+    }
 
     async fn planned_fixture(
         prefill_config: ModelRuntimeConfig,
         decode_config: ModelRuntimeConfig,
     ) -> PlannedFixture {
         use dynamo_llm::discovery::LoadThresholdHandle;
-        use dynamo_llm::kv_router::{
-            KvRouter, RouterLoadSource, RoutingHost, RoutingLoadContext, SelectionPolicySource,
-        };
-        use dynamo_llm::protocols::common::llm_backend::LLMEngineOutput;
-        use dynamo_runtime::protocols::annotated::Annotated;
-        use dynamo_runtime::{distributed::DistributedConfig, pipeline::PushRouter};
+        use dynamo_llm::kv_router::{RouterLoadSource, RoutingLoadContext};
+        use dynamo_runtime::distributed::DistributedConfig;
 
         let runtime = Runtime::from_current().unwrap();
         let distributed =
@@ -3126,65 +3201,27 @@ mod tests {
                 .await
                 .unwrap();
         let namespace = format!("epp-planned-{}", Uuid::new_v4());
-        let mut sets = Vec::new();
-        let mut members = Vec::new();
-        for (role, worker_type, config) in [
-            ("prefill", WorkerType::Prefill, prefill_config),
-            ("decode", WorkerType::Decode, decode_config),
-        ] {
-            let endpoint = distributed
-                .namespace(namespace.clone())
-                .unwrap()
-                .component(role.to_string())
-                .unwrap()
-                .endpoint("generate".to_string());
-            endpoint.register_endpoint_instance().await.unwrap();
-            let client = endpoint.client().await.unwrap();
-            let worker_id = client.wait_for_instances().await.unwrap()[0].id();
-            let (tx, rx) = tokio::sync::watch::channel(HashMap::from([(worker_id, config)]));
-            members.push(tx);
-            let router_config = dynamo_kv_router::config::KvRouterConfig {
-                skip_initial_worker_wait: true,
-                use_kv_events: false,
-                router_track_active_blocks: false,
-                ..Default::default()
-            };
-            let chooser = Arc::new(
-                KvRouter::new_with_worker_role(
-                    endpoint.clone(),
-                    client.clone(),
-                    rx,
-                    None,
-                    16,
-                    SelectionPolicySource::Registry,
-                    Some(router_config),
-                    None,
-                    Some(worker_type),
-                    role,
-                    Some("epp-model".into()),
-                    false,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap(),
-            );
-            sets.push((endpoint.id(), client, chooser, worker_id));
-        }
-        let (prefill_endpoint, prefill_client, prefill, _) = sets.remove(0);
-        let (_, decode_client, decode, decode_id) = sets.remove(0);
-        let push = PushRouter::<PreprocessedRequest, Annotated<LLMEngineOutput>>::from_client(
-            prefill_client,
-            RouterMode::KV,
+        let prefill = planned_set(
+            &distributed,
+            &namespace,
+            "prefill",
+            WorkerType::Prefill,
+            prefill_config,
         )
-        .await
-        .unwrap();
-        let prefill_host = Arc::new(RoutingHost::new(push, prefill.clone(), None).unwrap());
+        .await;
+        let decode = planned_set(
+            &distributed,
+            &namespace,
+            "decode",
+            WorkerType::Decode,
+            decode_config,
+        )
+        .await;
         let prefill_router =
             PrefillRouter::disabled(Arc::new(ModelManager::new()), RouterMode::KV, None);
-        prefill_router.bind_for_tests(prefill_endpoint, prefill_host);
+        prefill_router.bind_for_tests(prefill.endpoint_id.clone(), prefill_host(&prefill).await);
         let load = RoutingLoadContext::start(
-            decode_client,
+            decode.client.clone(),
             RouterLoadSource::Encode,
             LoadThresholdHandle::new(Default::default()),
             &distributed.child_token(),
@@ -3203,10 +3240,10 @@ mod tests {
         let mut index = WorkerEndpointIndex::new(false);
         index
             .endpoints
-            .insert(decode_id, "127.0.0.1:8000".to_string());
+            .insert(decode.worker_id, "127.0.0.1:8000".to_string());
         let router = Router {
             prefill_router,
-            decode_router: ManagedKvRouter::new(load, decode.clone()),
+            decode_router: ManagedKvRouter::new(load, decode.chooser.clone()),
             preprocessor: OpenAIPreprocessor::new(card).unwrap(),
             runtime,
             worker_index: Arc::new(RwLock::new(index)),
@@ -3215,10 +3252,11 @@ mod tests {
         };
         PlannedFixture {
             router: Arc::new(router),
-            prefill,
-            decode,
-            _members: members,
-            _distributed: distributed,
+            prefill: prefill.chooser.clone(),
+            decode: decode.chooser.clone(),
+            namespace,
+            _members: vec![prefill.members, decode.members],
+            distributed,
         }
     }
 
@@ -3360,6 +3398,103 @@ mod tests {
         router.on_request_complete_with_usage(&live, None).await;
         router.on_prefill_complete(&fresh).await;
         router.on_request_complete_with_usage(&fresh, None).await;
+        wait_for_zero_charges(&fixture).await;
+    }
+
+    /// Active requests on one set.
+    async fn active_on(chooser: &dynamo_llm::kv_router::KvRouter) -> usize {
+        chooser
+            .get_potential_loads(&[], None, None, None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|load| load.active_requests)
+            .sum()
+    }
+
+    async fn wait_until(what: &str, mut condition: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !condition().await {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A pick made on one prefill set, then the set is replaced (a rolling
+    /// update publishes a successor; later, the prefill side is withdrawn
+    /// entirely). Callbacks for the old pick still free its booking promptly
+    /// through the set that admitted it, and a pick on the successor is not
+    /// touched by them. Callbacks after the withdrawal behave the same.
+    #[tokio::test]
+    async fn callbacks_after_a_prefill_binding_replacement_free_the_original_booking() {
+        let fixture =
+            planned_fixture(ModelRuntimeConfig::default(), ModelRuntimeConfig::default()).await;
+        let router = &fixture.router;
+        let pick = || async {
+            let picked = router.pick(&planned_request(), &[]).await.expect("pick");
+            assert!(
+                picked
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "x-dynamo-routing-mode" && v == "disaggregated")
+            );
+            picked.reservation_id.expect("a reservation id")
+        };
+        let old_pick = pick().await;
+        wait_until("the old set holds the first pick", async || {
+            active_on(&fixture.prefill).await == 1
+        })
+        .await;
+
+        // The successor set replaces the binding; the old set is still alive
+        // (its booking is held) but no longer the router's target.
+        let successor = planned_set(
+            &fixture.distributed,
+            &fixture.namespace,
+            "prefill-v2",
+            WorkerType::Prefill,
+            ModelRuntimeConfig::default(),
+        )
+        .await;
+        router.prefill_router.bind_for_tests(
+            successor.endpoint_id.clone(),
+            prefill_host(&successor).await,
+        );
+        let new_pick = pick().await;
+        wait_until("the successor holds the second pick", async || {
+            active_on(&successor.chooser).await == 1
+        })
+        .await;
+        assert_eq!(
+            active_on(&fixture.prefill).await,
+            1,
+            "the old booking is untouched by the new pick"
+        );
+
+        // The old pick's prefill completes: its booking is freed by the set
+        // that admitted it, not by the successor.
+        router.on_prefill_complete(&old_pick).await;
+        wait_until("the old set released the old pick", async || {
+            active_on(&fixture.prefill).await == 0
+        })
+        .await;
+        assert_eq!(
+            active_on(&successor.chooser).await,
+            1,
+            "the successor's booking is untouched"
+        );
+        router.on_request_complete_with_usage(&old_pick, None).await;
+
+        // The prefill side is withdrawn entirely; the successor's pick still
+        // frees through its own set when its callbacks arrive.
+        router.prefill_router.unbind_for_tests();
+        router.on_prefill_complete(&new_pick).await;
+        wait_until(
+            "the successor released its pick after withdrawal",
+            async || active_on(&successor.chooser).await == 0,
+        )
+        .await;
+        router.on_request_complete_with_usage(&new_pick, None).await;
         wait_for_zero_charges(&fixture).await;
     }
 }
