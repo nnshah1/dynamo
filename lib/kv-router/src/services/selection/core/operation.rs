@@ -16,7 +16,7 @@ use crate::protocols::{
     WorkerWithDpRank,
 };
 use crate::scheduling::config::RouterConfigOverride;
-use crate::scheduling::queue::BookingHandle;
+use crate::scheduling::queue::{BookingHandle, SchedulerBookingDescriptor};
 use crate::scheduling::{AdvisoryWorkerLoad, QueueRejection, SchedulingResponse, SessionContext};
 
 use super::super::error::SelectionError;
@@ -48,6 +48,8 @@ pub struct SelectionOperation<'a> {
     /// Cache the inputs under this id for a later `create_reservation` replay
     /// (unbooked admissions only).
     pub replay_id: Option<String>,
+    /// How long the queue may hold the request; see `ScheduleRequest::hold_budget`.
+    pub hold_budget: Option<Duration>,
 }
 
 pub enum SelectionAdmission {
@@ -144,4 +146,6 @@ pub struct Selected {
     /// The booking's handle; `Lease` admission only. Dropping it frees the
     /// booking, `commit` hands it to the caller's own cleanup.
     pub booking: Option<BookingHandle>,
+    /// The booking the reservation index now holds; `Book` admission only.
+    pub booking_descriptor: Option<SchedulerBookingDescriptor>,
 }

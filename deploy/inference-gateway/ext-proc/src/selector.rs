@@ -200,6 +200,11 @@ impl Selector {
             pinned_worker: None,
             allowed_worker_ids: req.allowed_worker_ids,
             routing_constraints: RoutingConstraints::default(),
+            // The class travels as the separate argument below; the
+            // plan-only fields keep this direct selection as it was.
+            policy_class: None,
+            all_now: false,
+            export_bookings: false,
         };
         let resp = self
             .service
