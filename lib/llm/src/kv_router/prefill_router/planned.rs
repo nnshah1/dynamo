@@ -2795,8 +2795,8 @@ mod tests {
         let mut fresh = router.plan(&after_req).unwrap();
         let error = router.schedule(&after_req, &mut fresh).await.unwrap_err();
         assert!(
-            matches!(error, SelectionError::Scheduler(_)),
-            "a scheduler refusal, not a placement: {error}"
+            matches!(error, SelectionError::NotReady(_)),
+            "no admitted worker to schedule on, not a placement: {error}"
         );
         assert!(fresh.booking(0).is_none());
 
