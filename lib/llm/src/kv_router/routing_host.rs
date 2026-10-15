@@ -48,12 +48,15 @@ use crate::{
 mod builtin;
 mod cancellation;
 mod kv;
-mod kv_selection;
+pub(crate) mod kv_selection;
 mod occupancy;
 mod request_guard;
 
 use builtin::BuiltinWorkerSelector;
-use cancellation::{CleanupBudget, DispatchCancellation, StagedKv, await_with_cleanup_policy};
+pub(crate) use cancellation::CleanupBudget;
+use cancellation::DispatchCancellation;
+pub(crate) use cancellation::cancelled_error;
+pub(crate) use cancellation::{StagedKv, await_with_cleanup_policy};
 use kv_selection::{RoutingRequestParts, SelectionOptions, WorkerSelection};
 use occupancy::HostedOccupancy;
 pub(crate) use request_guard::prompt_private_blocks;
@@ -353,14 +356,15 @@ impl RoutePlanSignals {
 }
 
 impl RoutePlan {
-    #[cfg(test)]
-    pub(crate) fn cleanup_budget_remaining(&self) -> std::time::Duration {
-        self.budget.remaining()
-    }
-
+    /// Free the admitted booking without dispatching.
     #[cfg(test)]
     pub(crate) async fn abort(self) {
         self.cleanup.finish().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_budget_remaining(&self) -> std::time::Duration {
+        self.budget.remaining()
     }
 }
 
@@ -621,7 +625,11 @@ impl RoutingHost {
 
     /// Check request-supplied targets only at initial selection, not after a route preview
     /// or when dispatching: a worker disappearing later is a service failure.
-    fn validate_explicit_worker(
+    pub(crate) fn session_affinity_mode(&self) -> SessionAffinityMode {
+        self.session_affinity_mode
+    }
+
+    pub(crate) fn validate_explicit_worker(
         &self,
         request: &PreprocessedRequest,
         phase: RequestPhase,
@@ -711,7 +719,7 @@ impl RoutingHost {
         }
     }
 
-    async fn select_with_session_affinity<T, Select, SelectionFuture>(
+    pub(crate) async fn select_with_session_affinity<T, Select, SelectionFuture>(
         &self,
         request: &SingleIn<PreprocessedRequest>,
         phase: RequestPhase,
