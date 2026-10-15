@@ -1024,11 +1024,19 @@ mod tests {
         let core = local_core(test_config(false));
         core.upsert_worker(worker(1)).await.expect("worker upsert");
         core.upsert_worker(worker(2)).await.expect("worker upsert");
+        // Worker 2 holds a 96-token request past its prefill; the 64-token
+        // request below is a prefix of it. With the default weights that
+        // makes both choices strict: cache-aware prefers 2 (24 vs 32 blocks),
+        // load-only prefers an idle worker (32 vs 40).
+        let held_tokens: Vec<u32> = (1..=96).collect();
         let tokens: Vec<u32> = (1..=64).collect();
         let mut held = reserve_request("held");
-        held.prompt.token_ids = Some(tokens.clone());
+        held.prompt.token_ids = Some(held_tokens);
         held.pinned_worker = Some(WorkerWithDpRank::new(2, 0));
         core.select_and_reserve(held).await.expect("reserve");
+        core.prefill_complete("held")
+            .await
+            .expect("held is decoding");
         let cached_on_2 = || {
             let mut req = select_request();
             req.prompt.token_ids = Some(tokens.clone());
@@ -1072,8 +1080,11 @@ mod tests {
             "the stage's load-only scoring beats the request's full cache credit"
         );
 
-        // Worker 1 fails; the retry excludes it and books the only other
-        // worker under the same stage rule.
+        // Worker 1 fails. A third, idle worker joins, so the retry has two
+        // eligible candidates: 2 (holds the cached prefix) and 3 (idle). A
+        // caller-only request with the same eligibility and the same full
+        // cache credit picks the cached worker; the retried stage still
+        // places on load alone and picks the idle one.
         let attempt = plan.mark_dispatched(0).unwrap();
         plan.mark_failed(
             0,
@@ -1084,10 +1095,29 @@ mod tests {
             },
         )
         .unwrap();
+        core.upsert_worker(worker(3)).await.expect("worker upsert");
+        wait_until("the third worker is visible", || {
+            core.loads(None, None)
+                .iter()
+                .any(|model| model.loads.iter().any(|load| load.worker_id == 3))
+        })
+        .await;
+        let mut control = cached_on_2();
+        control.router_config_override = req.router_config_override.clone();
+        control.allowed_worker_ids = Some(HashSet::from([2, 3]));
+        let caller_only = core.select(control).await.unwrap().worker_id;
         plan.retry(0).unwrap();
         Router::schedule(&core, &req, &mut plan).await.unwrap();
-        assert_eq!(plan.worker(0).unwrap().worker_id, 2);
+        let retried = plan.worker(0).unwrap().worker_id;
         plan.release().await.unwrap();
         core.free_reservation("held").await.unwrap();
+        assert_eq!(
+            caller_only, 2,
+            "the caller-only control prefers the cached worker"
+        );
+        assert_eq!(
+            retried, 3,
+            "the retried stage keeps load-only scoring with two eligible workers"
+        );
     }
 }
