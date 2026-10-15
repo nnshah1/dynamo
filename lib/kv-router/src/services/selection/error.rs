@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::indexer::KvRouterError;
+use crate::router::PlanError;
 use crate::scheduling::KvSchedulerError;
 use crate::sequences::SequenceError;
 
@@ -21,6 +22,10 @@ pub enum SelectionError {
     Conflict(String),
     #[error("{0}")]
     Internal(String),
+    /// The caller withdrew the request before it was placed. Not a failure
+    /// of the selection; a host reports it as the client's cancellation.
+    #[error("{0}")]
+    Cancelled(String),
     #[error(transparent)]
     Scheduler(#[from] KvSchedulerError),
     #[error(transparent)]
@@ -31,6 +36,19 @@ pub enum SelectionError {
     Indexer(#[from] KvRouterError),
 }
 
+/// How a plan's refusal reads to the caller, the same from the core and from
+/// every host adapter: a placement the chosen worker cannot satisfy is a
+/// conflict between stages; anything else the plan rejects (an unknown stage,
+/// a pin the worker breaks, a booking out of order) is a bad request.
+impl From<PlanError> for SelectionError {
+    fn from(error: PlanError) -> Self {
+        match error {
+            PlanError::Placement { .. } => Self::Conflict(error.to_string()),
+            other => Self::BadRequest(other.to_string()),
+        }
+    }
+}
+
 impl SelectionError {
     fn status(&self) -> StatusCode {
         match self {
@@ -39,6 +57,8 @@ impl SelectionError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // nginx's "client closed request"; no standard status fits.
+            Self::Cancelled(_) => StatusCode::from_u16(499).expect("499 is a valid status code"),
             Self::Scheduler(error) => scheduler_error_status(error),
             Self::Sequence(error) => sequence_error_status(error),
             Self::Indexer(KvRouterError::IndexerOffline) => StatusCode::SERVICE_UNAVAILABLE,
@@ -60,6 +80,7 @@ impl SelectionError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::Internal(_) => "internal",
+            Self::Cancelled(_) => "cancelled",
             Self::Scheduler(_) => "scheduler",
             Self::Sequence(_) => "sequence",
             Self::Indexer(KvRouterError::IndexerOffline) => "not_ready",

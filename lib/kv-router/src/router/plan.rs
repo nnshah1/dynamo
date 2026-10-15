@@ -100,7 +100,8 @@ pub enum DomainMode {
 }
 
 /// A placement rule. Rules that name a stage read that stage's booked
-/// worker, so they may only name earlier stages.
+/// worker, so they may only name earlier stages. `Plan::routing_constraints`
+/// turns the first two into today's topology taints.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constraint {
     /// The worker must be able to receive KV from stage `k`'s worker.
@@ -122,7 +123,7 @@ pub enum Constraint {
 }
 
 impl Constraint {
-    fn reads(&self) -> Option<usize> {
+    pub(super) fn reads(&self) -> Option<usize> {
         match self {
             Self::TransferCompatible(stage) | Self::SameDomain { stage, .. } => Some(*stage),
             Self::Pin(_) | Self::Previewed(_) | Self::Exclude(_) => None,

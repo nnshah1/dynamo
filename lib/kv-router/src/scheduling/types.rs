@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dynamo_tokens::SequenceHash;
 use rustc_hash::FxHashMap;
@@ -390,6 +391,12 @@ impl SessionContext {
         static EMPTY: BTreeMap<String, Vec<String>> = BTreeMap::new();
         self.agent_headers.as_deref().unwrap_or(&EMPTY)
     }
+
+    /// The shared header map as attached, for a caller that passes it on
+    /// without copying its contents; `None` when none was attached.
+    pub fn shared_agent_headers(&self) -> Option<&Arc<BTreeMap<String, Vec<String>>>> {
+        self.agent_headers.as_ref()
+    }
 }
 
 /// Validated request accepted by [`LocalScheduler`](super::LocalScheduler).
@@ -417,6 +424,11 @@ pub struct ScheduleRequest {
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
     pub shared_cache_hits: Option<SharedCacheHits>,
+    /// How long the queue may hold this request, counted from ingress.
+    /// `None` leaves it to the class's queue policy; `Some(0)` admits on the
+    /// arrival pass or rejects with `DeadlineExceeded`. Honoured on the
+    /// booking path.
+    pub hold_budget: Option<Duration>,
 }
 
 /// Actor-owned admission request.
