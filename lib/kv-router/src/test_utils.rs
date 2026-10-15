@@ -3,13 +3,13 @@
 
 //! Shared test utilities for radix tree tests.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::indexer::KvIndexerInterface;
 use crate::protocols::{
     ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
-    KvCacheStoredBlockData, LocalBlockHash, OverlapScores, RouterEvent, WorkerConfigLike, WorkerId,
-    WorkerWithDpRank, compute_seq_hash_for_block,
+    KvCacheStoredBlockData, KvTransferEnforcement, LocalBlockHash, OverlapScores, RouterEvent,
+    WorkerConfigLike, WorkerId, WorkerWithDpRank, compute_seq_hash_for_block,
 };
 pub use crate::sequences::NoopSequencePublisher;
 
@@ -366,13 +366,17 @@ pub fn assert_overlap_scores_eq(left: &OverlapScores, right: &OverlapScores, ctx
 }
 
 /// Minimal [`WorkerConfigLike`] for scheduler/queue tests and benchmarks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SimpleWorkerConfig {
     pub data_parallel_start_rank: u32,
     pub data_parallel_size: u32,
     pub max_num_batched_tokens: Option<u64>,
     pub total_kv_blocks: Option<u64>,
     pub taints: HashSet<String>,
+    pub topology_domains: HashMap<String, String>,
+    pub kv_transfer_domain: Option<String>,
+    pub kv_transfer_enforcement: Option<KvTransferEnforcement>,
+    pub kv_transfer_preferred_weight: Option<f32>,
 }
 
 impl Default for SimpleWorkerConfig {
@@ -383,6 +387,10 @@ impl Default for SimpleWorkerConfig {
             max_num_batched_tokens: None,
             total_kv_blocks: None,
             taints: HashSet::new(),
+            topology_domains: HashMap::new(),
+            kv_transfer_domain: None,
+            kv_transfer_enforcement: None,
+            kv_transfer_preferred_weight: None,
         }
     }
 }
@@ -406,5 +414,21 @@ impl WorkerConfigLike for SimpleWorkerConfig {
 
     fn taints(&self) -> &HashSet<String> {
         &self.taints
+    }
+
+    fn topology_domains(&self) -> Option<&HashMap<String, String>> {
+        (!self.topology_domains.is_empty()).then_some(&self.topology_domains)
+    }
+
+    fn kv_transfer_domain(&self) -> Option<&str> {
+        self.kv_transfer_domain.as_deref()
+    }
+
+    fn kv_transfer_enforcement(&self) -> Option<KvTransferEnforcement> {
+        self.kv_transfer_enforcement
+    }
+
+    fn kv_transfer_preferred_weight(&self) -> Option<f32> {
+        self.kv_transfer_preferred_weight
     }
 }
