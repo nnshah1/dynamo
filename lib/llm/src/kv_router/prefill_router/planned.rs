@@ -340,6 +340,11 @@ impl PlannedFlow<'_> {
         let mut guard = shared.lock().await;
         let (routing, plan) = &mut *guard;
         let plan = plan.as_mut().expect("plan set above");
+        // The loop: book what is due, dispatch what is ready, record what
+        // happened. A booking is the plan's until its stage is dispatched;
+        // `run_prefill` / `run_decode` take it into the host's request guard,
+        // which owns its cleanup from then on. Dropping the plan afterwards
+        // frees nothing.
         loop {
             if plan.ready().next().is_none() {
                 // A deferred stage waits in its queue under the host's
