@@ -290,6 +290,12 @@ impl RequestLeaseManager {
         }
     }
 
+    /// One reaper scan, as the timer runs it: live leases go quiet, quiet
+    /// leases expire. Test-only; the timer remains the owner in production.
+    pub(crate) fn reap_now(&self) {
+        self.inner.reap();
+    }
+
     pub(crate) fn touch_request(&self, request_id: &str) {
         if let Some(record) = self.inner.current_record(request_id) {
             record.clock.touch();

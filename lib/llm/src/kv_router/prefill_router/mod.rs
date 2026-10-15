@@ -621,6 +621,38 @@ impl PrefillRouter {
             .map_err(|_| anyhow::anyhow!("PrefillRouter already has a plan router factory"))
     }
 
+    /// Free an enrolled prefill reservation by its id (see
+    /// [`PrefillReservation::enroll`]). Nothing under the id is the late or
+    /// duplicate callback case and is reported as the set's error.
+    pub async fn free_prefill_reservation(&self, reservation_id: &str) -> Result<()> {
+        let Some(binding) = self.binding.load_full() else {
+            return Ok(());
+        };
+        let Some(chooser) = binding.router.kv_router_if_enabled() else {
+            return Ok(());
+        };
+        chooser.free(reservation_id).await.map_err(|error| {
+            anyhow::anyhow!("freeing prefill reservation {reservation_id}: {error}")
+        })
+    }
+
+    /// Bind this router to a prefill set's host without discovery, in KV
+    /// mode. Test hook for hosts in other crates; activation is the owner in
+    /// production.
+    #[doc(hidden)]
+    pub fn bind_for_tests(&self, endpoint_id: EndpointId, host: Arc<RoutingHost>) {
+        self.binding.store(Some(Arc::new(PrefillBinding {
+            target_id: WorkerSetTargetId::Legacy(endpoint_id.clone()),
+            endpoint_id,
+            router: host,
+            prefill_router_mode: RouterMode::KV,
+        })));
+        self.lifecycle.store(
+            PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     pub(crate) fn set_decode_routing_host(&self, routing_host: Arc<RoutingHost>) -> Result<()> {
         match self.decode_routing_host.set(routing_host) {
             Ok(()) => Ok(()),
