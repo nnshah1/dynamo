@@ -290,6 +290,11 @@ impl RequestLeaseManager {
         }
     }
 
+    /// Whether any request attempt is still leased here.
+    pub(crate) fn has_active(&self) -> bool {
+        !self.inner.active.lock().by_attempt.is_empty()
+    }
+
     /// One reaper scan, as the timer runs it: live leases go quiet, quiet
     /// leases expire. Test-only; the timer remains the owner in production.
     pub(crate) fn reap_now(&self) {

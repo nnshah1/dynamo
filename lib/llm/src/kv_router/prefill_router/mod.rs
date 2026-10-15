@@ -218,6 +218,11 @@ pub(crate) const BYPASS_REMOTE_PREFILL_ANNOTATION: &str = "x-bypass-remote-prefi
 /// channel.
 pub struct PrefillRouter {
     binding: ArcSwapOption<PrefillBinding>,
+    /// Bindings replaced or withdrawn while their set still holds bookings
+    /// enrolled through [`PrefillReservation::enroll`]. A free by id reaches
+    /// the set that admitted the booking through here; a retired binding is
+    /// dropped once its set holds nothing.
+    retired_bindings: Mutex<Vec<Arc<PrefillBinding>>>,
     target: Mutex<Option<WorkerSetTargetId>>,
     target_tx: Option<watch::Sender<Option<WorkerSetTarget>>>,
     /// Decode routing owns conditional-disagg planning and dispatch. This is
@@ -625,15 +630,44 @@ impl PrefillRouter {
     /// [`PrefillReservation::enroll`]). Nothing under the id is the late or
     /// duplicate callback case and is reported as the set's error.
     pub async fn free_prefill_reservation(&self, reservation_id: &str) -> Result<()> {
-        let Some(binding) = self.binding.load_full() else {
-            return Ok(());
-        };
-        let Some(chooser) = binding.router.kv_router_if_enabled() else {
-            return Ok(());
-        };
-        chooser.free(reservation_id).await.map_err(|error| {
-            anyhow::anyhow!("freeing prefill reservation {reservation_id}: {error}")
-        })
+        // The current set first, then sets replaced while still holding
+        // bookings: the id is freed where it was admitted.
+        let mut bindings: Vec<Arc<PrefillBinding>> = self.binding.load_full().into_iter().collect();
+        bindings.extend(self.retired_bindings.lock().iter().cloned());
+        for binding in bindings {
+            if let Some(chooser) = binding.router.kv_router_if_enabled()
+                && chooser.free_enrolled(reservation_id).await
+            {
+                self.prune_retired_bindings();
+                return Ok(());
+            }
+        }
+        self.prune_retired_bindings();
+        anyhow::bail!("no prefill reservation is enrolled under {reservation_id}")
+    }
+
+    /// Install `next` as the binding. The previous one is retired, not
+    /// dropped, while its set still holds enrolled bookings.
+    fn replace_binding(&self, next: Option<Arc<PrefillBinding>>) {
+        let previous = self.binding.swap(next);
+        self.prune_retired_bindings();
+        if let Some(previous) = previous
+            && previous
+                .router
+                .kv_router_if_enabled()
+                .is_some_and(|chooser| chooser.has_enrolled_requests())
+        {
+            self.retired_bindings.lock().push(previous);
+        }
+    }
+
+    fn prune_retired_bindings(&self) {
+        self.retired_bindings.lock().retain(|binding| {
+            binding
+                .router
+                .kv_router_if_enabled()
+                .is_some_and(|chooser| chooser.has_enrolled_requests())
+        });
     }
 
     /// Bind this router to a prefill set's host without discovery, in KV
@@ -641,7 +675,7 @@ impl PrefillRouter {
     /// production.
     #[doc(hidden)]
     pub fn bind_for_tests(&self, endpoint_id: EndpointId, host: Arc<RoutingHost>) {
-        self.binding.store(Some(Arc::new(PrefillBinding {
+        self.replace_binding(Some(Arc::new(PrefillBinding {
             target_id: WorkerSetTargetId::Legacy(endpoint_id.clone()),
             endpoint_id,
             router: host,
@@ -649,6 +683,16 @@ impl PrefillRouter {
         })));
         self.lifecycle.store(
             PrefillLifecycleState::Active as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// Withdraw the prefill binding, as deactivation does. Test hook.
+    #[doc(hidden)]
+    pub fn unbind_for_tests(&self) {
+        self.replace_binding(None);
+        self.lifecycle.store(
+            PrefillLifecycleState::Pending as u8,
             std::sync::atomic::Ordering::Release,
         );
     }
