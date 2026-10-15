@@ -165,6 +165,7 @@ impl PrefillRouter {
             target_tx: None,
             decode_routing_host: std::sync::OnceLock::new(),
             plan_router_factory: std::sync::OnceLock::new(),
+            retired_bindings: parking_lot::Mutex::new(Vec::new()),
             selection_policy: None,
             model_manager,
             cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -219,6 +220,7 @@ impl PrefillRouter {
             target_tx: Some(target_tx),
             decode_routing_host: std::sync::OnceLock::new(),
             plan_router_factory: std::sync::OnceLock::new(),
+            retired_bindings: parking_lot::Mutex::new(Vec::new()),
             selection_policy: Some(selection_policy),
             model_manager: model_manager.clone(),
             cancel_token: cancel_token.clone(),
@@ -564,7 +566,7 @@ impl PrefillRouter {
                     if current_target.as_ref() != Some(&target_id) {
                         continue;
                     }
-                    router_ref.binding.store(Some(Arc::new(binding)));
+                    router_ref.replace_binding(Some(Arc::new(binding)));
                     router_ref
                         .lifecycle
                         .store(PrefillLifecycleState::Active as u8, Ordering::Release);
@@ -623,7 +625,7 @@ impl PrefillRouter {
         } else if reuses_binding {
             PrefillLifecycleState::Active
         } else {
-            self.binding.store(None);
+            self.replace_binding(None);
             PrefillLifecycleState::Pending
         };
         self.lifecycle.store(lifecycle as u8, Ordering::Release);
