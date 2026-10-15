@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use super::config::RouterQueuePolicy;
 use crate::plugins::request_classifier::RawRequestClassifierConfig;
+use crate::router::StageList;
 // TODO(v1.7): Remove these compatibility re-exports; use crate::plugins instead.
 pub use crate::plugins::request_classifier::RequestClassifierConfig;
 use crate::plugins::worker_selection::RawWorkerSelectionConfig;
@@ -46,6 +47,11 @@ pub struct PolicyClassConfig {
     pub request_queue_limit_per_worker: Option<usize>,
     pub raw_isl_token_queue_limit_per_worker: Option<usize>,
     pub cached_token_queue_limit_per_worker: Option<usize>,
+    /// The class's stage list; `None` means the router's default (aggregated).
+    pub stages: Option<StageList>,
+    /// The routing family this class serves a bucket of; `None` for an
+    /// explicit class a request names directly.
+    pub policy_family: Option<String>,
 }
 
 impl PolicyClassConfig {
@@ -151,6 +157,8 @@ impl PolicyProfile {
             request_queue_limit_per_worker: None,
             raw_isl_token_queue_limit_per_worker: None,
             cached_token_queue_limit_per_worker: None,
+            stages: None,
+            policy_family: None,
         };
         Self {
             classes: vec![class],
@@ -436,6 +444,7 @@ struct RawPolicyClassConfig {
     request_queue_limit_per_worker: Option<usize>,
     raw_isl_token_queue_limit_per_worker: Option<usize>,
     cached_token_queue_limit_per_worker: Option<usize>,
+    stages: Option<StageList>,
 }
 
 fn resolve_profile(
@@ -614,6 +623,16 @@ fn resolve_policy_class(
             )));
         }
     };
+    if raw
+        .stages
+        .as_ref()
+        .is_some_and(|list| list.stages.is_empty())
+    {
+        return Err(RouterPolicyConfigError::Validation(format!(
+            "{location} policy class {:?}: stages must list at least one stage",
+            raw.name
+        )));
+    }
     Ok(ResolvedPolicyClass {
         config: PolicyClassConfig {
             name: raw.name,
@@ -624,6 +643,8 @@ fn resolve_policy_class(
             request_queue_limit_per_worker: raw.request_queue_limit_per_worker,
             raw_isl_token_queue_limit_per_worker: raw.raw_isl_token_queue_limit_per_worker,
             cached_token_queue_limit_per_worker: raw.cached_token_queue_limit_per_worker,
+            stages: raw.stages,
+            policy_family: raw.policy_family,
         },
         binding,
     })
