@@ -75,6 +75,8 @@ fn bench(c: &mut Criterion) {
                                 pinned_worker: None,
                                 allowed_worker_ids: None,
                                 routing_constraints: Default::default(),
+                                policy_class: None,
+                                all_now: false,
                             })
                             .await
                             .unwrap();

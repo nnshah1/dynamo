@@ -1381,6 +1381,8 @@ impl KvRouter {
                 track_active_blocks: self.kv_router_config.router_track_active_blocks,
                 return_routing_hashes: return_routing_hashes || session_index_context.is_some(),
                 replay_id: None,
+                // The frontend's queue policy is unchanged: hold as today.
+                hold_budget: None,
             })
             .await;
         if lookup.is_some_and(|lookup| lookup.shared_cache_error)
