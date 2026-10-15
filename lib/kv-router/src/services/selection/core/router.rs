@@ -1013,4 +1013,81 @@ mod tests {
         );
         plan.release().await.unwrap();
     }
+
+    /// Precedence through a real admission: a request that asks for full
+    /// cache credit still has its decode-only stage placed on load alone
+    /// (the stage list wins over the request's override), and the rule holds
+    /// across a retry after that worker fails.
+    #[tokio::test]
+    async fn a_stages_scoring_wins_over_the_requests_override_and_survives_retry() {
+        use crate::router::Failure;
+        let core = local_core(test_config(false));
+        core.upsert_worker(worker(1)).await.expect("worker upsert");
+        core.upsert_worker(worker(2)).await.expect("worker upsert");
+        let tokens: Vec<u32> = (1..=64).collect();
+        let mut held = reserve_request("held");
+        held.prompt.token_ids = Some(tokens.clone());
+        held.pinned_worker = Some(WorkerWithDpRank::new(2, 0));
+        core.select_and_reserve(held).await.expect("reserve");
+        let cached_on_2 = || {
+            let mut req = select_request();
+            req.prompt.token_ids = Some(tokens.clone());
+            req.advisory = true;
+            req
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while core
+                .select(cached_on_2())
+                .await
+                .expect("select")
+                .overlap
+                .longest_matched
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the booked prompt is credited");
+
+        let mut req = reserve_request("override");
+        req.prompt.token_ids = Some(tokens.clone());
+        req.router_config_override = Some(RouterConfigOverride {
+            overlap_score_credit: Some(1.0),
+            ..RouterConfigOverride::default()
+        });
+        let mut plan = Plan::new(
+            PlanId::from("override"),
+            default_key(),
+            vec![Stage {
+                work: Some(StageWork::DecodeOnly),
+                ..Stage::new(WorkerType::Aggregated)
+            }],
+        )
+        .unwrap();
+        Router::schedule(&core, &req, &mut plan).await.unwrap();
+        assert_eq!(
+            plan.worker(0).unwrap().worker_id,
+            1,
+            "the stage's load-only scoring beats the request's full cache credit"
+        );
+
+        // Worker 1 fails; the retry excludes it and books the only other
+        // worker under the same stage rule.
+        let attempt = plan.mark_dispatched(0).unwrap();
+        plan.mark_failed(
+            0,
+            attempt,
+            Failure {
+                is_retryable: true,
+                reason: "worker died".to_string(),
+            },
+        )
+        .unwrap();
+        plan.retry(0).unwrap();
+        Router::schedule(&core, &req, &mut plan).await.unwrap();
+        assert_eq!(plan.worker(0).unwrap().worker_id, 2);
+        plan.release().await.unwrap();
+        core.free_reservation("held").await.unwrap();
+    }
 }

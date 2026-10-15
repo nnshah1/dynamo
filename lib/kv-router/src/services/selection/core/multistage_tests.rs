@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::super::input::MmRoutingInfoRequest;
 use super::tests::{core_with, reserve_request, test_config, wait_until, worker};
@@ -18,6 +19,7 @@ use crate::router::{
     StageList, StageState, When, topology_taint,
 };
 use crate::scheduling::KvSchedulerError;
+use crate::services::selection::{SelectRequest, SelectResponse};
 
 fn typed_core(worker_type: WorkerType) -> Arc<SelectionCore> {
     typed_core_with(worker_type, test_config(false))
@@ -621,5 +623,218 @@ async fn decode_is_booked_after_an_untracked_prefill_selection() {
     assert!(plan.booking(0).is_none(), "prefill is untracked");
     assert_eq!(plan.state_of(1), Some(&StageState::Booked));
     assert_eq!(plan.worker(1).map(|w| w.worker_id), Some(1));
+    plan.release().await.unwrap();
+}
+
+/// Forget the whole prompt on `worker_id` in the core's index: the mirror of
+/// `seed_prompt`.
+async fn evict_prompt(core: &SelectionCore, worker_id: WorkerId, tokens: &[u32]) {
+    use crate::indexer::KvIndexerInterface;
+    use crate::protocols::{
+        BlockHashOptions, ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData,
+        KvCacheRemoveData, RouterEvent, StorageTier, compute_block_hash_for_seq,
+        compute_seq_hash_for_block,
+    };
+    use crate::services::indexer::backend::Indexer;
+    let key = super::tests::default_key();
+    let block_size = core.entry(&key).expect("entry").block_size;
+    let local_hashes = compute_block_hash_for_seq(tokens, block_size, BlockHashOptions::default());
+    let block_hashes = compute_seq_hash_for_block(&local_hashes)
+        .into_iter()
+        .map(ExternalSequenceBlockHash)
+        .collect();
+    let indexer = core.partition(&key).expect("partition").indexer().clone();
+    indexer
+        .apply_event_routed(RouterEvent::with_storage_tier(
+            worker_id,
+            KvCacheEvent {
+                event_id: 2,
+                data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
+                dp_rank: 0,
+            },
+            StorageTier::Device,
+        ))
+        .await
+        .expect("evict");
+    if let Indexer::Single { primary, .. } = &indexer {
+        primary.flush().await;
+    }
+}
+
+/// A previewed pin is admitted against the worker's state at admission, not
+/// at preview. A decode worker whose placement changed under the same id
+/// since the preview is refused by the live check and nothing is kept for
+/// it; one whose cache was evicted since the preview is booked and charged
+/// for the whole prompt it now prefills itself.
+#[tokio::test]
+async fn a_previewed_pin_is_admitted_against_the_workers_current_state() {
+    // Placement: the preview chose 22 while it shared prefill's zone.
+    let prefill = typed_core(WorkerType::Prefill);
+    let decode = typed_core(WorkerType::Decode);
+    prefill.upsert_worker(zoned(11, "a")).await.unwrap();
+    decode.upsert_worker(zoned(21, "a")).await.unwrap();
+    decode.upsert_worker(zoned(22, "a")).await.unwrap();
+    ready(&prefill).await;
+    ready_for(&decode, 2).await;
+    let router = MultiStageRouter::builder()
+        .set(WorkerType::Prefill, prefill.clone())
+        .set(WorkerType::Decode, decode.clone())
+        .classes(ClassTable::new(StageList::new(vec![
+            Stage::new(WorkerType::Prefill),
+            Stage {
+                inputs: vec![0],
+                constraints: vec![same_zone_as(0)],
+                ..Stage::new(WorkerType::Decode)
+            },
+        ])))
+        .build()
+        .unwrap();
+    let req = reserve_request("stale-preview");
+    let mut plan = router.plan(&req).unwrap();
+    plan.constrain(1, Constraint::Previewed(WorkerWithDpRank::new(22, 0)))
+        .unwrap();
+    // The set is rebuilt under the same id: 22 is now in zone b.
+    decode.upsert_worker(zoned(22, "b")).await.unwrap();
+    let error = router.schedule(&req, &mut plan).await.unwrap_err();
+    assert_eq!(
+        state(&plan, 0),
+        &StageState::Booked,
+        "prefill is booked: {error}"
+    );
+    assert!(
+        state(&plan, 1).is_pending(),
+        "the stale preview is not admitted"
+    );
+    assert_eq!(
+        prefill_tokens_of(&decode, 22),
+        0,
+        "nothing was kept on the refused worker"
+    );
+    plan.release().await.unwrap();
+
+    // Cache: the preview saw the prompt on 22; it is gone by admission.
+    let decode = typed_core(WorkerType::Decode);
+    decode.upsert_worker(worker(22)).await.unwrap();
+    ready(&decode).await;
+    let key = super::tests::default_key();
+    let block_size = decode.entry(&key).expect("entry").block_size;
+    let tokens: Vec<u32> = (1..=4 * block_size).collect();
+    seed_prompt(&decode, 22, &tokens).await;
+    let previewed = |id: &str| {
+        let mut plan = Plan::new(
+            crate::router::PlanId::from(id),
+            key.clone(),
+            vec![Stage::new(WorkerType::Decode)],
+        )
+        .unwrap();
+        plan.constrain(0, Constraint::Previewed(WorkerWithDpRank::new(22, 0)))
+            .unwrap();
+        plan
+    };
+    let mut req = reserve_request("cached");
+    req.prompt.token_ids = Some(tokens.clone());
+    let mut hit = previewed("cached");
+    Router::schedule(&*decode, &req, &mut hit).await.unwrap();
+    let charged_with_cache = prefill_tokens_of(&decode, 22);
+    assert!(
+        charged_with_cache < tokens.len(),
+        "with the prompt cached the booking is charged less than the prompt: {charged_with_cache}"
+    );
+    hit.release().await.unwrap();
+    wait_until("release", || prefill_tokens_of(&decode, 22) == 0).await;
+
+    evict_prompt(&decode, 22, &tokens).await;
+    let mut req = reserve_request("evicted");
+    req.prompt.token_ids = Some(tokens.clone());
+    let mut miss = previewed("evicted");
+    Router::schedule(&*decode, &req, &mut miss).await.unwrap();
+    assert_eq!(
+        plan_worker(&miss),
+        22,
+        "the previewed worker is still the one booked"
+    );
+    assert_eq!(
+        prefill_tokens_of(&decode, 22),
+        tokens.len(),
+        "and it is charged for the whole prompt it now prefills"
+    );
+    miss.release().await.unwrap();
+}
+
+fn plan_worker(plan: &Plan) -> WorkerId {
+    plan.worker(0).unwrap().worker_id
+}
+
+/// A custom `Router` over real cores reads the scheduler's recorded answer
+/// for an earlier stage and steers a later one from it: here, decode is
+/// pinned to worker 22 once prefill's answer names worker 11.
+struct SteerFromPrefillAnswer(MultiStageRouter);
+
+#[async_trait::async_trait]
+impl Router for SteerFromPrefillAnswer {
+    async fn select(&self, req: SelectRequest) -> Result<SelectResponse, SelectionError> {
+        self.0.select(req).await
+    }
+
+    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        self.0.plan(req)
+    }
+
+    async fn schedule(
+        &self,
+        req: &SelectAndReserveRequest,
+        plan: &mut Plan,
+    ) -> Result<(), SelectionError> {
+        self.0.schedule(req, plan).await?;
+        let prefill_on_11 = plan
+            .scheduling(0)
+            .is_some_and(|answer| answer.best_worker.worker_id == 11);
+        let decode_unpinned = plan.state_of(1).is_some_and(StageState::is_pending)
+            && plan.stage(1).is_some_and(|stage| {
+                !stage
+                    .constraints
+                    .iter()
+                    .any(|constraint| matches!(constraint, Constraint::Pin(_)))
+            });
+        if prefill_on_11 && decode_unpinned {
+            plan.constrain(1, Constraint::Pin(WorkerWithDpRank::new(22, 0)))?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_custom_router_steers_from_a_real_stages_scheduling_answer() {
+    let prefill = typed_core(WorkerType::Prefill);
+    let decode = typed_core(WorkerType::Decode);
+    prefill.upsert_worker(worker(11)).await.unwrap();
+    decode.upsert_worker(worker(21)).await.unwrap();
+    decode.upsert_worker(worker(22)).await.unwrap();
+    ready(&prefill).await;
+    ready_for(&decode, 2).await;
+    let router = SteerFromPrefillAnswer(
+        MultiStageRouter::builder()
+            .set(WorkerType::Prefill, prefill.clone())
+            .set(WorkerType::Decode, decode.clone())
+            .classes(ClassTable::new(StageList::prefill_decode_deferred(
+                Duration::from_secs(2),
+            )))
+            .build()
+            .unwrap(),
+    );
+    let req = reserve_request("steer-real");
+    let mut plan = router.plan(&req).unwrap();
+    router.schedule(&req, &mut plan).await.unwrap();
+    let answer = plan.scheduling(0).expect("prefill's answer is on the plan");
+    assert_eq!(answer.best_worker.worker_id, 11);
+    assert_eq!(answer.cached_tokens, 0, "a cold prompt");
+    assert!(state(&plan, 1).is_pending(), "decode is deferred");
+    run(&mut plan, 0);
+    router.schedule(&req, &mut plan).await.unwrap();
+    assert_eq!(
+        plan.worker(1).unwrap().worker_id,
+        22,
+        "decode followed the custom router's reading of prefill's real answer"
+    );
     plan.release().await.unwrap();
 }
