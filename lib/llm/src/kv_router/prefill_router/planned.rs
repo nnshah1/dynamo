@@ -1751,6 +1751,83 @@ mod tests {
         fixture.runtime.shutdown();
     }
 
+    /// A decode worker whose metadata discovery has withdrawn is not a
+    /// placement, even though its endpoint instance is still registered and
+    /// its last-known facts were compatible with the prefill side. The set
+    /// has no admitted worker, so the plan is refused before anything is
+    /// dispatched: no prefill is spent on a request that has nowhere to
+    /// decode, and nothing is left booked.
+    #[tokio::test]
+    async fn a_decode_worker_without_metadata_is_not_a_placement() {
+        use dynamo_kv_router::protocols::KvTransferEnforcement;
+        use std::collections::HashSet;
+
+        let zone_b = || ModelRuntimeConfig {
+            taints: HashSet::from(["dynamo.topology/zone=b".to_string()]),
+            topology_domains: HashMap::from([("zone".to_string(), "b".to_string())]),
+            kv_transfer_domain: Some("zone".to_string()),
+            kv_transfer_enforcement: Some(KvTransferEnforcement::Required),
+            ..ModelRuntimeConfig::default()
+        };
+        let fixture = fixture_configs(
+            "plan-host-decode-metadata-withdrawn",
+            false,
+            zone_b(),
+            zone_b(),
+        )
+        .await;
+        fixture.prefill.worker.script(vec![bootstrap_frame()]);
+        fixture
+            .decode
+            .worker
+            .script(vec![token_frame(7), stop_frame()]);
+
+        // Discovery withdraws the decode worker's metadata; its endpoint
+        // instance stays registered.
+        fixture.decode.workers_tx.send_replace(HashMap::new());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let loads = fixture
+                    .decode
+                    .chooser
+                    .get_potential_loads(&[], None, None, None, None)
+                    .await
+                    .unwrap();
+                if !loads
+                    .iter()
+                    .any(|load| load.worker_id == fixture.decode.worker_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the decode set observes the withdrawal");
+
+        let result = fixture
+            .router
+            .generate(Context::new(request()), Arc::new(NeverNext))
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(stream) => {
+                let frames: Vec<_> = stream.collect().await;
+                panic!("a worker without metadata was placed: {frames:?}");
+            }
+        };
+        assert!(
+            fixture.decode.worker.seen().is_empty(),
+            "decode was never dispatched: {error:#}"
+        );
+        assert!(
+            fixture.prefill.worker.seen().is_empty(),
+            "the plan is refused before prefill is dispatched: {error:#}"
+        );
+        wait_until_released(&fixture).await;
+        fixture.runtime.shutdown();
+    }
+
     /// The two answers that are the client's, through the real frontend
     /// loop: a request withdrawn before it was planned, and a decode worker
     /// the set does not have. Each leaves with the class a direct admission
