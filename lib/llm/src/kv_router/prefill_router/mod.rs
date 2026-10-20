@@ -12,8 +12,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use dynamo_kv_router::{
-    PrefillLoadEstimator, conditional_disagg::ConditionalDisaggPolicy,
-    config::RouterConfigOverride, protocols::RoutingConstraints,
+    PrefillLoadEstimator,
+    conditional_disagg::{ConditionalDisaggParams, ConditionalDisaggPolicy},
+    config::RouterConfigOverride,
+    protocols::RoutingConstraints,
 };
 use dynamo_runtime::{
     error::{ErrorType, match_error_chain},
@@ -235,6 +237,9 @@ pub struct PrefillRouter {
     session_affinity_ttl: Option<std::time::Duration>,
     session_affinity_mode: SessionAffinityMode,
     conditional_disagg_policy: Arc<dyn ConditionalDisaggPolicy>,
+    /// The same policy as the planned path's stage data: the parameters the
+    /// conditional stage list's skip rule carries. `None` when disabled.
+    conditional_disagg_params: Option<ConditionalDisaggParams>,
     /// Resolved once at construction: dedicated threshold if set, otherwise
     /// `router_queue_threshold`. `None` means the prefill-load condition is disabled.
     conditional_disagg_prefill_busy_threshold: Option<f64>,

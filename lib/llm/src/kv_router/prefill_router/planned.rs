@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use dynamo_kv_router::WorkerType;
-use dynamo_kv_router::conditional_disagg::ConditionalDisaggPolicy;
+use dynamo_kv_router::conditional_disagg::ConditionalDisaggParams;
 use dynamo_kv_router::protocols::{WorkerAffinityTarget, WorkerWithDpRank};
 use dynamo_kv_router::router::{
     Booking, ClassTable, Constraint, Failure, MultiStageRouter, Plan, Router, StageList, StageState,
@@ -62,14 +62,14 @@ use crate::protocols::common::{
 use crate::session_affinity::{AffinityTarget, Hold, SessionAffinityMode};
 
 /// What a [`PlanRouterFactory`] receives: one `Router` per worker set (the
-/// set's selection core), and the conditional-disaggregation policy with
-/// whether a decode-busy gate is configured. The factory returns the
-/// `Router` the frontend drives for the request; the default builds a
-/// `MultiStageRouter` over the class's stage list.
+/// set's selection core), and the conditional-disaggregation parameters
+/// when it is enabled. The factory returns the `Router` the frontend drives
+/// for the request; the default builds a `MultiStageRouter` over the
+/// class's stage list.
 pub struct PlanRouterParts {
     pub prefill: Arc<dyn Router>,
     pub decode: Arc<dyn Router>,
-    pub conditional: Option<(Arc<dyn ConditionalDisaggPolicy>, bool)>,
+    pub conditional: Option<ConditionalDisaggParams>,
 }
 
 /// A compiled injection point for a custom `Router`: wrap or replace the
@@ -80,19 +80,16 @@ pub type PlanRouterFactory = Arc<dyn Fn(PlanRouterParts) -> Result<Arc<dyn Route
 /// The default: a `MultiStageRouter` over the plain or conditional
 /// prefill/decode list.
 pub fn default_plan_router(parts: PlanRouterParts) -> Result<Arc<dyn Router>> {
-    let list = if parts.conditional.is_some() {
-        StageList::conditional_prefill_decode()
-    } else {
-        StageList::prefill_decode()
+    let list = match parts.conditional {
+        Some(params) => StageList::conditional_prefill_decode(params),
+        None => StageList::prefill_decode(),
     };
-    let mut builder = MultiStageRouter::builder()
+    let router = MultiStageRouter::builder()
         .set(WorkerType::Prefill, parts.prefill)
         .set(WorkerType::Decode, parts.decode)
-        .classes(ClassTable::new(list));
-    if let Some((policy, has_decode_gate)) = parts.conditional {
-        builder = builder.conditional_disagg(policy, has_decode_gate);
-    }
-    Ok(Arc::new(builder.build()?))
+        .classes(ClassTable::new(list))
+        .build()?;
+    Ok(Arc::new(router))
 }
 
 pub(crate) fn plan_host_enabled() -> bool {
@@ -265,14 +262,10 @@ impl PlannedFlow<'_> {
         let parts = PlanRouterParts {
             prefill: self.binding.router.kv_router().plan_router(),
             decode: self.decode_host.kv_router().plan_router(),
-            conditional: conditional.then(|| {
-                (
-                    Arc::clone(&self.router.conditional_disagg_policy),
-                    self.router
-                        .conditional_disagg_decode_busy_threshold
-                        .is_some(),
-                )
-            }),
+            conditional: self
+                .router
+                .conditional_disagg_params
+                .filter(|_| conditional),
         };
         match self.router.plan_router_factory.get() {
             Some(factory) => factory(parts),
@@ -384,11 +377,11 @@ impl PlannedFlow<'_> {
                         .collect::<Vec<_>>()
                 ));
             };
-            let set = plan.stage(k).expect("ready stage exists").set;
-            let step = match set {
+            let set = &plan.stage(k).expect("ready stage exists").set;
+            let step = match set.role {
                 WorkerType::Prefill => self.run_prefill(plan, k, &engine_ctx).await?,
                 WorkerType::Decode => self.run_decode(plan, k, conditional, &engine_ctx).await?,
-                other => return Err(anyhow!("plan dispatched unexpected set {other:?}")),
+                _ => return Err(anyhow!("plan dispatched unexpected set {set}")),
             };
             if let Step::Done(response) = step {
                 return Ok(response);
@@ -884,7 +877,7 @@ fn migration_exhaustion(
 ) -> Option<anyhow::Error> {
     let needs_exhausted_set = (0..plan.stage_count()).any(|k| {
         plan.stage(k)
-            .is_some_and(|stage| exhausted.contains(&stage.set))
+            .is_some_and(|stage| exhausted.contains(&stage.set.role))
             && plan.state_of(k).is_some_and(StageState::is_pending)
     });
     if !needs_exhausted_set {

@@ -9,7 +9,9 @@ use tokio::sync::{oneshot, watch};
 
 use dynamo_kv_router::{
     PrefillLoadEstimator,
-    conditional_disagg::{ConditionalDisaggPolicy, make_conditional_disagg_policy},
+    conditional_disagg::{
+        ConditionalDisaggParams, ConditionalDisaggPolicy, make_conditional_disagg_policy,
+    },
     config::KvRouterConfig,
 };
 use dynamo_runtime::{
@@ -172,6 +174,7 @@ impl PrefillRouter {
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
             session_affinity_mode,
             conditional_disagg_policy: Arc::from(make_conditional_disagg_policy(None)),
+            conditional_disagg_params: None,
             conditional_disagg_prefill_busy_threshold: None,
             conditional_disagg_decode_busy_threshold: None,
             prefill_load_estimator: None,
@@ -205,6 +208,9 @@ impl PrefillRouter {
         let (target_tx, target_rx) = watch::channel(None);
         let conditional_disagg_policy: Arc<dyn ConditionalDisaggPolicy> =
             Arc::from(make_conditional_disagg_policy(kv_router_config.as_ref()));
+        let conditional_disagg_params = kv_router_config
+            .as_ref()
+            .and_then(ConditionalDisaggParams::from_config);
         let conditional_disagg_prefill_busy_threshold = kv_router_config.as_ref().and_then(|c| {
             c.conditional_disagg_prefill_busy_threshold
                 .or(c.router_queue_threshold)
@@ -226,6 +232,7 @@ impl PrefillRouter {
             session_affinity_ttl: session_affinity_ttl_secs.map(std::time::Duration::from_secs),
             session_affinity_mode,
             conditional_disagg_policy,
+            conditional_disagg_params,
             conditional_disagg_prefill_busy_threshold,
             conditional_disagg_decode_busy_threshold,
             prefill_load_estimator,
