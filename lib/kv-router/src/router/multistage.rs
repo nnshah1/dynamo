@@ -543,7 +543,7 @@ impl Router for MultiStageRouter {
         self.set_router(set, pool)?.select(req).await
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let list = self.stage_list(req);
         let stages = if req.all_now {
             list.all_now().stages

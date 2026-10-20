@@ -370,7 +370,7 @@ impl Router for FakeRouter {
         Ok(self.response(&req.model_name, &req.routing_group, prompt_tokens, &worker))
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let id = req
             .selection_id
             .clone()

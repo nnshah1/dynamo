@@ -202,7 +202,7 @@ impl Fixture {
 }
 
 async fn booked(router: &MultiStageRouter, req: &SelectAndReserveRequest) -> Plan {
-    let mut plan = router.plan(req).expect("plan");
+    let mut plan = router.create_plan(req).expect("plan");
     router.schedule(req, &mut plan).await.expect("schedule");
     plan
 }
@@ -561,7 +561,7 @@ async fn unsatisfiable_placement_releases_the_held_reservation() {
     fixture.decode.add_worker(zoned(21, "b"));
     let router = fixture.router(StageList::prefill_decode());
     let req = request("zone-2");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::Scheduler(_)), "{error}");
     // The host owns the plan: prefill is still held until it decides.
@@ -584,7 +584,7 @@ async fn decode_first_selection_still_satisfies_the_prefill_transfer_requirement
     fixture.decode.add_worker(zoned(21, "b"));
     let router = fixture.router(StageList::decode_first());
     let req = request("zone-3");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::Conflict(_)), "{error}");
     plan.abort();
@@ -615,7 +615,7 @@ async fn cancel_before_admission_completes_leaves_nothing_reserved() {
     let fixture = Fixture::new();
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let req = request("cancel-1");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     fixture.prefill.set_admission_open(false);
     {
         let schedule = router.schedule(&req, &mut plan);
@@ -758,7 +758,7 @@ async fn second_stage_admission_failure_releases_the_first_reservation() {
     ));
     let router = fixture.router(StageList::prefill_decode());
     let req = all_now(request("fail-1"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::Scheduler(_)), "{error}");
     plan.abort();
@@ -802,7 +802,7 @@ async fn stale_pool_generation_between_preview_and_admission_is_rejected() {
     // has gone by the time it is booked, so the pinned booking fails.
     let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
     let req = request("stale-1");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::Scheduler(_)), "{error}");
     assert_eq!(state(&plan, 0), &StageState::Skipped);
@@ -816,7 +816,7 @@ async fn admission_timeout_releases_everything_the_session_holds() {
     fixture.decode.set_admission_open(false);
     let router = fixture.router(StageList::prefill_decode());
     let req = all_now(request("timeout-1"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
         matches!(
@@ -933,7 +933,7 @@ async fn upfront_planning_rejects_a_policy_that_waits() {
     fixture.decode.set_admission_open(false);
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let req = all_now(request("wait-1"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     assert!(plan.stages().all(|stage| stage.when == When::Now));
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
@@ -984,7 +984,7 @@ async fn preview_is_refused_for_a_stage_without_preview_support() {
     fixture.decode = FakeRouter::without_select(WorkerType::Decode, [21, 22]);
     let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
     let req = request("enc-1");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(matches!(error, SelectionError::BadRequest(_)), "{error}");
     assert_eq!(fixture.outstanding(), 0);
@@ -1103,7 +1103,7 @@ async fn fallback_does_not_hide_a_non_capacity_error() {
     ));
     let router = fixture.router(StageList::prefill_decode().with_fallback(Fallback::Aggregated));
     let req = request("no-fallback");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
         matches!(
@@ -1366,7 +1366,7 @@ async fn a_schedule_deadline_caps_a_full_wait_only_when_configured() {
         .build()
         .unwrap();
     let req = request("deadline-1");
-    let mut plan = capped.plan(&req).unwrap();
+    let mut plan = capped.create_plan(&req).unwrap();
     let error = capped.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
         matches!(
@@ -1378,7 +1378,7 @@ async fn a_schedule_deadline_caps_a_full_wait_only_when_configured() {
     assert!(state(&plan, 0).is_pending());
 
     let uncapped = fixture.router(StageList::aggregated());
-    let mut plan = uncapped.plan(&req).unwrap();
+    let mut plan = uncapped.create_plan(&req).unwrap();
     let schedule = uncapped.schedule(&req, &mut plan);
     tokio::pin!(schedule);
     tokio::time::advance(Duration::from_secs(3600)).await;
@@ -1400,7 +1400,7 @@ async fn immediate_wait_books_both_or_nothing() {
 
     fixture.decode.set_admission_open(false);
     let req = request("both-2");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     assert!(router.schedule(&req, &mut plan).await.is_err());
     plan.abort();
     assert_eq!(fixture.outstanding(), 0, "nothing is held across the gap");
@@ -1431,7 +1431,7 @@ async fn fallback_to_agg_when_prefill_set_saturated() {
     list.stages[0].wait = Budget::Immediate;
     let router = fixture.router(list.with_fallback(Fallback::Aggregated));
     let req = request("fallback-1");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.expect("fell back");
     assert_eq!(plan.stage_count(), 1);
     assert_eq!(plan.stage(0).unwrap().set, WorkerType::Decode);
@@ -1541,8 +1541,8 @@ impl Router for SteerDecodeByPrefill {
         self.0.select(req).await
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
-        self.0.plan(req)
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        self.0.create_plan(req)
     }
 
     async fn schedule(
@@ -1575,7 +1575,7 @@ async fn a_custom_router_steers_a_later_stage_from_an_earlier_stages_record() {
         .push(Constraint::Pin(WorkerWithDpRank::new(11, 0)));
     let router = SteerDecodeByPrefill(fixture.router(list));
     let req = request("steer-1");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.worker(0).unwrap().worker_id, 11);
     assert!(
@@ -1607,7 +1607,7 @@ impl Router for NeverBooks {
         Err(SelectionError::NotReady("no preview".to_string()))
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         Ok(Plan::new(
             super::plan::PlanId::from(req.selection_id.clone().unwrap_or_default()),
             crate::identity::RoutingPartitionId::new(&req.model_name, &req.routing_group),
@@ -1634,7 +1634,7 @@ async fn a_set_router_that_finishes_without_booking_is_an_error() {
         .build()
         .unwrap();
     for req in [request("finish-3"), all_now(request("finish-4"))] {
-        let mut plan = router.plan(&req).unwrap();
+        let mut plan = router.create_plan(&req).unwrap();
         let error = router.schedule(&req, &mut plan).await.unwrap_err();
         assert!(
             matches!(&error, SelectionError::Internal(message) if message.contains("without booking stage 1")),
@@ -1663,7 +1663,7 @@ async fn fallback_keeps_the_decode_stages_exclusions() {
     list.stages[1].constraints.push(Constraint::Exclude(21));
     let router = fixture.router(list);
     let req = all_now(request("fallback-excluded"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.stage_count(), 1, "fell back to decode alone");
     assert_eq!(
@@ -1686,7 +1686,7 @@ async fn fallback_keeps_the_decode_stages_exclusions() {
     list.stages[1].constraints.push(Constraint::Exclude(22));
     let router = fixture.router(list);
     let req = all_now(request("fallback-exhausted"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     assert!(
         router.schedule(&req, &mut plan).await.is_err(),
         "no decode worker is left to fall back to"

@@ -136,7 +136,7 @@ async fn remote_decode_is_not_charged_for_the_prompt_but_a_bypass_decode_is() {
 
     // Remote prefill: the prompt is prefill's load, not decode's.
     let req = reserve_request("pd");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(state(&plan, 1), &StageState::Booked);
@@ -151,7 +151,7 @@ async fn remote_decode_is_not_charged_for_the_prompt_but_a_bypass_decode_is() {
 
     // Prefill skipped (a bypass): decode does the prefill and is charged.
     let req = reserve_request("bypass");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     plan.skip(0).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(
@@ -186,7 +186,7 @@ async fn a_decode_core_that_does_not_track_prefill_still_pays_for_a_bypass() {
         .unwrap();
 
     let req = reserve_request("remote");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     let remote = plan.worker(1).unwrap().worker_id;
     assert_eq!(prefill_tokens_of(&decode, remote), 0);
@@ -196,7 +196,7 @@ async fn a_decode_core_that_does_not_track_prefill_still_pays_for_a_bypass() {
     // The bypass: the decode core's role default says "no prefill here",
     // the stage's work says otherwise, and the stage's work wins.
     let req = reserve_request("bypass");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     plan.skip(0).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     let first = plan.worker(1).unwrap().worker_id;
@@ -249,7 +249,7 @@ async fn an_encoder_booking_holds_no_prompt_tokens_or_kv_blocks() {
         .build()
         .unwrap();
     let req = multimodal(reserve_request("encode"));
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(
@@ -290,7 +290,7 @@ async fn target_stage_pins_exclusions_and_topology_hold_through_real_admission()
 
     // Topology: decode in prefill's zone.
     let req = reserve_request("zone");
-    let mut plan = router(vec![same_zone_as(0)]).plan(&req).unwrap();
+    let mut plan = router(vec![same_zone_as(0)]).create_plan(&req).unwrap();
     router(vec![same_zone_as(0)])
         .schedule(&req, &mut plan)
         .await
@@ -301,7 +301,7 @@ async fn target_stage_pins_exclusions_and_topology_hold_through_real_admission()
     // A hard pin to the other zone's worker.
     let req = reserve_request("pin");
     let pinned = router(vec![Constraint::Pin(WorkerWithDpRank::new(22, 0))]);
-    let mut plan = pinned.plan(&req).unwrap();
+    let mut plan = pinned.create_plan(&req).unwrap();
     pinned.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.worker(1).unwrap().worker_id, 22);
     plan.abort();
@@ -310,7 +310,7 @@ async fn target_stage_pins_exclusions_and_topology_hold_through_real_admission()
     // error, not a silent placement elsewhere.
     let req = reserve_request("excluded");
     let excluded = router(vec![same_zone_as(0), Constraint::Exclude(21)]);
-    let mut plan = excluded.plan(&req).unwrap();
+    let mut plan = excluded.create_plan(&req).unwrap();
     let error = excluded.schedule(&req, &mut plan).await.unwrap_err();
     assert!(
         matches!(
@@ -362,7 +362,7 @@ async fn the_conditional_preview_places_decode_where_topology_allows() {
         .build()
         .unwrap();
     let req = reserve_request("zoned-bypass");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     run(&mut plan, 0);
     router.schedule(&req, &mut plan).await.unwrap();
@@ -440,7 +440,7 @@ policy_classes:
     for (id, class) in [("none", None), ("unknown", Some("no-such-class"))] {
         let mut req = reserve_request(id);
         req.policy_class = class.map(str::to_string);
-        let mut plan = router.plan(&req).unwrap();
+        let mut plan = router.create_plan(&req).unwrap();
         router.schedule(&req, &mut plan).await.unwrap();
         assert_eq!(plan.stage_count(), 2, "{id}: the default family's list");
         assert_eq!(prefill_tokens(&prefill), Some(4));
@@ -450,7 +450,7 @@ policy_classes:
     }
     let mut req = reserve_request("direct");
     req.policy_class = Some("direct".to_string());
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.stage_count(), 1, "the explicit class's own list");
     assert_eq!(prefill_tokens(&aggregated), Some(4));
@@ -537,7 +537,7 @@ async fn a_later_stage_sees_the_cached_prompt() {
         .unwrap();
     let mut req = reserve_request("real");
     req.prompt.token_ids = Some(tokens.clone());
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.worker(0).unwrap().worker_id, 1);
     assert_eq!(plan.worker(1).unwrap().worker_id, 2);
@@ -568,7 +568,7 @@ impl Router for UntrackedPrefill {
         Err(SelectionError::NotReady("no preview".to_string()))
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let mut stage = Stage::new(WorkerType::Prefill);
         stage.work = Some(crate::router::StageWork::None);
         Ok(Plan::new(
@@ -617,7 +617,7 @@ async fn decode_is_booked_after_an_untracked_prefill_selection() {
         .build()
         .unwrap();
     let req = reserve_request("gateway-untracked-prefill");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.worker(0).map(|w| w.worker_id), Some(99));
     assert!(plan.booking(0).is_none(), "prefill is untracked");
@@ -690,7 +690,7 @@ async fn a_previewed_pin_is_admitted_against_the_workers_current_state() {
         .build()
         .unwrap();
     let req = reserve_request("stale-preview");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     plan.constrain(1, Constraint::Previewed(WorkerWithDpRank::new(22, 0)))
         .unwrap();
     // The set is rebuilt under the same id: 22 is now in zone b.
@@ -776,8 +776,8 @@ impl Router for SteerFromPrefillAnswer {
         self.0.select(req).await
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
-        self.0.plan(req)
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+        self.0.create_plan(req)
     }
 
     async fn schedule(
@@ -823,7 +823,7 @@ async fn a_custom_router_steers_from_a_real_stages_scheduling_answer() {
             .unwrap(),
     );
     let req = reserve_request("steer-real");
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     router.schedule(&req, &mut plan).await.unwrap();
     let answer = plan.scheduling(0).expect("prefill's answer is on the plan");
     assert_eq!(answer.best_worker.worker_id, 11);
