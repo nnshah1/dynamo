@@ -14,7 +14,8 @@ use serde::Deserialize;
 use crate::WorkerType;
 use crate::scheduling::policy_config::{PolicyClassConfig, PolicyProfile};
 
-use super::plan::{Budget, Constraint, SkipRule, Stage, StageScoring, When};
+use super::plan::{Budget, Constraint, SetId, SkipRule, Stage, StageScoring, When};
+use crate::conditional_disagg::ConditionalDisaggParams;
 
 /// What a class does when its first stage is rejected for capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -96,7 +97,9 @@ impl StageList {
             "prefill_decode" => Self::prefill_decode(),
             "prefill_decode_deferred" => Self::prefill_decode_deferred(DEFAULT_DEFERRED_WAIT),
             "decode_first" => Self::decode_first(),
-            "conditional_prefill_decode" => Self::conditional_prefill_decode(),
+            "conditional_prefill_decode" => {
+                Self::conditional_prefill_decode(ConditionalDisaggParams::default())
+            }
             "encode_prefill_decode" => Self::encode_prefill_decode(),
             _ => return None,
         })
@@ -150,13 +153,14 @@ impl StageList {
     }
 
     /// `prefill_decode` whose prefill stage is skipped when the conditional
-    /// disaggregation policy says the previewed decode worker should do it.
+    /// disaggregation policy in `params` says the previewed decode worker
+    /// should do it.
     /// Decode keeps its cache credit either way: the policy previews the
     /// decode set's cache, and the worker it chose for a local prefill is
     /// the one with the prompt.
-    pub fn conditional_prefill_decode() -> Self {
+    pub fn conditional_prefill_decode(params: ConditionalDisaggParams) -> Self {
         let mut list = Self::prefill_decode();
-        list.stages[0].skip = Some(SkipRule::ConditionalDisagg);
+        list.stages[0].skip = Some(SkipRule::ConditionalDisagg(params));
         list.stages[1].scoring = Some(StageScoring::CacheAware);
         list
     }
@@ -208,8 +212,8 @@ impl StageList {
     }
 
     /// The worker sets this list books into.
-    pub fn sets(&self) -> impl Iterator<Item = WorkerType> + '_ {
-        self.stages.iter().map(|stage| stage.set)
+    pub fn sets(&self) -> impl Iterator<Item = &SetId> + '_ {
+        self.stages.iter().map(|stage| &stage.set)
     }
 }
 
@@ -371,7 +375,10 @@ mod tests {
             Some(StageScoring::LoadOnly)
         );
         assert_eq!(
-            plan(StageList::conditional_prefill_decode()).scoring_of(1),
+            plan(StageList::conditional_prefill_decode(
+                ConditionalDisaggParams::default()
+            ))
+            .scoring_of(1),
             Some(StageScoring::CacheAware)
         );
         assert_eq!(

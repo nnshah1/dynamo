@@ -25,8 +25,8 @@ use crate::services::selection::{
 };
 
 use super::booking::Booking;
-use super::plan::{Budget, Constraint, Plan, PlanId, Stage, WorkerConfig};
-use super::router_trait::Router;
+use super::plan::{Budget, Constraint, Plan, PlanId, SetId, Stage, WorkerConfig};
+use super::router_trait::{Router, RouterSignals};
 use crate::test_utils::SimpleWorkerConfig;
 
 /// Projected load and cache state a fake worker reports.
@@ -90,7 +90,7 @@ pub struct FakeThresholds {
 }
 
 pub struct FakeRouter {
-    set: WorkerType,
+    set: SetId,
     block_size: u32,
     thresholds: FakeThresholds,
     workers: Mutex<Vec<FakeWorker>>,
@@ -102,22 +102,15 @@ pub struct FakeRouter {
     /// stale by the time the booking is made.
     leaves_after_preview: Mutex<Option<WorkerId>>,
     can_select: bool,
-    /// The worker set this fake is, when a test routes more than one set of
-    /// its type.
-    pool: Option<String>,
 }
 
 impl FakeRouter {
-    pub fn new(set: WorkerType) -> Arc<Self> {
-        Self::new_in_pool(set, None)
-    }
-
-    /// A router that is the named worker set `pool` of `set`'s type.
-    pub fn new_in_pool(set: WorkerType, pool: Option<&str>) -> Arc<Self> {
+    /// A router for one worker set: a role, or a named set of a role when a
+    /// test routes more than one.
+    pub fn new(set: impl Into<SetId>) -> Arc<Self> {
         let (admission_open, _) = watch::channel(true);
         Arc::new(Self {
-            set,
-            pool: pool.map(str::to_string),
+            set: set.into(),
             block_size: 1,
             thresholds: FakeThresholds::default(),
             workers: Mutex::new(Vec::new()),
@@ -132,19 +125,10 @@ impl FakeRouter {
 
     /// A router over `set` with one single-rank worker per id.
     pub fn with_workers(
-        set: WorkerType,
+        set: impl Into<SetId>,
         worker_ids: impl IntoIterator<Item = WorkerId>,
     ) -> Arc<Self> {
-        Self::with_workers_in_pool(set, None, worker_ids)
-    }
-
-    /// `with_workers` for the named worker set `pool` of `set`'s type.
-    pub fn with_workers_in_pool(
-        set: WorkerType,
-        pool: Option<&str>,
-        worker_ids: impl IntoIterator<Item = WorkerId>,
-    ) -> Arc<Self> {
-        let router = Self::new_in_pool(set, pool);
+        let router = Self::new(set);
         for worker_id in worker_ids {
             router.add_worker(FakeWorker::new(worker_id));
         }
@@ -169,8 +153,8 @@ impl FakeRouter {
         Arc::new(router)
     }
 
-    pub fn set(&self) -> WorkerType {
-        self.set
+    pub fn set(&self) -> &SetId {
+        &self.set
     }
 
     pub fn add_worker(&self, worker: FakeWorker) {
@@ -344,6 +328,13 @@ impl FakeRouter {
 
 #[async_trait]
 impl Router for FakeRouter {
+    fn signals(&self) -> RouterSignals {
+        RouterSignals {
+            decode_busy: self.thresholds.decode_busy.is_some(),
+            prefill_busy: self.thresholds.prefill_busy.is_some(),
+        }
+    }
+
     async fn select(&self, req: SelectRequest) -> Result<SelectResponse, SelectionError> {
         if !self.can_select {
             return Err(SelectionError::BadRequest(format!(
@@ -378,10 +369,7 @@ impl Router for FakeRouter {
         Plan::new(
             PlanId::from(id),
             RoutingPartitionId::new(req.model_name.clone(), req.routing_group.clone()),
-            vec![Stage {
-                pool: self.pool.clone(),
-                ..Stage::new(self.set)
-            }],
+            vec![Stage::new(self.set.clone())],
         )
         .map_err(|error| SelectionError::BadRequest(error.to_string()))
     }
@@ -392,11 +380,9 @@ impl Router for FakeRouter {
         plan: &mut Plan,
     ) -> Result<(), SelectionError> {
         loop {
-            let next = plan.schedulable().find(|&k| {
-                plan.stage(k).is_some_and(|stage| {
-                    stage.set == self.set && stage.pool.as_deref() == self.pool.as_deref()
-                })
-            });
+            let next = plan
+                .schedulable()
+                .find(|&k| plan.stage(k).is_some_and(|stage| stage.set == self.set));
             let Some(k) = next else { break };
             let stage = plan.stage(k).cloned().expect("schedulable stage exists");
             self.wait_for_admission(stage.wait).await?;

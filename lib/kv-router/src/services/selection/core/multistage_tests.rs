@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::super::input::MmRoutingInfoRequest;
 use super::tests::{core_with, reserve_request, test_config, wait_until, worker};
 use super::*;
-use crate::conditional_disagg::{ConditionalDisaggDecisionInput, ConditionalDisaggPolicy};
+use crate::conditional_disagg::ConditionalDisaggParams;
 use crate::protocols::PotentialLoad;
 use crate::router::{
     ClassTable, Constraint, DomainMode, Failure, MultiStageRouter, Plan, Router, SkipRule, Stage,
@@ -89,18 +89,14 @@ fn multimodal(mut req: SelectAndReserveRequest) -> SelectAndReserveRequest {
     req
 }
 
-/// The conditional policy at its most permissive, so a test can watch where
-/// the bypass lands without staging a cache hit on a real core.
-struct AlwaysBypass;
-
-#[async_trait::async_trait]
-impl ConditionalDisaggPolicy for AlwaysBypass {
-    fn is_enabled(&self) -> bool {
-        true
-    }
-
-    async fn should_bypass_remote_prefill(&self, _input: ConditionalDisaggDecisionInput) -> bool {
-        true
+/// The conditional policy at its most permissive (every net-new length and
+/// ratio is under the thresholds), so a test can watch where the bypass
+/// lands without staging a cache hit on a real core.
+fn always_bypass() -> ConditionalDisaggParams {
+    ConditionalDisaggParams {
+        eff_isl_threshold: usize::MAX,
+        eff_isl_ratio_threshold: f64::INFINITY,
+        ..ConditionalDisaggParams::default()
     }
 }
 
@@ -344,7 +340,7 @@ async fn the_conditional_preview_places_decode_where_topology_allows() {
         Stage::new(WorkerType::Encode),
         Stage {
             when: When::After(0),
-            skip: Some(SkipRule::ConditionalDisagg),
+            skip: Some(SkipRule::ConditionalDisagg(always_bypass())),
             ..Stage::new(WorkerType::Prefill)
         },
         Stage {
@@ -358,7 +354,6 @@ async fn the_conditional_preview_places_decode_where_topology_allows() {
         .set(WorkerType::Prefill, prefill.clone())
         .set(WorkerType::Decode, decode.clone())
         .classes(ClassTable::new(list))
-        .conditional_disagg(Arc::new(AlwaysBypass), false)
         .build()
         .unwrap();
     let req = reserve_request("zoned-bypass");

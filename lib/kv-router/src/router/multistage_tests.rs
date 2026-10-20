@@ -10,9 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::WorkerType;
-use crate::conditional_disagg::{
-    ConditionalDisaggPolicy, IslBoundingPolicy, PrefillLoadPolicy, make_conditional_disagg_policy,
-};
+use crate::conditional_disagg::ConditionalDisaggParams;
+use crate::config::ConditionalDisaggPolicyKind;
 use crate::protocols::{KvTransferEnforcement, RoutingConstraints, WorkerWithDpRank};
 use crate::scheduling::KvSchedulerError;
 use crate::scheduling::policy_config::RouterPolicyConfig;
@@ -27,7 +26,7 @@ use super::fake::{FakeEvent, FakeRouter, FakeSignals, FakeThresholds, FakeWorker
 use super::multistage::{MultiStageRouter, RouterLimits};
 use super::placement::topology_taint;
 use super::plan::{
-    Budget, Constraint, DomainMode, Failure, Plan, PlanError, SkipRule, Stage, StageAttempt,
+    Budget, Constraint, DomainMode, Failure, Plan, PlanError, SetId, SkipRule, Stage, StageAttempt,
     StageState, StageWork, When,
 };
 use super::router_trait::Router;
@@ -109,12 +108,22 @@ fn cached(cached_tokens: usize, potential_decode_blocks: u64) -> FakeSignals {
 /// progressive conditional flow.
 fn conditional_deferred() -> StageList {
     let mut list = StageList::prefill_decode_deferred(Duration::from_secs(2));
-    list.stages[0].skip = Some(SkipRule::ConditionalDisagg);
+    list.stages[0].skip = Some(SkipRule::ConditionalDisagg(isl_params()));
     list
 }
 
-fn isl_policy(enabled: bool) -> Arc<dyn ConditionalDisaggPolicy> {
-    Arc::new(IslBoundingPolicy::new(enabled, 2048, 0.7))
+/// The ISL-bounding policy at the frontend's defaults: 2048 net-new tokens, 0.7.
+fn isl_params() -> ConditionalDisaggParams {
+    ConditionalDisaggParams {
+        policy: ConditionalDisaggPolicyKind::IslBounding,
+        eff_isl_threshold: 2048,
+        eff_isl_ratio_threshold: 0.7,
+    }
+}
+
+/// `conditional_prefill_decode` at the frontend's default parameters.
+fn conditional_list() -> StageList {
+    StageList::conditional_prefill_decode(isl_params())
 }
 
 struct Fixture {
@@ -168,27 +177,6 @@ impl Fixture {
     fn router(&self, list: StageList) -> MultiStageRouter {
         self.builder()
             .classes(ClassTable::new(list))
-            .build()
-            .expect("valid router")
-    }
-
-    fn conditional(
-        &self,
-        list: StageList,
-        policy: Arc<dyn ConditionalDisaggPolicy>,
-    ) -> MultiStageRouter {
-        self.conditional_gated(list, policy, false)
-    }
-
-    fn conditional_gated(
-        &self,
-        list: StageList,
-        policy: Arc<dyn ConditionalDisaggPolicy>,
-        has_decode_gate: bool,
-    ) -> MultiStageRouter {
-        self.builder()
-            .classes(ClassTable::new(list))
-            .conditional_disagg(policy, has_decode_gate)
             .build()
             .expect("valid router")
     }
@@ -290,7 +278,9 @@ async fn plan_all_selects_every_stage_before_execution() {
     let router = fixture.router(StageList::prefill_decode_deferred(Duration::from_secs(2)));
     let plan = booked(&router, &all_now(request("plan-1"))).await;
     assert_eq!(
-        plan.stages().map(|stage| stage.set).collect::<Vec<_>>(),
+        plan.stages()
+            .map(|stage| stage.set.role)
+            .collect::<Vec<_>>(),
         vec![WorkerType::Prefill, WorkerType::Decode]
     );
     assert_eq!(plan.stage(1).unwrap().inputs, vec![0]);
@@ -340,7 +330,7 @@ async fn conditional_disagg_bypasses_to_the_previewed_decode_worker() {
     let fixture = Fixture::new();
     fixture.decode.set_signals(22, cached(15, 1));
     fixture.decode.set_signals(21, cached(0, 5));
-    let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
+    let router = fixture.router(conditional_list());
     let plan = booked(&router, &request("cond-1")).await;
     assert_eq!(state(&plan, 0), &StageState::Skipped);
     assert_eq!(plan.worker(1).unwrap().worker_id, 22);
@@ -362,13 +352,13 @@ async fn conditional_bypass_survives_placement_rules() {
     let fixture = Fixture::new();
     fixture.decode.remove_worker(21);
     fixture.decode.set_signals(22, cached(16, 0));
-    let mut list = StageList::conditional_prefill_decode();
+    let mut list = conditional_list();
     list.stages[1].constraints.push(Constraint::SameDomain {
         stage: 0,
         key: "zone".to_string(),
         mode: DomainMode::Required,
     });
-    let router = fixture.conditional(list, isl_policy(true));
+    let router = fixture.router(list);
     let plan = booked(&router, &request("cond-7")).await;
     assert_eq!(state(&plan, 0), &StageState::Skipped);
     assert_eq!(
@@ -385,7 +375,7 @@ async fn conditional_bypass_survives_placement_rules() {
 #[tokio::test]
 async fn conditional_disagg_takes_remote_prefill_when_the_policy_declines() {
     let fixture = Fixture::new();
-    let router = fixture.conditional(conditional_deferred(), isl_policy(true));
+    let router = fixture.router(conditional_deferred());
     let req = request("cond-2");
     let mut plan = booked(&router, &req).await;
     assert_eq!(state(&plan, 0), &StageState::Booked);
@@ -404,11 +394,7 @@ async fn conditional_disagg_decode_gate_vetoes_a_busy_decode_worker() {
     let fixture = Fixture::new().with_decode_gate(0.9);
     fixture.decode.remove_worker(21);
     fixture.decode.set_signals(22, cached(15, 95));
-    let router = fixture.conditional_gated(
-        StageList::conditional_prefill_decode(),
-        isl_policy(true),
-        true,
-    );
+    let router = fixture.router(conditional_list());
     let plan = booked(&router, &request("cond-3")).await;
     assert_eq!(
         state(&plan, 0),
@@ -431,11 +417,11 @@ async fn conditional_disagg_decode_gate_vetoes_a_busy_decode_worker() {
 async fn conditional_disagg_skips_the_decision_for_a_pinned_prefill_worker() {
     let fixture = Fixture::new();
     fixture.decode.set_signals(22, cached(16, 0));
-    let mut list = StageList::conditional_prefill_decode();
+    let mut list = conditional_list();
     list.stages[0]
         .constraints
         .push(Constraint::Pin(WorkerWithDpRank::new(12, 0)));
-    let router = fixture.conditional(list, isl_policy(true));
+    let router = fixture.router(list);
     let plan = booked(&router, &request("cond-4")).await;
     assert_eq!(plan.worker(0).unwrap().worker_id, 12);
     assert_eq!(
@@ -445,10 +431,12 @@ async fn conditional_disagg_skips_the_decision_for_a_pinned_prefill_worker() {
     );
 }
 
+/// Conditional disaggregation disabled is a stage list without the skip
+/// rule: plain prefill/decode, no decode preview.
 #[tokio::test]
 async fn conditional_disagg_disabled_goes_straight_to_remote_prefill() {
     let fixture = Fixture::new();
-    let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(false));
+    let router = fixture.router(StageList::prefill_decode());
     let plan = booked(&router, &all_now(request("cond-5"))).await;
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(state(&plan, 1), &StageState::Booked);
@@ -471,10 +459,12 @@ async fn conditional_disagg_consults_prefill_load_when_the_policy_needs_it() {
             ..FakeSignals::default()
         },
     );
-    let router = fixture.conditional(
-        StageList::conditional_prefill_decode(),
-        Arc::new(PrefillLoadPolicy::new(true)),
-    );
+    let router = fixture.router(StageList::conditional_prefill_decode(
+        ConditionalDisaggParams {
+            policy: ConditionalDisaggPolicyKind::PrefillLoad,
+            ..isl_params()
+        },
+    ));
     let plan = booked(&router, &request("cond-6")).await;
     assert_eq!(
         state(&plan, 0),
@@ -800,7 +790,7 @@ async fn stale_pool_generation_between_preview_and_admission_is_rejected() {
     fixture.decode.leaves_after_preview(22);
     // There is no pool generation here: the previewed worker is pinned and
     // has gone by the time it is booked, so the pinned booking fails.
-    let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
+    let router = fixture.router(conditional_list());
     let req = request("stale-1");
     let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
@@ -982,7 +972,7 @@ async fn unbound_topology_stages_are_rejected_at_construction() {
 async fn preview_is_refused_for_a_stage_without_preview_support() {
     let mut fixture = Fixture::new();
     fixture.decode = FakeRouter::without_select(WorkerType::Decode, [21, 22]);
-    let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
+    let router = fixture.router(conditional_list());
     let req = request("enc-1");
     let mut plan = router.create_plan(&req).unwrap();
     let error = router.schedule(&req, &mut plan).await.unwrap_err();
@@ -1013,16 +1003,7 @@ policy_classes:
     .unwrap();
     let profile = config.resolve_profile(None, None, Default::default());
     let classes = ClassTable::from_profile(&profile, StageList::aggregated()).unwrap();
-    let policy = make_conditional_disagg_policy(Some(&crate::config::KvRouterConfig {
-        conditional_disagg_enabled: true,
-        ..Default::default()
-    }));
-    let router = fixture
-        .builder()
-        .classes(classes)
-        .conditional_disagg(Arc::from(policy), false)
-        .build()
-        .unwrap();
+    let router = fixture.builder().classes(classes).build().unwrap();
 
     // The request names the routing family; the scheduler resolves the
     // physical class (`cond`) by cached-token bucket for queue settings.
@@ -1071,11 +1052,11 @@ async fn the_conditional_preview_respects_the_decode_stages_own_constraints() {
     let fixture = Fixture::new();
     fixture.decode.set_signals(21, cached(16, 0));
     fixture.decode.set_signals(22, cached(16, 5));
-    let mut list = StageList::conditional_prefill_decode();
+    let mut list = conditional_list();
     list.stages[1]
         .constraints
         .push(Constraint::Pin(WorkerWithDpRank::new(22, 0)));
-    let router = fixture.conditional(list, isl_policy(true));
+    let router = fixture.router(list);
     let plan = booked(&router, &request("pinned-decode")).await;
     assert_eq!(state(&plan, 0), &StageState::Skipped);
     assert_eq!(
@@ -1087,9 +1068,9 @@ async fn the_conditional_preview_respects_the_decode_stages_own_constraints() {
     // An excluded worker can be previewed but never booked: keep remote prefill.
     let fixture = Fixture::new();
     fixture.decode.set_signals(21, cached(16, 0));
-    let mut list = StageList::conditional_prefill_decode();
+    let mut list = conditional_list();
     list.stages[1].constraints.push(Constraint::Exclude(21));
-    let router = fixture.conditional(list, isl_policy(true));
+    let router = fixture.router(list);
     let plan = booked(&router, &request("excluded-decode")).await;
     assert_eq!(state(&plan, 0), &StageState::Booked);
     assert_eq!(plan.worker(1).unwrap().worker_id, 22);
@@ -1234,7 +1215,7 @@ fn zoned_encode_conditional_decode() -> StageList {
         Stage::new(WorkerType::Encode),
         Stage {
             when: When::After(0),
-            skip: Some(SkipRule::ConditionalDisagg),
+            skip: Some(SkipRule::ConditionalDisagg(isl_params())),
             ..Stage::new(WorkerType::Prefill)
         },
         Stage {
@@ -1257,7 +1238,7 @@ async fn the_conditional_preview_honours_the_decode_stages_topology_rules() {
     let fixture = Fixture::new().zoned();
     fixture.decode.set_signals(21, cached(16, 0));
     fixture.decode.set_signals(22, cached(16, 0));
-    let router = fixture.conditional(zoned_encode_conditional_decode(), isl_policy(true));
+    let router = fixture.router(zoned_encode_conditional_decode());
     let req = request("zoned-bypass");
     let mut plan = booked(&router, &req).await;
     assert_eq!(plan.worker(0).unwrap().worker_id, 31);
@@ -1282,7 +1263,7 @@ async fn the_conditional_preview_honours_the_decode_stages_topology_rules() {
     fixture.decode.set_signals(22, cached(16, 0));
     let mut list = zoned_encode_conditional_decode();
     list.stages[1].when = When::Now;
-    let router = fixture.conditional(list, isl_policy(true));
+    let router = fixture.router(list);
     let plan = booked(&router, &request("unresolved")).await;
     assert_eq!(
         state(&plan, 1),
@@ -1297,7 +1278,7 @@ async fn a_bypassed_decode_can_be_retried_elsewhere() {
     let fixture = Fixture::new();
     fixture.decode.set_signals(22, cached(16, 0));
     fixture.decode.set_signals(21, cached(0, 5));
-    let router = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
+    let router = fixture.router(conditional_list());
     let req = request("bypass-retry");
     let mut plan = booked(&router, &req).await;
     assert_eq!(
@@ -1325,29 +1306,33 @@ async fn a_bypassed_decode_can_be_retried_elsewhere() {
     );
 }
 
+/// The decode-busy gate is the decode set's own: its router reports one
+/// through `signals()`. With a gate, a worker whose capacity is unknown
+/// cannot clear it; without one, the same signal is simply not read.
 #[tokio::test]
 async fn an_unknown_decode_signal_denies_the_bypass_only_when_a_gate_is_configured() {
-    let fixture = Fixture::new();
-    fixture.decode.set_signals(
-        22,
-        FakeSignals {
-            total_kv_blocks: None,
-            ..cached(16, 0)
-        },
-    );
-    fixture.decode.set_signals(21, cached(0, 5));
-    let gated = fixture.conditional_gated(
-        StageList::conditional_prefill_decode(),
-        isl_policy(true),
-        true,
-    );
+    let unknown_capacity = |fixture: &Fixture| {
+        fixture.decode.set_signals(
+            22,
+            FakeSignals {
+                total_kv_blocks: None,
+                ..cached(16, 0)
+            },
+        );
+        fixture.decode.set_signals(21, cached(0, 5));
+    };
+    let fixture = Fixture::new().with_decode_gate(0.9);
+    unknown_capacity(&fixture);
+    let gated = fixture.router(conditional_list());
     let plan = booked(&gated, &request("gate-1")).await;
     assert_eq!(
         state(&plan, 0),
         &StageState::Booked,
         "unknown capacity: no bypass"
     );
-    let ungated = fixture.conditional(StageList::conditional_prefill_decode(), isl_policy(true));
+    let fixture = Fixture::new();
+    unknown_capacity(&fixture);
+    let ungated = fixture.router(conditional_list());
     let plan = booked(&ungated, &request("gate-2")).await;
     assert_eq!(state(&plan, 0), &StageState::Skipped);
 }
@@ -1455,17 +1440,17 @@ async fn all_now_books_every_stage_in_one_call() {
 
 /// Two decode worker sets, as a rolling update has them: the unnamed set
 /// and a named one. A class steers its decode stage to the named set by
-/// pool; the two sets book, account and release independently, and a stage
-/// list naming a pool no router was given for is rejected at build time.
+/// name; the two sets book, account and release independently, and a stage
+/// list naming a set no router was given for is rejected at build time.
 #[tokio::test]
-async fn two_decode_pools_are_booked_independently_by_name() {
+async fn two_decode_sets_are_booked_independently_by_name() {
     let fixture = Fixture::new();
-    let canary = FakeRouter::with_workers_in_pool(WorkerType::Decode, Some("canary"), [23, 24]);
+    let canary = FakeRouter::with_workers((WorkerType::Decode, "canary"), [23, 24]);
     let mut canary_list = StageList::prefill_decode();
-    canary_list.stages[1].pool = Some("canary".to_string());
+    canary_list.stages[1].set = SetId::named(WorkerType::Decode, "canary");
     let router = fixture
         .builder()
-        .pool(WorkerType::Decode, "canary", canary.clone())
+        .set((WorkerType::Decode, "canary"), canary.clone())
         .classes(ClassTable::new(StageList::prefill_decode()).with_class("canary", canary_list))
         .build()
         .expect("valid router");
@@ -1515,17 +1500,22 @@ async fn two_decode_pools_are_booked_independently_by_name() {
     assert_eq!(fixture.outstanding(), 0);
 
     let mut unknown = StageList::prefill_decode();
-    unknown.stages[1].pool = Some("blue".to_string());
+    unknown.stages[1].set = SetId::named(WorkerType::Decode, "blue");
     let error = fixture
         .builder()
         .classes(ClassTable::new(unknown))
         .build()
         .err()
-        .expect("a pool with no router is rejected");
-    assert!(error.to_string().contains("pool \"blue\""), "{error}");
+        .expect("a set with no router is rejected");
+    assert!(error.to_string().contains("decode/blue"), "{error}");
     let parsed: StageList =
-        serde_yaml::from_str("[prefill, { set: decode, pool: canary, inputs: [0] }]").unwrap();
-    assert_eq!(parsed.stages[1].pool.as_deref(), Some("canary"));
+        serde_yaml::from_str("[prefill, { set: decode/canary, inputs: [0] }]").unwrap();
+    assert_eq!(
+        parsed.stages[1].set,
+        SetId::named(WorkerType::Decode, "canary")
+    );
+    let parsed: StageList = serde_yaml::from_str("[prefill, decode/canary]").unwrap();
+    assert_eq!(parsed.stages[1].set.name.as_deref(), Some("canary"));
 }
 
 /// A custom `Router` composed over the built-in one that steers a later
