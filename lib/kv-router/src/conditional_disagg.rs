@@ -9,6 +9,8 @@
 
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{ConditionalDisaggPolicyKind, KvRouterConfig};
 
 /// Default effective-ISL absolute threshold (tokens). A request bypasses to
@@ -98,6 +100,62 @@ pub fn make_conditional_disagg_policy(
             Box::new(PrefillLoadPolicy::from_config(config))
         }
         ConditionalDisaggPolicyKind::IslOrLoad => Box::new(IslOrLoadPolicy::from_config(config)),
+    }
+}
+
+/// The parameters of a conditional-disaggregation decision, carried by the
+/// stage whose skip rule makes it. Presence means enabled; the policy built
+/// from them is always on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalDisaggParams {
+    #[serde(default)]
+    pub policy: ConditionalDisaggPolicyKind,
+    #[serde(default = "ConditionalDisaggParams::default_eff_isl_threshold")]
+    pub eff_isl_threshold: usize,
+    #[serde(default = "ConditionalDisaggParams::default_eff_isl_ratio_threshold")]
+    pub eff_isl_ratio_threshold: f64,
+}
+
+impl Default for ConditionalDisaggParams {
+    fn default() -> Self {
+        Self {
+            policy: ConditionalDisaggPolicyKind::default(),
+            eff_isl_threshold: DEFAULT_CONDITIONAL_DISAGG_EFF_ISL_THRESHOLD,
+            eff_isl_ratio_threshold: DEFAULT_CONDITIONAL_DISAGG_EFF_ISL_RATIO_THRESHOLD,
+        }
+    }
+}
+
+impl ConditionalDisaggParams {
+    const fn default_eff_isl_threshold() -> usize {
+        DEFAULT_CONDITIONAL_DISAGG_EFF_ISL_THRESHOLD
+    }
+
+    const fn default_eff_isl_ratio_threshold() -> f64 {
+        DEFAULT_CONDITIONAL_DISAGG_EFF_ISL_RATIO_THRESHOLD
+    }
+
+    /// The configured parameters, or `None` when conditional disaggregation
+    /// is not enabled.
+    pub fn from_config(config: &KvRouterConfig) -> Option<Self> {
+        config.conditional_disagg_enabled.then_some(Self {
+            policy: config.conditional_disagg_policy,
+            eff_isl_threshold: config.conditional_disagg_eff_isl_threshold,
+            eff_isl_ratio_threshold: config.conditional_disagg_eff_isl_ratio_threshold,
+        })
+    }
+
+    /// The policy these parameters describe, enabled.
+    pub fn policy(&self) -> Box<dyn ConditionalDisaggPolicy> {
+        let isl =
+            IslBoundingPolicy::new(true, self.eff_isl_threshold, self.eff_isl_ratio_threshold);
+        match self.policy {
+            ConditionalDisaggPolicyKind::IslBounding => Box::new(isl),
+            ConditionalDisaggPolicyKind::PrefillLoad => Box::new(PrefillLoadPolicy::new(true)),
+            ConditionalDisaggPolicyKind::IslOrLoad => {
+                Box::new(IslOrLoadPolicy::new(isl, PrefillLoadPolicy::new(true)))
+            }
+        }
     }
 }
 
