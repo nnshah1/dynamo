@@ -216,7 +216,7 @@ impl PlanRouter for PrefillReservationRouter {
         ))
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let mut stage = Stage::new(WorkerType::Prefill);
         stage.work = Some(StageWork::None);
         Plan::new(
@@ -986,7 +986,7 @@ impl Router {
             route.policy_class,
             decode_router.is_eagle(),
         );
-        let mut plan = router.plan(&req).map_err(routing_failed)?;
+        let mut plan = router.create_plan(&req).map_err(routing_failed)?;
         if let Err(error) = router.schedule(&req, &mut plan).await {
             // Booked stages stay with the host on an error: the prefill
             // router frees its reservation, the plan the booking it owns.
