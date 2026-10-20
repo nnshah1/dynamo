@@ -38,7 +38,7 @@ mod interface {
     /// set; a multistage router implements it for one model by composing
     /// cores.
     ///
-    /// The host owns the plan. `plan` builds it, `schedule` books into it,
+    /// The host owns the plan. `create_plan` builds it, `schedule` books into it,
     /// and an error leaves it with the host, booked stages intact, so the
     /// host decides between `abort`, a retry, or a fallback.
     #[async_trait]
@@ -48,7 +48,7 @@ mod interface {
 
         /// The plan for `req`, every stage pending. A one-set router's plan
         /// is one stage, today's `select_and_reserve`.
-        fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError>;
+        fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError>;
 
         /// Book every stage of the plan that can be booked now: pending
         /// stages whose `when` is satisfied and whose constraints have a
