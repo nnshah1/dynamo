@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use super::super::types::resolve_session_context;
 use super::run::session_binding;
 use super::*;
-use crate::router::{Booking, Budget, Constraint, Plan, PlanId, Router, Stage, WorkerConfig};
+use crate::router::{
+    Booking, Budget, Constraint, Plan, PlanId, Router, RouterSignals, Stage, WorkerConfig,
+};
 
 #[async_trait]
 impl Router for SelectionCore {
@@ -22,13 +24,25 @@ impl Router for SelectionCore {
         SelectionCore::select(self, req).await
     }
 
+    fn signals(&self) -> RouterSignals {
+        RouterSignals {
+            decode_busy: self
+                .kv_router_config
+                .conditional_disagg_decode_busy_threshold
+                .is_some(),
+            prefill_busy: self
+                .kv_router_config
+                .conditional_disagg_prefill_busy_threshold
+                .is_some(),
+        }
+    }
+
     fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let id = req
             .selection_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let mut stage = Stage::new(self.worker_type);
-        stage.pool = self.pool().map(str::to_string);
+        let mut stage = Stage::new(self.set_id());
         if req.all_now {
             stage.wait = Budget::Immediate;
         }
@@ -51,14 +65,12 @@ impl Router for SelectionCore {
         }
         let session_context =
             resolve_session_context(req.session_context.clone(), req.session_id.clone());
+        let set = self.set_id();
         loop {
-            // This core's stages: its worker type, and its pool when the
-            // host routes more than one set of that type.
-            let next = plan.schedulable().find(|&k| {
-                plan.stage(k).is_some_and(|stage| {
-                    stage.set == self.worker_type && stage.pool.as_deref() == self.pool()
-                })
-            });
+            // This core's stages: the ones that name its set.
+            let next = plan
+                .schedulable()
+                .find(|&k| plan.stage(k).is_some_and(|stage| stage.set == set));
             let Some(k) = next else { break };
             self.book_stage(req, plan, k, session_context.as_ref())
                 .await?;
@@ -980,27 +992,24 @@ mod tests {
         core.free_reservation("held").await.unwrap();
     }
 
-    /// A core named as one worker set of its type books only the stages
-    /// that name that pool; the other decode set's stage is left for its
-    /// own core, and the core's one-stage plan names its pool.
+    /// A core named as one worker set of its role books only the stages
+    /// that name that set; the other set's stage is left for its own core,
+    /// and the core's one-stage plan names its set.
     #[tokio::test]
-    async fn a_pooled_core_books_only_its_own_pools_stages() {
+    async fn a_named_core_books_only_its_own_sets_stages() {
         let core = local_core(test_config(false));
-        core.set_pool("canary").unwrap();
-        assert!(core.set_pool("main").is_err(), "a core is one pool");
+        core.name_set("canary").unwrap();
+        assert!(core.name_set("main").is_err(), "a core is one set");
         core.upsert_worker(worker(1)).await.expect("worker upsert");
         let req = reserve_request("pooled");
         let own = Router::create_plan(&core, &req).unwrap();
-        assert_eq!(own.stage(0).unwrap().pool.as_deref(), Some("canary"));
+        assert_eq!(own.stage(0).unwrap().set.name.as_deref(), Some("canary"));
 
         let mut plan = Plan::new(
             PlanId::from("pooled"),
             default_key(),
             vec![
-                Stage {
-                    pool: Some("canary".to_string()),
-                    ..Stage::new(WorkerType::Aggregated)
-                },
+                Stage::new((WorkerType::Aggregated, "canary")),
                 Stage::new(WorkerType::Aggregated),
             ],
         )
