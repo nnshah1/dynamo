@@ -330,7 +330,7 @@ impl PlannedFlow<'_> {
             let mut guard = shared.lock().await;
             let (routing, slot) = &mut *guard;
             let mut plan = multistage
-                .plan(routing)
+                .create_plan(routing)
                 .map_err(|error| self.routing_error(frontend_error(error)))?;
             self.pin_caller_targets(&mut plan)?;
             self.exclude_migration_failures(routing, &mut plan)?;
@@ -1593,7 +1593,7 @@ mod tests {
             self.inner.select(req).await
         }
 
-        fn plan(
+        fn create_plan(
             &self,
             req: &dynamo_kv_router::services::selection::SelectAndReserveRequest,
         ) -> Result<Plan, dynamo_kv_router::services::selection::SelectionError> {
@@ -1612,7 +1612,7 @@ mod tests {
                     )
                 })
             } else {
-                self.inner.plan(req)
+                self.inner.create_plan(req)
             }
         }
 
@@ -1737,7 +1737,7 @@ mod tests {
             .classes(ClassTable::new(StageList::prefill_decode()))
             .build()
             .unwrap();
-        let mut plan = router.plan(&req).unwrap();
+        let mut plan = router.create_plan(&req).unwrap();
         let result = router.schedule(&req, &mut plan).await;
         assert!(
             matches!(result, Err(SelectionError::Conflict(_))),
@@ -2257,7 +2257,7 @@ mod tests {
         let context = Context::new(request());
         let core = f.decode.chooser.plan_router();
         let req = routing_request(&context, &f.decode.chooser.partition(), None, false);
-        let mut held = core.plan(&req).unwrap();
+        let mut held = core.create_plan(&req).unwrap();
         core.schedule(&req, &mut held).await.unwrap();
 
         let chooser = Arc::clone(&f.decode.chooser);
@@ -2845,7 +2845,7 @@ mod tests {
         // In flight on the retiring worker.
         let before = Context::new(request());
         let before_req = routing_request(&before, &partition, None, false);
-        let mut in_flight = router.plan(&before_req).unwrap();
+        let mut in_flight = router.create_plan(&before_req).unwrap();
         router.schedule(&before_req, &mut in_flight).await.unwrap();
         assert_eq!(in_flight.worker(0).unwrap().worker_id, retiring);
 
@@ -2874,7 +2874,7 @@ mod tests {
         // A new plan is refused: the retired instance is not a placement.
         let after = Context::new(request());
         let after_req = routing_request(&after, &partition, None, false);
-        let mut fresh = router.plan(&after_req).unwrap();
+        let mut fresh = router.create_plan(&after_req).unwrap();
         let error = router.schedule(&after_req, &mut fresh).await.unwrap_err();
         assert!(
             matches!(error, SelectionError::NotReady(_)),

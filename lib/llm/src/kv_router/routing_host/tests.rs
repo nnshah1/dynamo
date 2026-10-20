@@ -4542,7 +4542,7 @@ async fn the_set_router_books_a_stage_the_host_dispatches_from_the_plan() {
     let router = host.kv_router().plan_router();
     let request = Context::new(request());
     let req = routing_request(&request, &host.kv_router().partition(), None, false);
-    let mut plan = router.plan(&req).unwrap();
+    let mut plan = router.create_plan(&req).unwrap();
     assert_eq!(plan.stage_count(), 1);
     router.schedule(&req, &mut plan).await.unwrap();
     assert_eq!(plan.state_of(0), Some(&StageState::Booked));
