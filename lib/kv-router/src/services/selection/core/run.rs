@@ -104,6 +104,7 @@ impl SelectionCore {
                 track_active_blocks: true,
                 return_routing_hashes: false,
                 replay_id: req.selection_id.clone(),
+                hold_budget: None,
             })
             .await?;
         Ok(self.select_response(selected, endpoint, req.selection_id))
@@ -148,6 +149,7 @@ impl SelectionCore {
                 track_active_blocks: true,
                 return_routing_hashes: false,
                 replay_id: None,
+                hold_budget: None,
             })
             .await?;
         Ok(self.select_response(selected, endpoint, Some(selection_id)))
@@ -197,6 +199,7 @@ impl SelectionCore {
             routing_hashes: _,
             shared_cache_hits: _,
             booking: _,
+            booking_descriptor: _,
         } = selected;
         let booked = sequence_hashes.is_some();
         let potential_decode_blocks = response.potential_decode_blocks as u64;
@@ -272,6 +275,7 @@ impl SelectionCore {
             track_active_blocks,
             return_routing_hashes,
             replay_id,
+            hold_budget,
         } = operation;
         self.ensure_running()?;
 
@@ -289,9 +293,9 @@ impl SelectionCore {
         let table = entry.affinity.get();
         let mut affinity_hold = None;
         let managed_session = match (&session, table) {
-            (SessionBinding::Managed { .. }, _) if claim.is_none() => {
+            (SessionBinding::Managed { .. }, _) if !book => {
                 return Err(SelectionError::Internal(
-                    "a managed session binding requires Book admission".to_string(),
+                    "a managed session binding requires a booking admission".to_string(),
                 ));
             }
             (SessionBinding::Managed { session_id }, Some(table)) => Some((table, session_id)),
@@ -429,6 +433,7 @@ impl SelectionCore {
             allowed_worker_ids,
             routing_constraints,
             shared_cache_hits,
+            hold_budget,
         };
         // `booking` guards the booking until it is installed below: any early
         // return or drop before then frees it.
@@ -506,6 +511,7 @@ impl SelectionCore {
         // The routing hashes go to exactly one of: the reservation recorded
         // now, or the replay cache a later reservation records from.
         let mut routing_hashes = routing_hashes;
+        let mut booking_descriptor = None;
         let booking = if let Some(claim) = claim {
             let Some(booking) = booking else {
                 return Err(SelectionError::Internal(
@@ -524,10 +530,23 @@ impl SelectionCore {
                 self.record_routing_decision(&entry, response.best_worker, hashes)
                     .await;
             }
+            booking_descriptor = Some(booking.descriptor().clone());
             claim.install(booking, affinity_lease)?;
             None
         } else {
-            booking
+            // `Lease`: the host owns the booking, so the session lease rides
+            // with the handle and is released with it.
+            match (booking, affinity_hold, managed_session) {
+                (Some(mut handle), Some(hold), Some((table, session_id))) => {
+                    if let Some(lease) =
+                        self.commit_session(table, hold, session_id, response.best_worker, &key)?
+                    {
+                        handle.attach(Box::new(lease));
+                    }
+                    Some(handle)
+                }
+                (booking, _, _) => booking,
+            }
         };
 
         if let Some((cache_id, sequence_hashes, lora_name, track_prefill_tokens, session_id)) =
@@ -565,6 +584,7 @@ impl SelectionCore {
             routing_hashes: returned_routing_hashes,
             shared_cache_hits: host_shared_cache_hits,
             booking,
+            booking_descriptor,
         }))
     }
 
@@ -807,7 +827,7 @@ impl SelectionCore {
 
 /// The core's use of the session table for a request: a session is steered
 /// only when the caller did not pin or target a worker explicitly.
-fn session_binding(
+pub(super) fn session_binding(
     context: Option<&SessionContext>,
     is_steerable: bool,
     is_booking: bool,

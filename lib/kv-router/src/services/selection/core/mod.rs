@@ -6,9 +6,9 @@
 //! in `run`, reservations in `reservations`, worker membership in `workers`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dynamo_tokens::SequenceHash;
@@ -29,6 +29,7 @@ use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, SharedCacheHits, WorkerAffinityTarget, WorkerConfigLike,
     WorkerId, WorkerWithDpRank,
 };
+use crate::router::SetId;
 use crate::scheduling::queue::SchedulerBookingDescriptor;
 use crate::scheduling::selector::WorkerSelectionPolicy;
 use crate::scheduling::{
@@ -55,6 +56,7 @@ mod hint;
 mod operation;
 mod queries;
 mod reservations;
+mod router;
 mod run;
 #[cfg(test)]
 mod tests;
@@ -279,6 +281,10 @@ pub struct SelectionCore {
     worker_selection_policy_factory: WorkerSelectionPolicyFactory,
     host: SelectionHost,
     worker_type: WorkerType,
+    /// The name of the worker set this core is, when the host routes more
+    /// than one set of its role: as a `Router` it books only the plan stages
+    /// that name this set. Unset, it is the role's one unnamed set.
+    set_name: OnceLock<String>,
     cancel_token: CancellationToken,
     replica_config: Option<ReplicaSyncConfig>,
     /// Booking inputs captured by `select`, keyed by `selection_id`, so a later
@@ -357,6 +363,26 @@ impl SelectionCore {
         self.entry(key).map(SelectionPartition)
     }
 
+    /// Name the worker set this core is, once, before it serves plans. A
+    /// host that routes several sets of one role gives each core its set
+    /// name; a stage then books into the core whose set it names.
+    pub fn name_set(&self, name: impl Into<String>) -> Result<(), String> {
+        self.set_name.set(name.into()).map_err(|name| {
+            format!(
+                "the core is already set {:?}, not {name:?}",
+                self.set_name.get()
+            )
+        })
+    }
+
+    /// The worker set this core is: its role, and its name when it has one.
+    pub fn set_id(&self) -> SetId {
+        SetId {
+            role: self.worker_type,
+            name: self.set_name.get().cloned(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_inner(
         kv_router_config: crate::config::KvRouterConfig,
@@ -394,6 +420,7 @@ impl SelectionCore {
             worker_selection_policy_factory,
             host,
             worker_type,
+            set_name: OnceLock::new(),
             cancel_token,
             replica_config,
             selection_cache: SelectionCache::new(&cache_config),

@@ -17,8 +17,8 @@ use super::overlap_refresh::{NoopOverlapScoresRefresh, OverlapScoresRefresh};
 use super::policy_config::PolicyProfile;
 use super::prefill_load::PrefillLoadEstimator;
 use super::queue::{
-    BookingHandle, ClassQueueStats, SchedulerBookingCleanup, SchedulerBookingDescriptor,
-    SchedulerQueue,
+    AdmissionTiming, BookingHandle, ClassQueueStats, SchedulerBookingCleanup,
+    SchedulerBookingDescriptor, SchedulerQueue,
 };
 use super::request_classifier::{RequestClassifierRuntime, RequestLifecycle};
 use super::selector::WorkerSelector;
@@ -101,6 +101,7 @@ where
             kv_transfer_candidates,
             retain_kv_transfer_chain,
             shared_cache_hits,
+            hold_budget: _,
         } = request;
         let request = SchedulingRequest {
             mode,
@@ -341,6 +342,7 @@ where
     ) -> Result<(AdmittedSchedulingResponse, Option<BookingHandle>), KvSchedulerError> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel();
+        let hold_budget = request.hold_budget;
         let (request, block_hashes) = self.make_scheduling_request(request, Some(resp_tx));
         let tracked = request.mode.is_tracked();
         let classified_request = self.classify_request(&request, ingress_at).await?;
@@ -356,7 +358,10 @@ where
                 lifecycle_lease,
                 tracked.then_some(attempt_tx),
                 classified_request,
-                ingress_at,
+                AdmissionTiming {
+                    ingress_at,
+                    hold_budget,
+                },
             )
             .await;
 
@@ -586,6 +591,7 @@ where
             pinned_worker,
             allowed_worker_ids,
             shared_cache_hits,
+            hold_budget: None,
         })
         .await
     }
@@ -1098,6 +1104,7 @@ mod tests {
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
             shared_cache_hits: None,
+            hold_budget: None,
         }
     }
 

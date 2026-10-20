@@ -41,6 +41,7 @@ pub struct SelectionServiceBuilder {
     worker_selection_policy_factory: Option<WorkerSelectionPolicyFactory>,
     session_affinity_ttl: Option<Duration>,
     host_manages_request_lifecycle: bool,
+    set_name: Option<String>,
 }
 
 /// Warn when a host does not construct workers for explicitly configured policy roles.
@@ -82,7 +83,15 @@ impl SelectionServiceBuilder {
             worker_selection_policy_factory: None,
             session_affinity_ttl: None,
             host_manages_request_lifecycle: false,
+            set_name: None,
         }
+    }
+
+    /// Name the worker set this service's core is, for a host that routes
+    /// more than one set of the same role.
+    pub fn set_name(mut self, name: impl Into<String>) -> Self {
+        self.set_name = Some(name.into());
+        self
     }
 
     /// Use `factory` for every partition's worker-selection policy instead of
@@ -199,6 +208,9 @@ impl SelectionServiceBuilder {
             indexer_policy,
             self.session_affinity_ttl.map(SessionAffinityConfig::new),
         ));
+        if let Some(name) = self.set_name {
+            core.name_set(name).map_err(anyhow::Error::msg)?;
+        }
 
         if recover_from_peers {
             match core.recover_indexer_from_peers(&self.indexer_peers).await {

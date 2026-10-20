@@ -38,6 +38,8 @@ fn reserve_request(selection_id: &str) -> SelectAndReserveRequest {
         pinned_worker: None,
         allowed_worker_ids: None,
         routing_constraints: RoutingConstraints::default(),
+        policy_class: None,
+        all_now: false,
     }
 }
 

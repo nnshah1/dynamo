@@ -41,7 +41,12 @@ impl QueueSnapshot {
 pub(crate) struct QueueMetadata {
     pub(crate) class_index: usize,
     pub(crate) snapshot: QueueSnapshot,
+    /// The request's deadline: rejected on arrival if already past, orders
+    /// the class earliest-due-first, swept if still queued when it passes.
     pub(crate) due_at: Option<Instant>,
+    /// Swept if still queued when it passes. Does not order the class and is
+    /// never in the past here: the actor handles a spent hold itself.
+    pub(crate) hold_until: Option<Instant>,
     pub(crate) arrival_offset_secs: f64,
 }
 
@@ -112,23 +117,34 @@ fn cmp_queue_order(
         .then_with(|| rhs_enqueue_seq.cmp(&lhs_enqueue_seq))
 }
 
-// `uncached_tokens` is derived, so drop it from queued entries: with the
-// deadline key in `QueuePriority` the header would otherwise cross 64 bytes,
-// and the policy_queue drain benchmarks (near-empty payloads, header-bound
-// heap sifts) regress 50-150% when an entry spans two cache lines.
+// `uncached_tokens` is derived, so drop it from queued entries, and token
+// counts are `u32` here: with the deadline key in `QueuePriority` and the
+// expiry key beside it the header would otherwise cross 64 bytes, and the
+// policy_queue drain benchmarks (near-empty payloads, header-bound heap
+// sifts) regress 50-150% when an entry spans two cache lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QueueEntrySnapshot {
-    raw_isl_tokens: usize,
-    cached_tokens: usize,
-    scheduling_cost_tokens: usize,
+    raw_isl_tokens: u32,
+    cached_tokens: u32,
+    scheduling_cost_tokens: u32,
+}
+
+impl QueueEntrySnapshot {
+    fn scheduling_cost_tokens(&self) -> usize {
+        self.scheduling_cost_tokens as usize
+    }
+}
+
+fn narrow(tokens: usize) -> u32 {
+    u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
 impl From<QueueSnapshot> for QueueEntrySnapshot {
     fn from(snapshot: QueueSnapshot) -> Self {
         Self {
-            raw_isl_tokens: snapshot.raw_isl_tokens,
-            cached_tokens: snapshot.cached_tokens,
-            scheduling_cost_tokens: snapshot.scheduling_cost_tokens,
+            raw_isl_tokens: narrow(snapshot.raw_isl_tokens),
+            cached_tokens: narrow(snapshot.cached_tokens),
+            scheduling_cost_tokens: narrow(snapshot.scheduling_cost_tokens),
         }
     }
 }
@@ -138,13 +154,13 @@ impl From<QueueEntrySnapshot> for QueueSnapshot {
         // `QueueSnapshot::new` clamps cached <= raw and floors the scheduling
         // cost; both already held when the entry was built, so this round-trip
         // only re-derives the dropped field.
+        let raw_isl_tokens = snapshot.raw_isl_tokens as usize;
+        let cached_tokens = snapshot.cached_tokens as usize;
         Self {
-            raw_isl_tokens: snapshot.raw_isl_tokens,
-            cached_tokens: snapshot.cached_tokens,
-            uncached_tokens: snapshot
-                .raw_isl_tokens
-                .saturating_sub(snapshot.cached_tokens),
-            scheduling_cost_tokens: snapshot.scheduling_cost_tokens,
+            raw_isl_tokens,
+            cached_tokens,
+            uncached_tokens: raw_isl_tokens.saturating_sub(cached_tokens),
+            scheduling_cost_tokens: snapshot.scheduling_cost_tokens(),
         }
     }
 }
@@ -152,6 +168,9 @@ impl From<QueueEntrySnapshot> for QueueSnapshot {
 pub struct PolicyQueueEntry<T> {
     class_index: usize,
     priority: QueuePriority,
+    /// When the entry is swept if still queued: the earlier of its deadline
+    /// and its hold budget. Only the deadline orders it.
+    expiry_key: u64,
     enqueue_seq: u64,
     snapshot: QueueEntrySnapshot,
     payload: T,
@@ -166,8 +185,8 @@ impl<T> PolicyQueueEntry<T> {
         self.snapshot.into()
     }
 
-    fn due_time_key(&self) -> Option<u64> {
-        (self.priority.due_time_key != NO_DUE_TIME).then_some(self.priority.due_time_key)
+    fn expiry_key(&self) -> Option<u64> {
+        (self.expiry_key != NO_DUE_TIME).then_some(self.expiry_key)
     }
 
     pub fn payload(&self) -> &T {
@@ -314,7 +333,7 @@ impl<T> PolicyClassQueue<T> {
                 .filter(|entry| is_dispatchable(class_index, &self.config, entry.payload()))
                 .map(|entry| DispatchCandidate {
                     placement: WorkerPlacement::Any,
-                    cost: entry.snapshot.scheduling_cost_tokens,
+                    cost: entry.snapshot.scheduling_cost_tokens(),
                 });
         }
 
@@ -360,7 +379,7 @@ impl<T> PolicyClassQueue<T> {
                 (
                     entry.priority,
                     entry.enqueue_seq,
-                    entry.snapshot.scheduling_cost_tokens,
+                    entry.snapshot.scheduling_cost_tokens(),
                 )
             });
 
@@ -396,7 +415,7 @@ impl<T> PolicyClassQueue<T> {
                 .peek()
                 .expect("indexed worker lane is empty")
                 .snapshot
-                .scheduling_cost_tokens;
+                .scheduling_cost_tokens();
             return match shared {
                 Some((priority, enqueue_seq, cost))
                     if cmp_queue_order(priority, enqueue_seq, head.priority, head.enqueue_seq)
@@ -603,6 +622,7 @@ impl<T> PolicyQueue<T> {
                 class_index,
                 snapshot,
                 due_at: None,
+                hold_until: None,
                 arrival_offset_secs,
             },
             worker_count,
@@ -626,17 +646,24 @@ impl<T> PolicyQueue<T> {
             class_index,
             snapshot,
             due_at,
+            hold_until,
             arrival_offset_secs,
         } = metadata;
-        if due_at.is_some() && self.due_entries.is_empty() {
+        let expires_at = match (due_at, hold_until) {
+            (Some(due_at), Some(hold_until)) => Some(due_at.min(hold_until)),
+            (due_at, hold_until) => due_at.or(hold_until),
+        };
+        if expires_at.is_some() && self.due_entries.is_empty() {
             self.deadline_origin = Instant::now();
         }
-        let due_time_key = due_at.map_or(NO_DUE_TIME, |due_at| {
-            due_at
-                .saturating_duration_since(self.deadline_origin)
+        let origin = self.deadline_origin;
+        let key = |at: Instant| {
+            at.saturating_duration_since(origin)
                 .as_nanos()
                 .min((NO_DUE_TIME - 1) as u128) as u64
-        });
+        };
+        let due_time_key = due_at.map_or(NO_DUE_TIME, key);
+        let expiry_key = expires_at.map_or(NO_DUE_TIME, key);
         let class = &mut self.classes[class_index];
         if let Some(rejection) = queue_rejection(class, worker_count) {
             return Err((rejection, payload));
@@ -649,13 +676,13 @@ impl<T> PolicyQueue<T> {
             priority_jump,
             strict_priority,
             due_time_key,
+            expiry_key,
             class.config.queue_policy,
             self.next_enqueue_seq,
             payload,
         );
-        if due_time_key != NO_DUE_TIME {
-            self.due_entries
-                .insert((due_time_key, self.next_enqueue_seq));
+        if expiry_key != NO_DUE_TIME {
+            self.due_entries.insert((expiry_key, self.next_enqueue_seq));
         }
         self.next_enqueue_seq = self.next_enqueue_seq.wrapping_add(1);
         add_stats(&mut class.stats, snapshot);
@@ -887,7 +914,7 @@ impl<T> PolicyQueue<T> {
         let entry = class.pop_lane(candidate.placement);
         class.deficit = class
             .deficit
-            .saturating_sub(entry.snapshot.scheduling_cost_tokens);
+            .saturating_sub(entry.snapshot.scheduling_cost_tokens());
         subtract_stats(&mut class.stats, entry.snapshot());
         self.pending_count -= 1;
         remove_due_time(&mut self.due_entries, &entry);
@@ -901,8 +928,8 @@ impl<T> PolicyQueue<T> {
 }
 
 fn remove_due_time<T>(due_entries: &mut BTreeSet<(u64, u64)>, entry: &PolicyQueueEntry<T>) {
-    if let Some(due_time_key) = entry.due_time_key() {
-        let removed = due_entries.remove(&(due_time_key, entry.enqueue_seq));
+    if let Some(expiry_key) = entry.expiry_key() {
+        let removed = due_entries.remove(&(expiry_key, entry.enqueue_seq));
         debug_assert!(removed);
     }
 }
@@ -915,6 +942,7 @@ fn make_entry<T>(
     priority_jump: f64,
     strict_priority: u32,
     due_time_key: u64,
+    expiry_key: u64,
     queue_policy: RouterQueuePolicy,
     enqueue_seq: u64,
     payload: T,
@@ -928,6 +956,7 @@ fn make_entry<T>(
             due_time_key,
             policy_score: OrderedFloat(policy_score),
         },
+        expiry_key,
         enqueue_seq,
         snapshot: snapshot.into(),
         payload,
@@ -1103,6 +1132,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(now + std::time::Duration::from_secs(20)),
+                    hold_until: None,
                     arrival_offset_secs: 0.0,
                 },
                 1,
@@ -1118,6 +1148,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(now + std::time::Duration::from_secs(10)),
+                    hold_until: None,
                     arrival_offset_secs: 1.0,
                 },
                 1,
@@ -1159,6 +1190,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(due_at + std::time::Duration::from_nanos(1)),
+                    hold_until: None,
                     arrival_offset_secs: 0.0,
                 },
                 1,
@@ -1174,6 +1206,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(due_at),
+                    hold_until: None,
                     arrival_offset_secs: 1.0,
                 },
                 1,
@@ -1212,6 +1245,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(due_at),
+                    hold_until: None,
                     arrival_offset_secs: 1.0,
                 },
                 2,
@@ -1240,6 +1274,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(due_at),
+                    hold_until: None,
                     arrival_offset_secs: 0.0,
                 },
                 1,
@@ -1278,6 +1313,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(now + std::time::Duration::from_secs(20)),
+                    hold_until: None,
                     arrival_offset_secs: 0.0,
                 },
                 1,
@@ -1293,6 +1329,7 @@ policy_classes:
                     class_index: 0,
                     snapshot: QueueSnapshot::new(1, 0),
                     due_at: Some(now + std::time::Duration::from_secs(10)),
+                    hold_until: None,
                     arrival_offset_secs: 1.0,
                 },
                 1,
