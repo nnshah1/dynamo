@@ -38,7 +38,7 @@ pub use scheduling::selector;
 pub use sequences::multi_worker as multi_worker_sequence;
 pub use sequences::single as sequence;
 
-#[cfg(any(test, feature = "bench"))]
+#[cfg(any(test, feature = "bench", feature = "testing"))]
 pub mod test_utils;
 
 // Re-export key types for convenience
