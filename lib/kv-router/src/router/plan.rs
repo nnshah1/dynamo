@@ -14,10 +14,14 @@
 //! - A failed stage takes every booked stage that reads it back to `Pending`,
 //!   transitively.
 
+use std::fmt;
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::WorkerType;
+use crate::conditional_disagg::ConditionalDisaggParams;
 use crate::identity::RoutingPartitionId;
+use crate::worker_type::ParseWorkerTypeError;
 use std::sync::Arc;
 
 use crate::kv_hints::KvHint;
@@ -196,13 +200,78 @@ impl StageScoring {
     }
 }
 
-/// When the router skips a stage instead of booking it.
-#[derive(Debug, Clone, PartialEq)]
+/// When the router skips a stage instead of booking it. A rule carries its
+/// own parameters; anything else it reads (a decode-busy gate) comes from
+/// the set router it previews.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SkipRule {
     /// No multimodal input (an encode stage).
     NoMultimodal,
-    /// The conditional-disaggregation policy and decode-busy gate.
-    ConditionalDisagg,
+    /// Skip remote prefill when the conditional-disaggregation policy, run
+    /// against a preview of the decode set, says the decode worker should
+    /// do the prefill itself.
+    ConditionalDisagg(ConditionalDisaggParams),
+}
+
+/// A worker set: a role, plus a name when a deployment routes more than one
+/// set of that role (a rolling update's new generation, a canary, a second
+/// hardware pool). The bare role is the one unnamed set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SetId {
+    pub role: WorkerType,
+    pub name: Option<String>,
+}
+
+impl SetId {
+    pub fn new(role: WorkerType) -> Self {
+        Self { role, name: None }
+    }
+
+    pub fn named(role: WorkerType, name: impl Into<String>) -> Self {
+        Self {
+            role,
+            name: Some(name.into()),
+        }
+    }
+}
+
+impl From<WorkerType> for SetId {
+    fn from(role: WorkerType) -> Self {
+        Self::new(role)
+    }
+}
+
+impl<S: Into<String>> From<(WorkerType, S)> for SetId {
+    fn from((role, name): (WorkerType, S)) -> Self {
+        Self::named(role, name)
+    }
+}
+
+impl PartialEq<WorkerType> for SetId {
+    fn eq(&self, role: &WorkerType) -> bool {
+        self.role == *role && self.name.is_none()
+    }
+}
+
+/// `decode`, or `decode/canary` for a named set.
+impl fmt::Display for SetId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{}/{name}", self.role),
+            None => write!(f, "{}", self.role),
+        }
+    }
+}
+
+impl FromStr for SetId {
+    type Err = ParseWorkerTypeError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.split_once('/') {
+            Some((role, name)) if !name.is_empty() => Ok(Self::named(role.parse()?, name)),
+            _ => Ok(Self::new(text.parse()?)),
+        }
+    }
 }
 
 /// The booked worker's configuration as its host knows it, captured at
@@ -269,11 +338,8 @@ impl StageState {
 /// placement rules. Pure configuration; the plan keeps the state beside it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage {
-    pub set: WorkerType,
-    /// The worker set this stage books into when more than one set of this
-    /// type is routed (a rolling update's new generation, a canary, a second
-    /// hardware pool). `None` is the one unnamed set of the type.
-    pub pool: Option<String>,
+    /// The worker set this stage books into.
+    pub set: SetId,
     pub when: When,
     /// Stages whose outcome this one needs before it is forwarded.
     pub inputs: Vec<usize>,
@@ -293,10 +359,9 @@ pub struct Stage {
 }
 
 impl Stage {
-    pub fn new(set: WorkerType) -> Self {
+    pub fn new(set: impl Into<SetId>) -> Self {
         Self {
-            set,
-            pool: None,
+            set: set.into(),
             when: When::Now,
             inputs: Vec::new(),
             wait: Budget::Full,
@@ -588,13 +653,13 @@ impl Plan {
         if let Some(work) = slot.stage.work {
             return Some(work);
         }
-        Some(match slot.stage.set {
+        Some(match slot.stage.set.role {
             WorkerType::Aggregated => StageWork::PrefillAndDecode,
             WorkerType::Prefill => StageWork::PrefillOnly,
             WorkerType::Encode => StageWork::None,
             WorkerType::Decode => {
                 let remote_prefill = slot.stage.reads().any(|j| {
-                    self.slots[j].stage.set == WorkerType::Prefill
+                    self.slots[j].stage.set.role == WorkerType::Prefill
                         && self.slots[j].state != StageState::Skipped
                 });
                 if remote_prefill {

@@ -18,12 +18,12 @@ mod plan_tests;
 
 pub use booking::Booking;
 pub use plan::{
-    Budget, Constraint, DomainMode, Failure, Plan, PlanError, PlanId, PlanState, Retry, SkipRule,
-    Stage, StageAttempt, StageScoring, StageState, StageWork, When, WorkerConfig,
+    Budget, Constraint, DomainMode, Failure, Plan, PlanError, PlanId, PlanState, Retry, SetId,
+    SkipRule, Stage, StageAttempt, StageScoring, StageState, StageWork, When, WorkerConfig,
 };
 
 #[cfg(feature = "standalone-selection")]
-pub use interface::Router;
+pub use interface::{Router, RouterSignals};
 
 #[cfg(feature = "standalone-selection")]
 mod interface {
@@ -33,6 +33,17 @@ mod interface {
     use crate::services::selection::{
         SelectAndReserveRequest, SelectRequest, SelectResponse, SelectionError,
     };
+
+    /// Which load signals a router's `select` responses carry. A rule that
+    /// reads one needs this to tell a missing signal from a disabled gate.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RouterSignals {
+        /// `SelectResponse::decode_busy` is evaluated (a decode-busy
+        /// threshold is configured on this set).
+        pub decode_busy: bool,
+        /// `SelectionWorkerLoad::prefill_busy` is evaluated.
+        pub prefill_busy: bool,
+    }
 
     /// The router interface. `SelectionCore` implements it for one worker
     /// set; a multistage router implements it for one model by composing
@@ -45,6 +56,11 @@ mod interface {
     pub trait Router: Send + Sync {
         /// An advisory pick: no booking, no KV hint.
         async fn select(&self, req: SelectRequest) -> Result<SelectResponse, SelectionError>;
+
+        /// The load signals this router's responses carry; none by default.
+        fn signals(&self) -> RouterSignals {
+            RouterSignals::default()
+        }
 
         /// The plan for `req`, every stage pending. A one-set router's plan
         /// is one stage, today's `select_and_reserve`.

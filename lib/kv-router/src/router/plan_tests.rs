@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::booking::Booking;
 use super::plan::{
-    Budget, Constraint, Failure, Plan, PlanError, PlanId, PlanState, Retry, SkipRule, Stage,
+    Budget, Constraint, Failure, Plan, PlanError, PlanId, PlanState, Retry, SetId, SkipRule, Stage,
     StageAttempt, StageScoring, StageState, StageWork, When, WorkerConfig,
 };
 use crate::WorkerType;
@@ -1164,20 +1164,23 @@ fn scoring_follows_the_work_unless_the_stage_says_otherwise() {
 }
 
 /// A stage names the worker set it books into only when there is more than
-/// one of its type; the plain constructor is the unnamed set.
+/// one of its role; the plain constructor is the unnamed set.
 #[test]
-fn a_stage_may_name_its_pool() {
+fn a_stage_may_name_its_set() {
     let unnamed = Stage::new(WorkerType::Decode);
-    assert_eq!(unnamed.pool, None);
-    let canary = Stage {
-        pool: Some("canary".to_string()),
-        ..Stage::new(WorkerType::Decode)
-    };
-    assert_eq!(canary.set, WorkerType::Decode);
-    assert_eq!(canary.pool.as_deref(), Some("canary"));
+    assert_eq!(unnamed.set, SetId::new(WorkerType::Decode));
+    assert_eq!(unnamed.set, WorkerType::Decode);
+    let canary = Stage::new((WorkerType::Decode, "canary"));
+    assert_eq!(canary.set.role, WorkerType::Decode);
+    assert_eq!(canary.set.name.as_deref(), Some("canary"));
+    assert_ne!(canary.set, WorkerType::Decode);
+    assert_eq!(canary.set.to_string(), "decode/canary");
+    assert_eq!("decode/canary".parse::<SetId>().unwrap(), canary.set);
+    assert_eq!("decode".parse::<SetId>().unwrap(), unnamed.set);
+    assert!("wibble/canary".parse::<SetId>().is_err());
     let p = plan(vec![unnamed, canary]);
     assert_eq!(
-        p.stage(1).and_then(|stage| stage.pool.as_deref()),
+        p.stage(1).and_then(|stage| stage.set.name.as_deref()),
         Some("canary")
     );
 }
