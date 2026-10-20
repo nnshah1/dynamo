@@ -22,7 +22,7 @@ impl Router for SelectionCore {
         SelectionCore::select(self, req).await
     }
 
-    fn plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
+    fn create_plan(&self, req: &SelectAndReserveRequest) -> Result<Plan, SelectionError> {
         let id = req
             .selection_id
             .clone()
@@ -337,7 +337,7 @@ mod tests {
         let entry = core.entry(&default_key()).expect("entry");
 
         let req = reserve_request("sel-1");
-        let mut plan = Router::plan(&core, &req).expect("plan");
+        let mut plan = Router::create_plan(&core, &req).expect("plan");
         assert_eq!(plan.stage_count(), 1);
         Router::schedule(&core, &req, &mut plan)
             .await
@@ -374,7 +374,7 @@ mod tests {
         let entry = core.entry(&default_key()).expect("entry");
 
         let req = reserve_request("sel-2");
-        let mut plan = Router::plan(&core, &req).unwrap();
+        let mut plan = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut plan)
             .await
             .expect("schedule");
@@ -421,7 +421,7 @@ mod tests {
         let entry = core.entry(&default_key()).expect("entry");
 
         let first = reserve_request("first");
-        let mut held = Router::plan(core, &first).unwrap();
+        let mut held = Router::create_plan(core, &first).unwrap();
         Router::schedule(core, &first, &mut held)
             .await
             .expect("first booking");
@@ -462,7 +462,7 @@ mod tests {
         let core: &SelectionCore = &core;
         core.upsert_worker(worker(1)).await.expect("worker upsert");
         let first = reserve_request("first");
-        let mut held = Router::plan(core, &first).unwrap();
+        let mut held = Router::create_plan(core, &first).unwrap();
         Router::schedule(core, &first, &mut held).await.unwrap();
 
         let mut bounded = Plan::new(
@@ -632,7 +632,7 @@ mod tests {
 
         let mut first = reserve_request("s-1");
         first.session_id = Some("session".to_string());
-        let mut plan = Router::plan(&core, &first).unwrap();
+        let mut plan = Router::create_plan(&core, &first).unwrap();
         Router::schedule(&core, &first, &mut plan)
             .await
             .expect("a session-bearing request books on the Lease path");
@@ -643,7 +643,7 @@ mod tests {
         // The second request of the session lands on the bound worker.
         let mut second = reserve_request("s-2");
         second.session_id = Some("session".to_string());
-        let mut plan = Router::plan(&core, &second).unwrap();
+        let mut plan = Router::create_plan(&core, &second).unwrap();
         Router::schedule(&core, &second, &mut plan).await.unwrap();
         assert_eq!(plan.worker(0), Some(bound));
         plan.abort();
@@ -658,7 +658,7 @@ mod tests {
 
         let mut req = reserve_request("s-1");
         req.session_id = Some("session".to_string());
-        let mut plan = Router::plan(&core, &req).unwrap();
+        let mut plan = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut plan).await.unwrap();
         let bound = plan.worker(0).unwrap();
         // Cancelled mid-flight: aborting the plan releases the booking and
@@ -669,7 +669,7 @@ mod tests {
         core.delete_worker(bound.worker_id).await.unwrap();
         let mut req = reserve_request("s-2");
         req.session_id = Some("session".to_string());
-        let mut plan = Router::plan(&core, &req).unwrap();
+        let mut plan = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut plan)
             .await
             .expect("a departed binding is re-initialised, not an error");
@@ -684,12 +684,12 @@ mod tests {
         core.upsert_worker(worker(1)).await.unwrap();
         let entry = core.entry(&default_key()).expect("entry");
         let first = reserve_request("held");
-        let mut held = Router::plan(core, &first).unwrap();
+        let mut held = Router::create_plan(core, &first).unwrap();
         Router::schedule(core, &first, &mut held).await.unwrap();
 
         let mut req = reserve_request("now");
         req.all_now = true;
-        let mut plan = Router::plan(core, &req).unwrap();
+        let mut plan = Router::create_plan(core, &req).unwrap();
         assert_eq!(plan.stage(0).unwrap().wait, Budget::Immediate);
         let error = Router::schedule(core, &req, &mut plan)
             .await
@@ -712,7 +712,7 @@ mod tests {
         let entry = core.entry(&default_key()).expect("entry");
         let mut req = reserve_request("exported");
         req.export_bookings = true;
-        let mut plan = core.plan(&req).unwrap();
+        let mut plan = core.create_plan(&req).unwrap();
         core.schedule(&req, &mut plan).await.unwrap();
         let booking = plan.booking(0).expect("booked");
         assert_eq!(
@@ -736,7 +736,7 @@ mod tests {
 
         // A leased booking is not indexed.
         let req = reserve_request("leased");
-        let mut plan = core.plan(&req).unwrap();
+        let mut plan = core.create_plan(&req).unwrap();
         core.schedule(&req, &mut plan).await.unwrap();
         assert!(plan.booking(0).unwrap().is_owned());
         assert!(core.free_reservation("leased").await.is_err());
@@ -832,7 +832,7 @@ mod tests {
             track_prefill_tokens: Some(false),
             ..Default::default()
         });
-        let mut plan = Router::plan(&core, &req).unwrap();
+        let mut plan = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut plan).await.unwrap();
         let load = core.loads(Some("model"), Some("default"))[0].loads[0].potential_prefill_tokens;
         assert_eq!(
@@ -866,7 +866,7 @@ mod tests {
 
         let mut other = reserve_request("elsewhere");
         other.routing_group = "other".to_string();
-        let mut plan = Router::plan(&core, &reserve_request("here")).unwrap();
+        let mut plan = Router::create_plan(&core, &reserve_request("here")).unwrap();
         assert!(matches!(
             Router::schedule(&core, &other, &mut plan).await,
             Err(SelectionError::BadRequest(_))
@@ -882,7 +882,7 @@ mod tests {
         let mut req = reserve_request("hinted");
         req.prompt.token_ids = Some(tokens.clone());
         req.pinned_worker = Some(WorkerWithDpRank::new(2, 0));
-        let mut plan = Router::plan(&core, &req).unwrap();
+        let mut plan = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut plan).await.unwrap();
         let hint = plan
             .kv_hint(0)
@@ -896,7 +896,7 @@ mod tests {
         let mut req = reserve_request("unhinted");
         req.prompt.token_ids = Some(tokens);
         req.pinned_worker = Some(WorkerWithDpRank::new(1, 0));
-        let mut other = Router::plan(&core, &req).unwrap();
+        let mut other = Router::create_plan(&core, &req).unwrap();
         Router::schedule(&core, &req, &mut other).await.unwrap();
         assert!(other.kv_hint(0).is_none());
         plan.release().await.unwrap();
@@ -990,7 +990,7 @@ mod tests {
         assert!(core.set_pool("main").is_err(), "a core is one pool");
         core.upsert_worker(worker(1)).await.expect("worker upsert");
         let req = reserve_request("pooled");
-        let own = Router::plan(&core, &req).unwrap();
+        let own = Router::create_plan(&core, &req).unwrap();
         assert_eq!(own.stage(0).unwrap().pool.as_deref(), Some("canary"));
 
         let mut plan = Plan::new(
