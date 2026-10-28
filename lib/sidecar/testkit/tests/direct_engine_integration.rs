@@ -14,10 +14,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynamo_backend_common::direct::DirectEngines;
 use dynamo_backend_common::{
-    BackendError, DisaggregationMode, ErrorType, FinishReason, LLMEngine, PreprocessedRequest,
+    BackendError, DisaggregationMode, DynamoError, ErrorType, FinishReason, LLMEngine,
+    PreprocessedRequest,
 };
-use dynamo_direct_engine::DirectEngines;
+
 use dynamo_runtime::error::match_error_chain;
 use dynamo_runtime::pipeline::{AsyncEngine, Context, PushRouter, RouterMode};
 use dynamo_sidecar_testkit::{
@@ -27,13 +29,14 @@ use dynamo_sidecar_testkit::{
     fixtures,
 };
 
+#[allow(dead_code)]
 #[path = "support/process.rs"]
 mod process;
 #[allow(dead_code)]
 mod support;
 
 use process::{Environment, outputs};
-use support::{FixtureConfig, SidecarFixture, WireFixture, vllm};
+use support::{FixtureConfig, ProcessFixture, SidecarFixture, WireFixture, vllm};
 
 /// One stock engine as the frontend sees it: its mock gRPC server, the
 /// controller that scripts and observes it, and the worker id discovery gave it.
@@ -65,7 +68,9 @@ async fn add_engine(env: &Environment, direct: &DirectEngines) -> Engine {
 }
 
 fn request(env: &Environment, id: &str) -> (Context<PreprocessedRequest>, PreprocessedRequest) {
-    let request = fixtures::request(&env.model, vec![11, 22, 33, 44], 3);
+    let mut request = fixtures::request(&env.model, vec![11, 22, 33, 44], 3);
+    // The same sampling and logprob fields the request-plane scenarios pin on the wire.
+    <vllm::Fixture as ProcessFixture>::configure_request(&mut request);
     (
         Context::with_id_and_metadata(request.clone(), id.to_string(), Default::default()),
         request,
@@ -135,7 +140,11 @@ async fn direct_request_reaches_the_selected_engine_over_grpc() {
             .unwrap();
         let result = outputs(stream).await;
 
-        assert_eq!(handle.tokens().len(), 3, "the mock engine generated the request");
+        assert_eq!(
+            handle.tokens().len(),
+            3,
+            "the mock engine generated the request"
+        );
         vllm::Fixture::assert_stream(&handle, &expected, &result);
         terminal(result, &handle.tokens(), 4, FinishReason::Length);
         released(&handle).await;
@@ -174,9 +183,10 @@ async fn lost_direct_engine_is_a_transport_fault_and_leaves_the_avail_set() {
 
         // Round robin visits both workers within two requests. The one that
         // lands on the dead engine must fail the way the request plane fails:
-        // a top-level transport `ErrorType`, so `PushRouter`'s fault detection
-        // reports the worker down. The sidecar engine's own
-        // `Backend(CannotConnect)` would not be recognised.
+        // the outermost error is a top-level transport `ErrorType`, so
+        // `PushRouter`'s fault detection reports the worker down. The sidecar
+        // engine's own `Backend(CannotConnect)` stays underneath as the cause;
+        // on its own it would not be recognised.
         let mut fault = None;
         for attempt in 0..2 {
             let id = format!("direct-fault-{attempt}");
@@ -189,23 +199,43 @@ async fn lost_direct_engine_is_a_transport_fault_and_leaves_the_avail_set() {
                     released(&handle).await;
                 }
                 Err(error) => {
+                    let outer = error
+                        .downcast_ref::<DynamoError>()
+                        .unwrap_or_else(|| panic!("typed transport fault expected: {error:#}"))
+                        .error_type();
+                    assert!(
+                        matches!(
+                            outer,
+                            ErrorType::CannotConnect
+                                | ErrorType::Disconnected
+                                | ErrorType::ConnectionTimeout
+                        ),
+                        "lost engine must surface as a top-level transport fault, got {outer:?}: {error:#}"
+                    );
+                    // The engine client's own report stays underneath as the
+                    // cause. Which one depends on timing: a refused connect, or a
+                    // stream cancelled by the connection going away.
                     assert!(
                         match_error_chain(
                             error.as_ref(),
                             &[
-                                ErrorType::CannotConnect,
-                                ErrorType::Disconnected,
-                                ErrorType::ConnectionTimeout,
+                                ErrorType::Backend(BackendError::CannotConnect),
+                                ErrorType::Backend(BackendError::Disconnected),
+                                ErrorType::Backend(BackendError::ConnectionTimeout),
+                                ErrorType::Backend(BackendError::Cancelled),
                             ],
-                            &[ErrorType::Backend(BackendError::CannotConnect)],
+                            &[],
                         ),
-                        "lost engine must surface as a top-level transport fault: {error:#}"
+                        "the engine client's own fault stays in the chain as the cause: {error:#}"
                     );
                     fault = Some(error);
                 }
             }
         }
-        assert!(fault.is_some(), "one of two round-robin requests must hit the lost engine");
+        assert!(
+            fault.is_some(),
+            "one of two round-robin requests must hit the lost engine"
+        );
 
         bounded("lost engine leaves the avail set", async {
             while client.instance_ids_avail().contains(&lost.id) {
@@ -223,7 +253,12 @@ async fn lost_direct_engine_is_a_transport_fault_and_leaves_the_avail_set() {
         let stream = bounded("direct dispatch after fault", router.generate(context))
             .await
             .unwrap();
-        terminal(outputs(stream).await, &handle.tokens(), 4, FinishReason::Length);
+        terminal(
+            outputs(stream).await,
+            &handle.tokens(),
+            4,
+            FinishReason::Length,
+        );
         released(&handle).await;
 
         drop((healthy, lost));
