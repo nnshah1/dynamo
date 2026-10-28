@@ -103,6 +103,7 @@ async fn run(runtime: Runtime, args: Args) -> anyhow::Result<()> {
     let service = HttpService::builder()
         .host(args.http_host.clone())
         .port(args.http_port)
+        .enable_chat_endpoints(true)
         .enable_cmpl_endpoints(true)
         .build()?;
     let watcher = Arc::new(ModelWatcher::new(
