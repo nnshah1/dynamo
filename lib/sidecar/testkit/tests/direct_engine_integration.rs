@@ -35,7 +35,8 @@ mod process;
 #[allow(dead_code)]
 mod support;
 
-use process::{Environment, outputs};
+use process::{Environment, Frontend, outputs};
+use serde_json::Value;
 use support::{FixtureConfig, ProcessFixture, SidecarFixture, WireFixture, vllm};
 
 /// One stock engine as the frontend sees it: its mock gRPC server, the
@@ -265,4 +266,38 @@ async fn lost_direct_engine_is_a_transport_fault_and_leaves_the_avail_set() {
     })
     .await
     .expect("direct fault scenario exceeded its overall deadline");
+}
+
+#[tokio::test]
+async fn direct_engine_serves_http_completions_through_the_frontend() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let env = Environment::new().await;
+        let endpoint = env.endpoint("backend");
+        let direct = DirectEngines::new(endpoint.clone(), DisaggregationMode::Aggregated);
+        let engine = add_engine(&env, &direct).await;
+
+        // The stock HTTP frontend: model watcher, preprocessor, router. It must
+        // reach the direct engine without a request plane in between.
+        let frontend = Frontend::start(&env).await;
+
+        let id = "00000000-0000-4000-8000-000000000101";
+        let handle = engine.control.request(id, RequestPlan::default());
+        let response = bounded(
+            "HTTP completion through the frontend",
+            frontend.generate(&env.model, id, false).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "length", "{body}");
+        assert_eq!(body["usage"]["completion_tokens"], 3, "{body}");
+        assert_eq!(handle.tokens().len(), 3, "the engine generated the request");
+        released(&handle).await;
+
+        frontend.shutdown().await;
+        drop(engine);
+    })
+    .await
+    .expect("direct HTTP scenario exceeded its overall deadline");
 }

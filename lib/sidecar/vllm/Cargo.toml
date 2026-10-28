@@ -15,6 +15,11 @@ description = "Rust sidecar for vLLM's native gRPC server"
 name = "dynamo-vllm-sidecar"
 path = "src/main.rs"
 
+# Prototype: the Dynamo frontend hosting vLLM gRPC engines directly, no sidecar process.
+[[bin]]
+name = "dynamo-vllm-direct"
+path = "src/bin/direct.rs"
+
 [features]
 # On for the standalone binary. The Python bindings turn it off by default and
 # forward their own opt-in `mm-routing` feature, so the default wheel stays lean.

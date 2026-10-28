@@ -49,10 +49,14 @@ pub struct DirectEngines {
 impl DirectEngines {
     /// Hosts engines as workers of `endpoint`, all in the same disaggregation role.
     pub fn new(endpoint: Endpoint, mode: DisaggregationMode) -> Self {
+        let dispatch = Arc::new(DirectDispatch::default());
+        // The frontend's router builder takes this as the final hop for the
+        // endpoint instead of the request plane.
+        dynamo_llm::direct_dispatch::install(endpoint.id(), dispatch.clone());
         Self {
             endpoint,
             mode,
-            dispatch: Arc::new(DirectDispatch::default()),
+            dispatch,
             next_index: AtomicU64::new(0),
         }
     }

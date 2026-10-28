@@ -272,14 +272,27 @@ pub(crate) async fn build_preprocessed_routing_with_session_affinity_mode(
             as MultimodalCacheKeyExtractor<PreprocessedRequest>
     });
 
-    let router = LlmPushRouter::from_client_with_state(
-        router_client,
-        router_mode,
-        None,
-        embedding_cache_indexer,
-        cache_key_extractor,
-    )
-    .await?;
+    // Engines this process hosts itself are served in-process; everything else
+    // goes over the request plane.
+    let router = match crate::direct_dispatch::lookup(&router_client.endpoint.id()) {
+        Some(dispatch) => {
+            tracing::info!(
+                endpoint = %router_client.endpoint.id(),
+                "routing to in-process direct engines"
+            );
+            LlmPushRouter::from_client_with_dispatch(router_client, router_mode, dispatch).await?
+        }
+        None => {
+            LlmPushRouter::from_client_with_state(
+                router_client,
+                router_mode,
+                None,
+                embedding_cache_indexer,
+                cache_key_extractor,
+            )
+            .await?
+        }
+    };
 
     // Eagerly register router request metrics so they appear as zeros before
     // RoutingHost is constructed. The host repeats this idempotently so the
