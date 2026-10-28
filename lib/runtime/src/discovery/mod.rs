@@ -1580,6 +1580,32 @@ pub trait Discovery: Send + Sync {
 
     /// Registers an object in the discovery plane with the instance id
     async fn register(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
+        self.register_with_instance_id(spec, None).await
+    }
+
+    /// Registers an endpoint or model object under a caller-chosen instance id
+    /// instead of this client's own.
+    ///
+    /// For a process that hosts several workers, such as a frontend serving
+    /// engines directly: each gets its own id, so their registrations do not
+    /// collide. The caller owns the id's uniqueness. Not every backend supports
+    /// it.
+    async fn register_as(
+        &self,
+        spec: DiscoverySpec,
+        instance_id: u64,
+    ) -> Result<DiscoveryInstance> {
+        self.register_with_instance_id(spec, Some(instance_id))
+            .await
+    }
+
+    /// `register` and `register_as`: a model registration is refused when a
+    /// different model is already registered on the same endpoint.
+    async fn register_with_instance_id(
+        &self,
+        spec: DiscoverySpec,
+        instance_id: Option<u64>,
+    ) -> Result<DiscoveryInstance> {
         let (namespace, component, endpoint, requested_identity) = match &spec {
             DiscoverySpec::Model {
                 namespace,
@@ -1594,7 +1620,7 @@ pub trait Discovery: Send + Sync {
                 endpoint.clone(),
                 extract_model_registration_identity(card_json, model_suffix.as_deref())?,
             ),
-            _ => return self.register_internal(spec).await,
+            _ => return self.register_internal_with(spec, instance_id).await,
         };
 
         let query = DiscoveryQuery::EndpointModels {
@@ -1612,7 +1638,7 @@ pub trait Discovery: Send + Sync {
             );
         }
 
-        let instance = self.register_internal(spec).await?;
+        let instance = self.register_internal_with(spec, instance_id).await?;
 
         if let Some(conflicting_name) =
             find_conflicting_model_name(&self.list(query).await?, &requested_identity)?
@@ -1638,6 +1664,30 @@ pub trait Discovery: Send + Sync {
 
     /// Backend-specific raw registration implementation.
     async fn register_internal(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance>;
+
+    /// Backend-specific raw registration under a caller-chosen instance id.
+    /// Backends that stamp only their own id keep this default.
+    async fn register_internal_as(
+        &self,
+        _spec: DiscoverySpec,
+        instance_id: u64,
+    ) -> Result<DiscoveryInstance> {
+        anyhow::bail!(
+            "this discovery backend registers only its own instance id {}, not {instance_id:x}",
+            self.instance_id()
+        )
+    }
+
+    async fn register_internal_with(
+        &self,
+        spec: DiscoverySpec,
+        instance_id: Option<u64>,
+    ) -> Result<DiscoveryInstance> {
+        match instance_id {
+            Some(instance_id) => self.register_internal_as(spec, instance_id).await,
+            None => self.register_internal(spec).await,
+        }
+    }
 
     /// Replace the caller-managed taints of this worker's existing base model card.
     async fn update_model_taints(

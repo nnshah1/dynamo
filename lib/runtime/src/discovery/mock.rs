@@ -218,7 +218,15 @@ impl Discovery for MockDiscovery {
     }
 
     async fn register_internal(&self, spec: DiscoverySpec) -> Result<DiscoveryInstance> {
-        let instance = spec.into_instance(self.instance_id);
+        self.register_internal_as(spec, self.instance_id).await
+    }
+
+    async fn register_internal_as(
+        &self,
+        spec: DiscoverySpec,
+        instance_id: u64,
+    ) -> Result<DiscoveryInstance> {
+        let instance = spec.into_instance(instance_id);
         let instance_id = instance.id();
         let mut state = self.registry.state.lock().unwrap();
         if let Some(existing) = state
