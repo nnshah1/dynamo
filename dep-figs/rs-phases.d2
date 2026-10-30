@@ -1,4 +1,5 @@
 ...@_style
+# render with D2_LAYOUT=elk (dagre folds the third panel sideways)
 
 direction: down
 
@@ -23,18 +24,19 @@ c2: "Phase C2  gRPC ReplicaSync" {
   n: "shippable: one port, proto in\nlib/global-common, mTLS as the relay client" {class: note}
 }
 
-later: "Later  store-backed session table" {
+later: "Later  store as transport and state" {
   class: host
   style.stroke-dash: 4
   direction: right
   a: "GF A\ncore" {class: core}
   b: "GF B\ncore" {class: core}
-  s: "Redis / DynamoDB\nsession → pool, AffinityVersion\nTTL = session idle" {class: ext}
-  a <-> b: "SubscribeReplicaEvents\nbookings only" {class: sync}
-  a <-> s: "conditional put · read at join" {class: signal}
-  b <-> s: "conditional put · read at join" {class: signal}
-  n: "fills the join snapshot;\nsame core seams, no kv-router change" {class: note}
+  s: "Redis Streams / DynamoDB Streams\nmailbox per replica: add · prefill-complete · free · binding\nstate: session rows, open-booking sets, heartbeat TTL" {class: ext}
+  a -> s: "append to mailbox A\nconditional put" {class: sync}
+  s -> a: "tail mailbox B\nread state at join" {class: sync}
+  b -> s: "append to mailbox B\nconditional put" {class: sync}
+  s -> b: "tail mailbox A\nread state at join" {class: sync}
+  n: "transparent to the core: one more HostReplicaSyncFactory,\nsame events in and out; no replica-to-replica connection,\nno peer discovery; lease = heartbeat TTL" {class: note}
 }
 
 c1 -> c2 -> later: "" {class: flow}
-k: "lib/kv-router unchanged in C1 and C2" {class: note}
+k: "lib/kv-router unchanged in every phase: the core sees HostReplicaChannels, never the transport" {class: note}
