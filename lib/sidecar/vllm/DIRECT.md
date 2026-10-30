@@ -25,9 +25,9 @@ flowchart LR
         F1 -- request plane --> S2[dynamo-vllm-sidecar]
         S1 -- gRPC --> V1[vLLM]
         S2 -- gRPC --> V2[vLLM]
-        F1 -. discovery .- E[(etcd)]
-        S1 -. discovery .- E
-        S2 -. discovery .- E
+        F1 -. watches .- K[(Kubernetes discovery<br/>pod metadata · EndpointSlices)]
+        S1 -. registers .- K
+        S2 -. registers .- K
     end
 ```
 
@@ -39,10 +39,17 @@ flowchart LR
         F2 -- StreamingDispatch --> D[DirectDispatch<br/>instance id → EngineAdapter]
         D -- gRPC --> V3[vLLM]
         D -- gRPC --> V4[vLLM]
-        F2 -. in-memory discovery .- M[(process-local<br/>KV store)]
+        F2 -. watches .- M[(Discovery<br/>process-local today,<br/>Kubernetes next)]
         D -. register_as(id) .- M
     end
 ```
+
+Discovery is the one piece the direct process still owns. Today the runner uses
+the process-local backend, since the frontend and its engines are the only
+parties. In a cluster the same process should register its engines through the
+Kubernetes discovery backend, so the operator and other frontends see them as
+ordinary workers. `register_as` is implemented for the KV-store and mock
+backends; the Kubernetes backend still refuses caller-chosen instance ids.
 
 ## The seam
 
@@ -143,6 +150,8 @@ server is required, matching `deploy/`.
 
 ## Not yet
 
+- `register_as` on the Kubernetes discovery backend, so a direct process
+  publishes its engines through k8s and needs no in-process store.
 - KV events into the indexer, so `--router-mode kv` is prefix-aware.
 - `remove()` and health-driven unregister.
 - `--direct-engine` flag in the Python frontend behind a cargo feature.
