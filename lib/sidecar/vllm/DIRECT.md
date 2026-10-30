@@ -5,10 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # Frontend-direct serving (prototype)
 
-`dynamo-vllm-direct` runs the stock Dynamo HTTP frontend with every vLLM
-engine hosted **in the same process** as a worker. The router's final hop is
-vLLM's own gRPC. There is no sidecar process, no etcd, no NATS and no request
-plane in the path.
+`dynamo-vllm-direct` is the stock Dynamo HTTP frontend whose router dials
+each vLLM engine's own gRPC server. The frontend and every vLLM server are
+still separate processes (separate pods in a cluster). What is removed is the
+hop between them: no sidecar process per engine, no request plane, no NATS.
+Each engine is still an ordinary worker to the router, so selection, fault
+detection and migration are unchanged.
 
 ```bash
 dynamo-vllm-direct --grpc-endpoint 127.0.0.1:50051 --grpc-endpoint 127.0.0.1:50052 --http-port 8000
@@ -33,23 +35,43 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    subgraph direct["This branch: dynamo-vllm-direct, one process"]
+    subgraph direct["This branch: frontend dials the engines directly"]
         direction LR
-        C2[Client] --> F2[Frontend<br/>preprocessor · PushRouter]
-        F2 -- StreamingDispatch --> D[DirectDispatch<br/>instance id → EngineAdapter]
-        D -- gRPC --> V3[vLLM]
-        D -- gRPC --> V4[vLLM]
-        F2 -. watches .- M[(Discovery<br/>process-local today,<br/>Kubernetes next)]
-        D -. register_as(id) .- M
+        C2[Client] --> F2[Frontend pod<br/>preprocessor · PushRouter<br/>DirectDispatch]
+        F2 -- vLLM gRPC --> V3[vLLM pod]
+        F2 -- vLLM gRPC --> V4[vLLM pod]
+        F2 -. "label selector<br/>nvidia.com/dynamo-engine=vllm-grpc" .- K2[(Kubernetes API<br/>Pods · EndpointSlices)]
+        V3 -. labels + annotations .- K2
+        V4 -. labels + annotations .- K2
     end
 ```
 
-Discovery is the one piece the direct process still owns. Today the runner uses
-the process-local backend, since the frontend and its engines are the only
-parties. In a cluster the same process should register its engines through the
-Kubernetes discovery backend, so the operator and other frontends see them as
-ordinary workers. `register_as` is implemented for the KV-store and mock
-backends; the Kubernetes backend still refuses caller-chosen instance ids.
+Same processes as today minus the sidecars: one per frontend, one per vLLM
+server. The frontend holds a gRPC client per engine.
+
+### Discovery by label selector
+
+Today's Kubernetes backend expects each worker pod to publish its own
+`DynamoWorkerMetadata` CR; the daemon joins those CRs with pod or
+EndpointSlice readiness under the labels
+`nvidia.com/dynamo-discovery-backend=kubernetes` and
+`nvidia.com/dynamo-discovery-enabled=true`. A stock vLLM pod runs no Dynamo
+code and writes no CR, so for direct engines the frontend does the publishing
+side itself:
+
+| Step | Who | What |
+|---|---|---|
+| select | frontend | watch Pods (or EndpointSlices) matching an engine label, e.g. `nvidia.com/dynamo-engine=vllm-grpc`, same namespace, Ready only |
+| describe | pod spec | annotations name the gRPC port, the Dynamo namespace/component/endpoint and the disaggregation role; the model name and tokenizer come from the engine's own model and server info calls when the frontend connects |
+| identify | frontend | instance id = `hash_pod_name(pod)`, the function the EPP already uses, so every frontend derives the same id without coordination |
+| publish | frontend | synthesize the `Model` and `Endpoint` discovery instances in its own `DiscoveryInstance` stream, so `ModelWatcher`, `ModelManager` and the KV router see an ordinary worker |
+| retire | frontend | pod NotReady or deleted removes the instance; `PushRouter` drains it like any withdrawn worker |
+
+This makes `register_as` unnecessary on the Kubernetes backend: nothing is
+registered, engines are observed. The prototype runner still takes engines as
+`--grpc-endpoint` flags and publishes them into a process-local store
+(`DirectEngines::add`), which is the right shape for a laptop or a test and
+becomes one of two engine sources, the other being the label watch.
 
 ## The seam
 
@@ -60,7 +82,7 @@ untouched: the model watcher, the preprocessor, selection (`round_robin`,
 
 ```mermaid
 flowchart TB
-    subgraph process["dynamo-vllm-direct process"]
+    subgraph process["Frontend process"]
         HTTP[HttpService<br/>/v1/completions · /v1/chat/completions]
         MW[ModelWatcher]
         PRE[Preprocessor]
@@ -71,7 +93,8 @@ flowchart TB
         DE[DirectEngines]
         A1[EngineAdapter → VllmSidecarEngine]
         A2[EngineAdapter → VllmSidecarEngine]
-        DISC[(Discovery<br/>process_local)]
+        DISC[(Discovery stream)]
+        LW["Pod label watch<br/>planned"]
 
         HTTP --> PRE --> PR
         MW -. builds router for each model .-> PR
@@ -80,13 +103,69 @@ flowchart TB
         HOOK -- installed --> DD
         DD -- "engines[instance_id]" --> A1
         DD -- "engines[instance_id]" --> A2
-        DE -- "add(engine): start, build card,<br/>register_as(Model), register_as(Endpoint)" --> DISC
+        DE -- "--grpc-endpoint flags: start, build card,<br/>register_as(Model), register_as(Endpoint)" --> DISC
+        LW -. "Ready pods by label: id = hash_pod_name,<br/>Model + Endpoint from annotations" .-> DISC
+        LW -. "connect gRPC client per pod" .-> DD
         DE -- install(endpoint, dispatch) --> HOOK
         DE --> DD
         DISC -. watch .-> MW
     end
     A1 -- "vllm.Inference gRPC" --> V1[(vLLM 0.28<br/>vllm-rs server)]
     A2 -- "vllm.Inference gRPC" --> V2[(vLLM 0.28<br/>vllm-rs server)]
+    K8S[(Kubernetes API)] -. "watch Pods" .-> LW
+```
+
+## Request and response path
+
+Both directions cross the same seam. The request goes down as a
+`PreprocessedRequest`; the response comes back as a stream of
+`LLMEngineOutput` deltas that each layer maps on its way up. There is no
+response plane: the gRPC server stream *is* the response stream.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as HttpService
+    participant P as Preprocessor
+    participant R as PushRouter
+    participant D as DirectDispatch
+    participant A as EngineAdapter<br/>VllmSidecarEngine
+    participant V as vLLM pod<br/>vllm-rs gRPC
+
+    C->>H: POST /v1/chat/completions
+    H->>P: OpenAI request
+    P->>P: chat template, tokenize
+    P->>R: PreprocessedRequest (token ids)
+    R->>R: select instance id, add occupancy
+    R->>D: AddressedRequest(instance id)
+    D->>A: engines[instance id].generate
+    A->>V: Inference.GenerateStream (proto request)
+
+    loop each step until finish
+        V-->>A: GenerateResponse (token ids, logprobs)
+        A-->>D: LLMEngineOutput delta
+        D-->>R: Annotated LLMEngineOutput<br/>transport faults lifted here
+        R-->>P: same stream, occupancy tracked
+        P-->>H: detokenize, reasoning and tool parsing
+        H-->>C: SSE chunk
+    end
+    V-->>A: final response (finish reason, usage)
+    A-->>C: finish chunk, then [DONE], via the same layers
+
+    opt client disconnects or stop
+        C--xH: connection closed
+        H->>R: context stopped
+        R->>A: stop propagates through the request context
+        A->>V: Control.Abort(request id), stream dropped
+    end
+
+    opt engine pod lost mid-stream
+        V--xA: stream error (Unavailable or Cancelled)
+        A-->>D: Backend(Disconnected / Cancelled)
+        D-->>R: lifted to Disconnected
+        R->>R: quarantine instance, migrate if enabled
+    end
 ```
 
 ## Error lifting
@@ -150,8 +229,8 @@ server is required, matching `deploy/`.
 
 ## Not yet
 
-- `register_as` on the Kubernetes discovery backend, so a direct process
-  publishes its engines through k8s and needs no in-process store.
+- Label-selector engine source: watch Pods by label, read annotations,
+  derive ids from `hash_pod_name`, publish into the frontend's discovery stream.
 - KV events into the indexer, so `--router-mode kv` is prefix-aware.
 - `remove()` and health-driven unregister.
 - `--direct-engine` flag in the Python frontend behind a cargo feature.
