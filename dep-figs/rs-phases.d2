@@ -23,16 +23,17 @@ c2: "Phase C2  gRPC ReplicaSync" {
   n: "shippable: one port, proto in\nlib/global-common, mTLS as the relay client" {class: note}
 }
 
-later: "Later  relay-served" {
+later: "Later  store-backed session table" {
   class: host
   style.stroke-dash: 4
   direction: right
-  a: "GF A" {class: core}
-  b: "GF B" {class: core}
-  r: "PoolRelay\nserves the same stream\nfor its pool" {class: ext}
-  r -> a: "SubscribeReplicaEvents" {class: sync}
-  r -> b: "SubscribeReplicaEvents" {class: sync}
-  n: "same proto, different server;\nneeds a relay-side session table" {class: note}
+  a: "GF A\ncore" {class: core}
+  b: "GF B\ncore" {class: core}
+  s: "Redis / DynamoDB\nsession → pool, AffinityVersion\nTTL = session idle" {class: ext}
+  a <-> b: "SubscribeReplicaEvents\nbookings only" {class: sync}
+  a <-> s: "conditional put · read at join" {class: signal}
+  b <-> s: "conditional put · read at join" {class: signal}
+  n: "fills the join snapshot;\nsame core seams, no kv-router change" {class: note}
 }
 
 c1 -> c2 -> later: "" {class: flow}
