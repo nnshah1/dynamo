@@ -13,7 +13,11 @@ Each engine is still an ordinary worker to the router, so selection, fault
 detection and migration are unchanged.
 
 ```bash
-dynamo-vllm-direct --grpc-endpoint 127.0.0.1:50051 --grpc-endpoint 127.0.0.1:50052 --http-port 8000
+# Engines from Kubernetes: every Ready pod labelled app=vllm, at <pod IP>:50051.
+dynamo-vllm-direct --pod-selector app=vllm --pod-namespace inference --pod-grpc-port 50051
+
+# Fixed engines, for local runs.
+dynamo-vllm-direct --grpc-endpoint 127.0.0.1:50051 --grpc-endpoint 127.0.0.1:50052
 ```
 
 ## Before and after
@@ -61,17 +65,27 @@ side itself:
 
 | Step | Who | What |
 |---|---|---|
-| select | frontend | watch Pods (or EndpointSlices) matching an engine label, e.g. `nvidia.com/dynamo-engine=vllm-grpc`, same namespace, Ready only |
-| describe | pod spec | annotations name the gRPC port, the Dynamo namespace/component/endpoint and the disaggregation role; the model name and tokenizer come from the engine's own model and server info calls when the frontend connects |
-| identify | frontend | instance id = `hash_pod_name(pod)`, the function the EPP already uses, so every frontend derives the same id without coordination |
-| publish | frontend | synthesize the `Model` and `Endpoint` discovery instances in its own `DiscoveryInstance` stream, so `ModelWatcher`, `ModelManager` and the KV router see an ordinary worker |
-| retire | frontend | pod NotReady or deleted removes the instance; `PushRouter` drains it like any withdrawn worker |
+| select | frontend | watch Pods matching `--pod-selector` in `--pod-namespace`; a pod serves once `Ready` and not terminating |
+| address | pod | `<pod IP>:<--pod-grpc-port>`, or the pod's `nvidia.com/dynamo-engine-grpc-port` annotation; the model name and tokenizer come from the engine's own model and server info calls when the frontend connects |
+| identify | frontend | instance id = `hash_pod_name(pod)`, the function the EPP already uses, so every frontend and the gateway derive the same id without coordination |
+| publish | frontend | `DirectEngines::add_as(engine, id)` registers the `Model` and `Endpoint` instances in the frontend's own discovery, so `ModelWatcher`, `ModelManager` and the router see an ordinary worker |
+| retire | frontend | pod NotReady, deleted, or missing from a relist: `DirectEngines::remove(id)` withdraws both records and cleans the engine up; the last worker leaving removes the model |
 
-This makes `register_as` unnecessary on the Kubernetes backend: nothing is
-registered, engines are observed. The prototype runner still takes engines as
-`--grpc-endpoint` flags and publishes them into a process-local store
-(`DirectEngines::add`), which is the right shape for a laptop or a test and
-becomes one of two engine sources, the other being the label watch.
+Each serving pod gets its own start task that retries with backoff (1 s,
+doubling to 30 s), so an unreachable engine never holds back the others, and
+retiring the pod cancels it. Nothing is registered by the engines and no
+`DynamoWorkerMetadata` CR is needed, so `register_as` is not needed on the
+Kubernetes backend either. In a cluster the frontend needs only this RBAC:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: direct-engine-watch }
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+```
 
 ## The seam
 
@@ -94,7 +108,7 @@ flowchart TB
         A1[EngineAdapter → VllmSidecarEngine]
         A2[EngineAdapter → VllmSidecarEngine]
         DISC[(Discovery stream)]
-        LW["Pod label watch<br/>planned"]
+        LW["PodEngines<br/>pod label watch"]
 
         HTTP --> PRE --> PR
         MW -. builds router for each model .-> PR
@@ -103,9 +117,9 @@ flowchart TB
         HOOK -- installed --> DD
         DD -- "engines[instance_id]" --> A1
         DD -- "engines[instance_id]" --> A2
-        DE -- "--grpc-endpoint flags: start, build card,<br/>register_as(Model), register_as(Endpoint)" --> DISC
-        LW -. "Ready pods by label: id = hash_pod_name,<br/>Model + Endpoint from annotations" .-> DISC
-        LW -. "connect gRPC client per pod" .-> DD
+        DE -- "start, build card,<br/>register_as(Model), register_as(Endpoint)" --> DISC
+        FLAGS["--grpc-endpoint flags"] -- "add(engine)" --> DE
+        LW -- "Ready pod: add_as(engine, hash_pod_name)<br/>gone: remove(id)" --> DE
         DE -- install(endpoint, dispatch) --> HOOK
         DE --> DD
         DISC -. watch .-> MW
@@ -208,10 +222,10 @@ flowchart LR
 | Crate | Change |
 |---|---|
 | `dynamo-runtime` | `Discovery::register_as(spec, instance_id)` so N engines in one process register as distinct workers. KV-store and mock backends implement it. |
-| `dynamo-backend-common` | `direct::DirectEngines` hosts `LLMEngine`s, registers each as a worker with the Worker's own model card, serves them through `DirectDispatch` (a `StreamingDispatch`), lifts transport faults. |
+| `dynamo-backend-common` | `direct::DirectEngines` hosts `LLMEngine`s (`add`, `add_as`, `remove`), registers each as a worker with the Worker's own model card, serves them through `DirectDispatch` (a `StreamingDispatch`), lifts transport faults. `direct::pods::PodEngines` keeps them in step with a pod label watch. |
 | `dynamo-llm` | `direct_dispatch` registry keyed by endpoint id. The frontend router builder takes an installed dispatch as the final hop instead of the request plane. |
-| `dynamo-vllm-sidecar` | `dynamo-vllm-direct` binary: frontend plus every `--grpc-endpoint` in-process. |
-| `dynamo-sidecar-testkit` | `tests/direct_engine_integration.rs`: four CPU-only scenarios over mock vLLM gRPC servers. |
+| `dynamo-vllm-sidecar` | `dynamo-vllm-direct` binary: frontend plus engines from `--grpc-endpoint` flags and/or `--pod-selector`. |
+| `dynamo-sidecar-testkit` | `tests/direct_engine_integration.rs`: eight CPU-only scenarios over mock vLLM gRPC servers. |
 
 ## Verified
 
@@ -221,7 +235,38 @@ flowchart LR
 | Request reaches the selected engine over gRPC, wire fields intact | pass |
 | Lost engine surfaces as a transport fault and leaves the avail set | pass |
 | Completion through the real HTTP frontend | pass |
+| Ready pod becomes a worker keyed by `hash_pod_name` and serves | pass |
+| NotReady or deleted pod is withdrawn, model card included; Ready again re-registers | pass |
+| Relist withdraws pods it no longer contains | pass |
+| Unreachable pod does not hold back a reachable one | pass |
+| Pod mapping: Ready, terminating, IP, IPv6, pool port, annotation override (unit) | pass |
 | Real vLLM 0.28 (`vllm-rs` gRPC), Qwen3-0.6B: completions, chat, streaming, 16 concurrent | pass |
+| Pod label watch against a real API server (k3s) with real vLLM, below | pass |
+
+### Pod watch against a real cluster
+
+Run on a single-node k3s with vLLM's gRPC server on host loopback. The test
+pods never run: a node selector keeps them Pending, and their status is
+patched the way a kubelet would report it (pod IP `127.0.0.1`, `Ready`), so
+the frontend dials the real engine without exposing it. Everything else is
+real: the API server, the label-selector watch, its relists, status and
+delete events.
+
+| Step | Observed |
+|---|---|
+| frontend starts, pods Pending | relist of 3 selected pods; the unlabelled pod is not selected |
+| 4 pods patched Ready | `vllm-a`, `vllm-b` serve as workers `de4b26baecf38`, `52b4eab3a06c1`; `vllm-dead` (annotation port 50059) retries; unlabelled pod ignored |
+| completion, chat, streaming, 8 concurrent | all 200; both workers report TTFT, so round robin used both |
+| `vllm-b` NotReady | withdrawn; requests keep returning 200 from `vllm-a` |
+| `vllm-a` deleted | withdrawn; no workers left, `/v1/models` empty, requests 404 |
+| `vllm-b` Ready again | re-registered under the same id; requests 200 |
+| frontend restarted | initial relist hosts `vllm-b` before serving; requests 200 |
+
+```bash
+kubectl patch pod -n direct-engine-e2e vllm-a --subresource=status --type=merge -p \
+  '{"status":{"phase":"Running","podIP":"127.0.0.1","podIPs":[{"ip":"127.0.0.1"}],
+    "conditions":[{"type":"Ready","status":"True","lastTransitionTime":"2026-10-30T18:00:00Z"}]}}'
+```
 
 The dev image's vLLM 0.18 `[grpc]` extra speaks a different protocol (SMG
 servicer) and cannot serve this path; vLLM ≥ 0.28 with its bundled `vllm-rs`
@@ -229,8 +274,8 @@ server is required, matching `deploy/`.
 
 ## Not yet
 
-- Label-selector engine source: watch Pods by label, read annotations,
-  derive ids from `hash_pod_name`, publish into the frontend's discovery stream.
+- Pod watch on a node that runs the engines for real (kubelet readiness,
+  pod network), and per-pod disaggregation role and endpoint annotations.
 - KV events into the indexer, so `--router-mode kv` is prefix-aware.
 - `remove()` and health-driven unregister.
 - `--direct-engine` flag in the Python frontend behind a cargo feature.
