@@ -13,13 +13,11 @@ relay -> sel: "occupancy per pool\n(PoolSignals, read locally)" {class: signal}
 
 client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
 proxy -> sel: "route(request, candidate pools)"
-sel -> core: "select_and_reserve\nallowed = candidate worker ids\nsession = s1, tokens = []" {class: flow}
+sel -> core: "select_and_reserve (least-in-flight; affinity: new pin, move, refresh)\nor advisory select (round-robin; affinity otherwise)\nallowed = candidate worker ids · session = s1 · tokens = []" {class: flow}
 core."picker runs: RoundRobin · LeastRequests · Headroom\nHeadroom reads affinity_target() + occupancy"
-core -> sel: "worker id → pool (xxh3 of pool id)\nReservation (booking +1)" {class: flow}
+core -> sel: "worker id → pool (xxh3 of pool id)\nReservation (booking +1) only if booked" {class: flow}
 sel -> proxy: "Selection { target, lifecycle }"
 proxy -> pool: "forward bytes unchanged"
-pool -> proxy: "first response chunk"
-proxy -> core: "lifecycle.prefill_complete()" {class: flow}
 pool -> proxy: "… stream ends / client leaves"
-proxy -> core: "drop(lifecycle) → free_reservation\n(background, never awaited)" {class: flow}
-core."soft affinity: session s1 now bound to the picked pool"
+proxy -> core: "drop(lifecycle) → free_reservation\n(booked picks only; background, never awaited)" {class: flow}
+core."soft affinity: a booking binds s1 to the picked pool;\nan advisory pick honours the pin without refreshing it"
