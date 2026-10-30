@@ -1,0 +1,34 @@
+...@_style
+
+direction: right
+
+a: "Global Frontend A" {
+  class: host
+  core: "embedded router core" {
+    class: core
+    ledger: "request ledger\nbookings per pool" {class: state}
+    sessions: "session table\nsession → pool" {class: state}
+  }
+  signals: "PoolSignals\noccupancy (local view)" {class: ext}
+}
+
+b: "Global Frontend B" {
+  class: host
+  core: "embedded router core" {
+    class: core
+    ledger: "request ledger\nbookings per pool" {class: state}
+    sessions: "session table\nsession → pool" {class: state}
+  }
+  signals: "PoolSignals\noccupancy (local view)" {class: ext}
+}
+
+a.core.ledger <-> b.core.ledger: "ActiveSequenceEvent\nAddRequest · MarkPrefillCompleted · Free" {class: sync}
+a.core.sessions <-> b.core.sessions: "AffinityBindingEvent\nlast writer wins by AffinityVersion" {class: sync}
+
+relays: "PoolRelays" {class: ext}
+relays -> a.signals: "SubscribeServingLoad\nSubscribeKvPoolLoad" {class: signal}
+relays -> b.signals: "SubscribeServingLoad\nSubscribeKvPoolLoad" {class: signal}
+
+a.signals -> b.signals: "load is never replicated" {class: no}
+
+legend: "shared: what replicas decide (bookings, pins)\nnot shared: what relays report (load)\nbest effort, bounded, off the request path" {class: note}

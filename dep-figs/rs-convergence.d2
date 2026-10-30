@@ -1,0 +1,25 @@
+...@_style
+
+shape: sequence_diagram
+
+client: "Client\nsession s1" {class: ext}
+a: "Global Frontend A" {class: host}
+b: "Global Frontend B" {class: host}
+blue: "pool blue" {class: ext}
+
+client -> a: "turn 1, session s1"
+a."picker: least full nearest pool → blue\nbook on blue, bind s1 → blue"
+a -> blue: "forward"
+a -> b: "AddRequest {req1, worker=blue, router_id=A}" {class: sync}
+a -> b: "AffinityBinding {s1 → blue, seq 1, writer A}" {class: sync}
+b."ledger: blue +1  ·  session table: s1 → blue (Inserted)"
+blue -> a: "stream ends"
+a -> b: "Free {req1}" {class: sync}
+b."ledger: blue −1"
+
+client -> b: "turn 2, session s1  (load balancer picks B)"
+b."affinity_target(s1) = blue → stays on blue\n(no re-pin, KV reuse kept)"
+b -> blue: "forward"
+b -> a: "AddRequest {req2, worker=blue, router_id=B}" {class: sync}
+b -> a: "AffinityBinding {s1 → blue, seq 2, writer B}" {class: sync}
+a."higher version wins → Refreshed; own echoes ignored by process_id"

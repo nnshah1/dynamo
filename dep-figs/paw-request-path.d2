@@ -1,0 +1,25 @@
+...@_style
+
+shape: sequence_diagram
+
+client: "Client" {class: ext}
+proxy: "Global Frontend\nproxy.rs" {class: host}
+sel: "CoreSelector\n(adapter)" {class: plugin}
+core: "router core\nledger · session table · picker" {class: core}
+pool: "Pool frontend\n(selected pool)" {class: ext}
+relay: "PoolRelay" {class: ext}
+
+relay -> sel: "occupancy per pool\n(PoolSignals, read locally)" {class: signal}
+
+client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
+proxy -> sel: "route(request, candidate pools)"
+sel -> core: "select_and_reserve\nallowed = candidate worker ids\nsession = s1, tokens = []" {class: flow}
+core."picker runs: RoundRobin · LeastRequests · Headroom\nHeadroom reads affinity_target() + occupancy"
+core -> sel: "worker id → pool (xxh3 of pool id)\nReservation (booking +1)" {class: flow}
+sel -> proxy: "Selection { target, lifecycle }"
+proxy -> pool: "forward bytes unchanged"
+pool -> proxy: "first response chunk"
+proxy -> core: "lifecycle.prefill_complete()" {class: flow}
+pool -> proxy: "… stream ends / client leaves"
+proxy -> core: "drop(lifecycle) → free_reservation\n(background, never awaited)" {class: flow}
+core."soft affinity: session s1 now bound to the picked pool"

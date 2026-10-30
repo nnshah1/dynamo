@@ -1,0 +1,28 @@
+...@_style
+
+direction: right
+
+a: "A  #17597\nembed the core" {
+  class: core
+  l: "PoolCatalogSource · CoreSelector\nRequestSelector seam · --selection\nRoundRobinPicker · LeastRequestsPicker" {class: plugin}
+  d: "default: legacy (unchanged)" {class: note}
+}
+b: "B  #17598\naffinity on the core" {
+  class: core
+  l: "HeadroomPicker · PoolDirectory\nsoft session table (idle TTL)" {class: plugin}
+  d: "default: legacy (unchanged)" {class: note}
+}
+c: "C1  #17599\nreplica sync" {
+  class: core
+  l: "--replica-sync-port · --peer\nbookings + pins shared\n(companion DEP)" {class: plugin}
+  d: "sync only when peers given" {class: note}
+}
+d: "D  cutover" {
+  class: legacy
+  l: "core the only path\ndelete InFlightTracker, AffinitySelector,\nLeastInFlight/RoundRobin selectors" {class: legacy}
+  d: "default flips" {class: note}
+}
+
+a -> b -> c -> d {class: flow}
+
+k: "lib/kv-router: no change in A, B, C1 or D" {class: note}

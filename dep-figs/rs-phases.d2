@@ -1,0 +1,39 @@
+...@_style
+
+direction: down
+
+c1: "Phase C1  (#17599)  built-in mesh" {
+  class: host
+  direction: right
+  a: "GF A\ncore" {class: core}
+  b: "GF B\ncore" {class: core}
+  a <-> b: "ZMQ PUB/SUB :5600\n--replica-sync-port · --peer tcp://…\ntopics slot-tracker · session-affinity" {class: sync}
+  n: "proof of behaviour: second port,\ncrate-internal wire format, no auth" {class: note}
+}
+
+c2: "Phase C2  gRPC ReplicaSync" {
+  class: host
+  direction: right
+  a: "GF A\ncore + ReplicaSync server" {class: core}
+  b: "GF B\ncore + ReplicaSync server" {class: core}
+  gd: "Global Discovery\nGET /routers" {class: ext}
+  a <-> b: "SubscribeReplicaEvents\nsnapshot frame, then batches\nsame HTTP/2 port as the API" {class: sync}
+  gd -> a: "peer list" {class: signal}
+  gd -> b: "peer list" {class: signal}
+  n: "shippable: one port, proto in\nlib/global-common, mTLS as the relay client" {class: note}
+}
+
+later: "Later  relay-served" {
+  class: host
+  style.stroke-dash: 4
+  direction: right
+  a: "GF A" {class: core}
+  b: "GF B" {class: core}
+  r: "PoolRelay\nserves the same stream\nfor its pool" {class: ext}
+  r -> a: "SubscribeReplicaEvents" {class: sync}
+  r -> b: "SubscribeReplicaEvents" {class: sync}
+  n: "same proto, different server;\nneeds a relay-side session table" {class: note}
+}
+
+c1 -> c2 -> later: "" {class: flow}
+k: "lib/kv-router unchanged in C1 and C2" {class: note}
