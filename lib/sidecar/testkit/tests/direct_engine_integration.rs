@@ -301,3 +301,251 @@ async fn direct_engine_serves_http_completions_through_the_frontend() {
     .await
     .expect("direct HTTP scenario exceeded its overall deadline");
 }
+
+// ---------------------------------------------------------------------------
+// Engines discovered from pods by label selector.
+//
+// The frontend observes stock engine pods instead of waiting for them to
+// register: a `Ready`, non-terminating pod becomes a worker keyed by
+// `hash_pod_name`, and leaves when it stops serving. The pods here are the
+// objects a Kubernetes watch would deliver; their address is a mock vLLM gRPC
+// server on loopback.
+// ---------------------------------------------------------------------------
+
+mod pods {
+    use super::*;
+
+    use dynamo_backend_common::direct::pods::{Connect, PORT_ANNOTATION, PodEngines};
+    use dynamo_runtime::discovery::hash_pod_name;
+    use dynamo_vllm_sidecar::VllmSidecarEngine;
+    use futures::FutureExt;
+    use k8s_openapi::api::core::v1::Pod;
+    use serde_json::json;
+
+    /// The connector the runner uses: a vLLM gRPC client for `host:port`.
+    fn connect() -> Connect {
+        Arc::new(|grpc_endpoint: String| {
+            async move {
+                let argv = vec![
+                    "dynamo-vllm-sidecar".to_string(),
+                    "--grpc-endpoint".to_string(),
+                    grpc_endpoint,
+                    "--grpc-startup-deadline-secs".to_string(),
+                    "2".to_string(),
+                    "--grpc-connect-attempt-timeout-secs".to_string(),
+                    "1".to_string(),
+                ];
+                let (engine, _) =
+                    tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
+                        .await
+                        .expect("engine argv parse task")?;
+                Ok(Arc::new(engine) as Arc<dyn LLMEngine>)
+            }
+            .boxed()
+        })
+    }
+
+    /// `(ip, port)` of a mock server's `http://ip:port` endpoint.
+    fn address(fixture: &vllm::Fixture) -> (String, u16) {
+        let endpoint = fixture.server.endpoint();
+        let host_port = endpoint.trim_start_matches("http://");
+        let (ip, port) = host_port.rsplit_once(':').unwrap();
+        (ip.to_string(), port.parse().unwrap())
+    }
+
+    fn pod(name: &str, (ip, port): (String, u16), ready: bool) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {
+                "name": name,
+                "labels": { "app": "vllm" },
+                "annotations": { PORT_ANNOTATION: port.to_string() },
+            },
+            "status": {
+                "podIP": ip,
+                "conditions": [{ "type": "Ready", "status": if ready { "True" } else { "False" } }],
+            },
+        }))
+        .unwrap()
+    }
+
+    async fn start_fixture(env: &Environment) -> (vllm::Fixture, Controller<vllm::Adapter>) {
+        let control = Controller::default();
+        let fixture = vllm::Fixture::start(
+            control.clone(),
+            FixtureConfig {
+                model: env.model.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        (fixture, control)
+    }
+
+    async fn serving(client: &dynamo_runtime::component::Client, id: u64, label: &str) {
+        bounded(label, async {
+            while !client.instance_ids().contains(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    async fn withdrawn(client: &dynamo_runtime::component::Client, id: u64, label: &str) {
+        bounded(label, async {
+            while client.instance_ids().contains(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ready_pod_serves_as_a_worker_keyed_by_its_name_hash() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let env = Environment::new().await;
+            let endpoint = env.endpoint("backend");
+            let direct = Arc::new(DirectEngines::new(
+                endpoint.clone(),
+                DisaggregationMode::Aggregated,
+            ));
+            let (fixture, control) = start_fixture(&env).await;
+            let pods = PodEngines::new(direct.clone(), None, connect());
+            let client = endpoint.client().await.unwrap();
+
+            pods.apply(&pod("vllm-0", address(&fixture), true)).await;
+            let id = hash_pod_name("vllm-0");
+            serving(&client, id, "pod engine registration").await;
+            assert_eq!(client.instance_ids(), vec![id]);
+            let cards = env.cards().await;
+            assert_eq!(cards.len(), 1, "the pod's engine publishes one model card");
+
+            let router = PushRouter::from_client_with_dispatch(
+                client,
+                RouterMode::RoundRobin,
+                direct.dispatch(),
+            )
+            .await
+            .unwrap();
+            let handle = control.request("pod-1", RequestPlan::default());
+            let (context, expected) = request(&env, "pod-1");
+            let stream = bounded("pod dispatch", router.generate(context))
+                .await
+                .unwrap();
+            let result = outputs(stream).await;
+            vllm::Fixture::assert_stream(&handle, &expected, &result);
+            terminal(result, &handle.tokens(), 4, FinishReason::Length);
+            released(&handle).await;
+
+            drop(fixture);
+        })
+        .await
+        .expect("pod serving scenario exceeded its overall deadline");
+    }
+
+    #[tokio::test]
+    async fn pod_that_stops_being_ready_or_is_deleted_is_withdrawn() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let env = Environment::new().await;
+            let endpoint = env.endpoint("backend");
+            let direct = Arc::new(DirectEngines::new(
+                endpoint.clone(),
+                DisaggregationMode::Aggregated,
+            ));
+            let (fixture, _control) = start_fixture(&env).await;
+            let pods = PodEngines::new(direct.clone(), None, connect());
+            let client = endpoint.client().await.unwrap();
+            let id = hash_pod_name("vllm-0");
+
+            pods.apply(&pod("vllm-0", address(&fixture), true)).await;
+            serving(&client, id, "pod engine registration").await;
+
+            pods.apply(&pod("vllm-0", address(&fixture), false)).await;
+            withdrawn(&client, id, "not-ready pod withdrawn").await;
+            assert!(env.cards().await.is_empty(), "its model card leaves too");
+
+            pods.apply(&pod("vllm-0", address(&fixture), true)).await;
+            serving(&client, id, "ready again").await;
+
+            pods.delete(&pod("vllm-0", address(&fixture), true)).await;
+            withdrawn(&client, id, "deleted pod withdrawn").await;
+
+            drop(fixture);
+        })
+        .await
+        .expect("pod withdrawal scenario exceeded its overall deadline");
+    }
+
+    #[tokio::test]
+    async fn relist_withdraws_pods_it_no_longer_contains() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let env = Environment::new().await;
+            let endpoint = env.endpoint("backend");
+            let direct = Arc::new(DirectEngines::new(
+                endpoint.clone(),
+                DisaggregationMode::Aggregated,
+            ));
+            let (a, _) = start_fixture(&env).await;
+            let (b, _) = start_fixture(&env).await;
+            let pods = PodEngines::new(direct.clone(), None, connect());
+            let client = endpoint.client().await.unwrap();
+
+            let pod_a = pod("vllm-a", address(&a), true);
+            let pod_b = pod("vllm-b", address(&b), true);
+            pods.resync(&[pod_a.clone(), pod_b]).await;
+            serving(&client, hash_pod_name("vllm-a"), "a registered").await;
+            serving(&client, hash_pod_name("vllm-b"), "b registered").await;
+
+            pods.resync(&[pod_a]).await;
+            withdrawn(&client, hash_pod_name("vllm-b"), "b dropped by relist").await;
+            assert!(client.instance_ids().contains(&hash_pod_name("vllm-a")));
+
+            drop((a, b));
+        })
+        .await
+        .expect("relist scenario exceeded its overall deadline");
+    }
+
+    #[tokio::test]
+    async fn unreachable_pod_does_not_hold_back_a_reachable_one() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let env = Environment::new().await;
+            let endpoint = env.endpoint("backend");
+            let direct = Arc::new(DirectEngines::new(
+                endpoint.clone(),
+                DisaggregationMode::Aggregated,
+            ));
+            let (fixture, _) = start_fixture(&env).await;
+            let pods = PodEngines::new(direct.clone(), None, connect())
+                .with_retry(Duration::from_millis(100));
+            let client = endpoint.client().await.unwrap();
+
+            // A port nothing listens on.
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed_port = closed.local_addr().unwrap().port();
+            drop(closed);
+
+            pods.apply(&pod("vllm-dead", ("127.0.0.1".into(), closed_port), true))
+                .await;
+            pods.apply(&pod("vllm-live", address(&fixture), true)).await;
+            serving(
+                &client,
+                hash_pod_name("vllm-live"),
+                "reachable pod registered",
+            )
+            .await;
+            assert!(
+                !client.instance_ids().contains(&hash_pod_name("vllm-dead")),
+                "an engine that cannot be reached is never a worker"
+            );
+
+            // Withdrawing the pod stops its retries; nothing is left behind.
+            pods.delete(&pod("vllm-dead", ("127.0.0.1".into(), closed_port), true))
+                .await;
+            assert_eq!(client.instance_ids(), vec![hash_pod_name("vllm-live")]);
+
+            drop(fixture);
+        })
+        .await
+        .expect("unreachable pod scenario exceeded its overall deadline");
+    }
+}

@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Frontend-direct serving of stock vLLM engines, in one process.
+//! Frontend-direct serving of stock vLLM engines.
 //!
-//! The Dynamo HTTP frontend with each `--grpc-endpoint` hosted in-process as a
-//! worker: no sidecar process, no etcd, no NATS, no request plane. The router's
-//! final hop is vLLM's own gRPC. Prototype vehicle for the direct-engine plan.
+//! The Dynamo HTTP frontend whose router dials each vLLM engine's own gRPC
+//! server: no sidecar process, no NATS, no request plane. Each engine is a
+//! worker to the router. Engines come from two sources:
+//!
+//! - `--grpc-endpoint host:port`, repeated: fixed engines, for local runs.
+//! - `--pod-selector app=vllm`: every `Ready` pod matching the label selector
+//!   in `--pod-namespace`, at `<pod IP>:<--pod-grpc-port>` (or the pod's
+//!   `nvidia.com/dynamo-engine-grpc-port` annotation), keyed by
+//!   `hash_pod_name`. Pods that stop serving are withdrawn. Needs `list` and
+//!   `watch` on pods.
 //!
 //! ```bash
-//! python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051 &
 //! dynamo-vllm-direct --grpc-endpoint 127.0.0.1:50051 --http-port 8000
+//! dynamo-vllm-direct --pod-selector app=vllm --pod-grpc-port 50051
 //! ```
 
 use std::sync::Arc;
@@ -17,6 +24,8 @@ use std::sync::Arc;
 use clap::Parser;
 use dynamo_backend_common::DisaggregationMode;
 use dynamo_backend_common::direct::DirectEngines;
+use dynamo_backend_common::direct::pods::{Connect, PodEngines, PodSelector};
+use dynamo_backend_common::{BackendError, DynamoError, ErrorType, LLMEngine};
 use dynamo_llm::discovery::ModelWatcher;
 use dynamo_llm::entrypoint::RouterConfig;
 use dynamo_llm::http::service::service_v2::HttpService;
@@ -26,13 +35,30 @@ use dynamo_runtime::distributed::DistributedConfig;
 use dynamo_runtime::pipeline::RouterMode;
 use dynamo_runtime::{DistributedRuntime, Runtime};
 use dynamo_vllm_sidecar::VllmSidecarEngine;
+use futures::FutureExt;
 
 #[derive(Parser, Debug)]
-#[command(name = "dynamo-vllm-direct", about = "Dynamo frontend serving vLLM gRPC engines directly")]
+#[command(
+    name = "dynamo-vllm-direct",
+    about = "Dynamo frontend serving vLLM gRPC engines directly"
+)]
 struct Args {
     /// vLLM gRPC server, `host:port`. Repeat for several engines.
-    #[arg(long, required = true)]
+    #[arg(long, required_unless_present = "pod_selector")]
     grpc_endpoint: Vec<String>,
+
+    /// Label selector for vLLM engine pods, e.g. `app=vllm`.
+    #[arg(long)]
+    pod_selector: Option<String>,
+
+    /// Namespace of the engine pods.
+    #[arg(long, env = "POD_NAMESPACE", default_value = "default")]
+    pod_namespace: String,
+
+    /// gRPC port of every selected pod, unless the pod's
+    /// `nvidia.com/dynamo-engine-grpc-port` annotation says otherwise.
+    #[arg(long)]
+    pod_grpc_port: Option<u16>,
 
     /// Frontend HTTP port.
     #[arg(long, default_value_t = 8000)]
@@ -72,32 +98,42 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(runtime: Runtime, args: Args) -> anyhow::Result<()> {
-    // Everything in this process: in-memory discovery, no brokers.
+    // Discovery is local to this frontend: engines are listed (flags) or
+    // observed (pods) here, never registered by the engines themselves.
     let drt = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local()).await?;
     let endpoint = drt
         .namespace(&args.namespace)?
         .component("backend")?
         .endpoint("generate");
 
-    let direct = DirectEngines::new(endpoint.clone(), DisaggregationMode::Aggregated);
+    let direct = Arc::new(DirectEngines::new(
+        endpoint.clone(),
+        DisaggregationMode::Aggregated,
+    ));
+    let connect = vllm_connector(args.grpc_startup_deadline_secs);
     for grpc_endpoint in &args.grpc_endpoint {
-        let argv = vec![
-            "dynamo-vllm-sidecar".to_string(),
-            "--grpc-endpoint".to_string(),
-            grpc_endpoint.clone(),
-            "--grpc-startup-deadline-secs".to_string(),
-            args.grpc_startup_deadline_secs.to_string(),
-        ];
-        let argv_for_parse = argv.clone();
-        let (engine, _worker_config) =
-            tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv_for_parse)))
-                .await??;
-        let instance_id = direct.add(Arc::new(engine)).await?;
+        let engine = connect(grpc_endpoint.clone()).await?;
+        let instance_id = direct.add(engine).await?;
         tracing::info!(
             grpc_endpoint,
             instance_id = format_args!("{instance_id:x}"),
             "direct vLLM engine serving"
         );
+    }
+    if let Some(labels) = args.pod_selector.clone() {
+        let client = kube::Client::try_default().await?;
+        let selector = PodSelector {
+            namespace: args.pod_namespace.clone(),
+            labels,
+            port: args.pod_grpc_port,
+        };
+        let pods = PodEngines::new(direct.clone(), selector.port, connect.clone());
+        let cancel = drt.primary_token();
+        tokio::spawn(async move {
+            if let Err(error) = pods.watch(client, &selector, cancel).await {
+                tracing::error!(%error, "engine pod watch ended");
+            }
+        });
     }
 
     let service = HttpService::builder()
@@ -129,10 +165,36 @@ async fn run(runtime: Runtime, args: Args) -> anyhow::Result<()> {
     let model = watcher.wait_for_chat_model().await;
     tracing::info!(
         model,
-        engines = args.grpc_endpoint.len(),
+        engines = direct.instance_ids().len(),
         url = format!("http://{}:{}/v1", args.http_host, args.http_port),
         "frontend serving directly"
     );
 
     service.run(drt.primary_token()).await
+}
+
+/// A vLLM gRPC client for a `host:port` endpoint, not yet started.
+fn vllm_connector(startup_deadline_secs: u64) -> Connect {
+    Arc::new(move |grpc_endpoint: String| {
+        async move {
+            let argv = vec![
+                "dynamo-vllm-sidecar".to_string(),
+                "--grpc-endpoint".to_string(),
+                grpc_endpoint,
+                "--grpc-startup-deadline-secs".to_string(),
+                startup_deadline_secs.to_string(),
+            ];
+            let (engine, _worker_config) =
+                tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
+                    .await
+                    .map_err(|error| {
+                        DynamoError::builder()
+                            .error_type(ErrorType::Backend(BackendError::Unknown))
+                            .message(format!("vLLM engine argv task: {error}"))
+                            .build()
+                    })??;
+            Ok(Arc::new(engine) as Arc<dyn LLMEngine>)
+        }
+        .boxed()
+    })
 }

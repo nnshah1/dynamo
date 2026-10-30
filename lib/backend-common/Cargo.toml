@@ -32,6 +32,8 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }

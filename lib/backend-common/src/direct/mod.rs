@@ -12,6 +12,8 @@
 //! worker. Selection, occupancy, fault detection and migration stay in
 //! `PushRouter` above this seam.
 
+pub mod pods;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use dynamo_llm::model_type::ModelInput;
 use dynamo_runtime::component::{Endpoint, Instance, TransportType};
-use dynamo_runtime::discovery::{DiscoverySpec, EndpointInstanceId};
+use dynamo_runtime::discovery::{DiscoveryInstance, DiscoverySpec, EndpointInstanceId};
 use dynamo_runtime::pipeline::{
     AddressedRequest, AsyncEngine, AsyncEngineContextProvider, Error, ManyIn, ManyOut,
     ResponseStream, SingleIn, StreamingDispatch,
@@ -32,7 +34,7 @@ use parking_lot::RwLock;
 
 use crate::adapter::EngineAdapter;
 use crate::disagg::DisaggregationMode;
-use crate::engine::{LLMEngine, LLMEngineOutput, PreprocessedRequest};
+use crate::engine::{EngineConfig, LLMEngine, LLMEngineOutput, PreprocessedRequest};
 use crate::error::{BackendError, DynamoError, ErrorType};
 use crate::worker::{
     WorkerConfig, build_local_model, err, resolve_model_type, resolve_worker_type_and_needs,
@@ -44,6 +46,14 @@ pub struct DirectEngines {
     mode: DisaggregationMode,
     dispatch: Arc<DirectDispatch>,
     next_index: AtomicU64,
+    hosted: parking_lot::Mutex<HashMap<u64, Hosted>>,
+}
+
+/// What [`DirectEngines::remove`] undoes for one engine.
+struct Hosted {
+    engine: Arc<dyn LLMEngine>,
+    /// Discovery records in registration order; withdrawn in reverse.
+    registrations: Vec<DiscoveryInstance>,
 }
 
 impl DirectEngines {
@@ -58,6 +68,7 @@ impl DirectEngines {
             mode,
             dispatch,
             next_index: AtomicU64::new(0),
+            hosted: Default::default(),
         }
     }
 
@@ -71,9 +82,100 @@ impl DirectEngines {
     /// Starts `engine`, registers it in discovery as a worker of this endpoint,
     /// and serves it through [`Self::dispatch`]. Returns its worker instance id.
     pub async fn add(&self, engine: Arc<dyn LLMEngine>) -> Result<u64, DynamoError> {
-        let instance_id = self.allocate_instance_id();
-        let engine_config = engine.start(instance_id).await?;
+        self.add_as(engine, self.allocate_instance_id()).await
+    }
 
+    /// [`Self::add`] under a caller-chosen worker instance id, for engines whose
+    /// identity comes from outside this process (a pod name, say).
+    pub async fn add_as(
+        &self,
+        engine: Arc<dyn LLMEngine>,
+        instance_id: u64,
+    ) -> Result<u64, DynamoError> {
+        if self.hosted.lock().contains_key(&instance_id) {
+            return Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                format!("direct engine {instance_id:x} is already hosted"),
+            ));
+        }
+        let engine_config = match engine.start(instance_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                // `cleanup` runs after a failed `start` too: engines release
+                // partial state there.
+                if let Err(cleanup) = engine.cleanup().await {
+                    tracing::warn!(%cleanup, "direct engine cleanup after failed start");
+                }
+                return Err(error);
+            }
+        };
+        self.hosted.lock().insert(
+            instance_id,
+            Hosted {
+                engine: engine.clone(),
+                registrations: Vec::new(),
+            },
+        );
+        match self.publish(&engine, &engine_config, instance_id).await {
+            Ok(()) => {
+                tracing::info!(
+                    instance_id = format_args!("{instance_id:x}"),
+                    model = %engine_config.model,
+                    "direct engine registered"
+                );
+                Ok(instance_id)
+            }
+            Err(error) => {
+                self.remove(instance_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Withdraws a hosted engine: it leaves discovery and the dispatch, then
+    /// is cleaned up. Returns whether it was hosted.
+    pub async fn remove(&self, instance_id: u64) -> bool {
+        let Some(hosted) = self.hosted.lock().remove(&instance_id) else {
+            return false;
+        };
+        let discovery = self.endpoint.drt().discovery();
+        for registration in hosted.registrations.into_iter().rev() {
+            if let Err(error) = discovery.unregister(registration).await {
+                tracing::warn!(
+                    instance_id = format_args!("{instance_id:x}"),
+                    %error,
+                    "direct engine discovery unregister"
+                );
+            }
+        }
+        self.dispatch.engines.write().remove(&instance_id);
+        if let Err(error) = hosted.engine.cleanup().await {
+            tracing::warn!(
+                instance_id = format_args!("{instance_id:x}"),
+                %error,
+                "direct engine cleanup"
+            );
+        }
+        tracing::info!(
+            instance_id = format_args!("{instance_id:x}"),
+            "direct engine withdrawn"
+        );
+        true
+    }
+
+    /// Ids of the engines hosted now.
+    pub fn instance_ids(&self) -> Vec<u64> {
+        self.hosted.lock().keys().copied().collect()
+    }
+
+    /// Builds the worker's model card and registers the model and endpoint,
+    /// recording each registration so [`Self::remove`] can withdraw it.
+    async fn publish(
+        &self,
+        engine: &Arc<dyn LLMEngine>,
+        engine_config: &EngineConfig,
+        instance_id: u64,
+    ) -> Result<(), DynamoError> {
         let endpoint_id = self.endpoint.id();
         let config = WorkerConfig {
             namespace: endpoint_id.namespace.clone(),
@@ -83,7 +185,7 @@ impl DirectEngines {
             disaggregation_mode: self.mode,
             ..WorkerConfig::default()
         };
-        let mut card = build_local_model(&config, &engine_config, false)
+        let mut card = build_local_model(&config, engine_config, false)
             .await?
             .into_card();
         card.model_type = resolve_model_type(&config)?;
@@ -101,54 +203,59 @@ impl DirectEngines {
                 )
             })?;
 
-        self.dispatch
-            .engines
-            .write()
-            .insert(instance_id, Arc::new(EngineAdapter::new(engine, self.mode)));
-
-        let discovery = self.endpoint.drt().discovery();
-        let registration = async {
-            discovery
-                .register_as(
-                    DiscoverySpec::Model {
-                        namespace: endpoint_id.namespace.clone(),
-                        component: endpoint_id.component.clone(),
-                        endpoint: endpoint_id.name.clone(),
-                        card_json,
-                        model_suffix: None,
-                    },
-                    instance_id,
-                )
-                .await?;
-            discovery
-                .register_as(
-                    DiscoverySpec::Endpoint {
-                        namespace: endpoint_id.namespace.clone(),
-                        component: endpoint_id.component.clone(),
-                        endpoint: endpoint_id.name.clone(),
-                        // Routing never dials this address: the dispatch holds the engine.
-                        transport: TransportType::Tcp(format!("direct/{instance_id:x}")),
-                        device_type: None,
-                        request_plane_codec: None,
-                    },
-                    instance_id,
-                )
-                .await
-        };
-        if let Err(error) = registration.await {
-            self.dispatch.engines.write().remove(&instance_id);
-            return Err(err(
-                ErrorType::Backend(BackendError::CannotConnect),
-                format!("direct engine discovery registration: {error:#}"),
-            ));
-        }
-
-        tracing::info!(
-            instance_id = format_args!("{instance_id:x}"),
-            model = %engine_config.model,
-            "direct engine registered"
+        self.dispatch.engines.write().insert(
+            instance_id,
+            Arc::new(EngineAdapter::new(engine.clone(), self.mode)),
         );
-        Ok(instance_id)
+
+        let specs = [
+            DiscoverySpec::Model {
+                namespace: endpoint_id.namespace.clone(),
+                component: endpoint_id.component.clone(),
+                endpoint: endpoint_id.name.clone(),
+                card_json,
+                model_suffix: None,
+            },
+            DiscoverySpec::Endpoint {
+                namespace: endpoint_id.namespace.clone(),
+                component: endpoint_id.component.clone(),
+                endpoint: endpoint_id.name.clone(),
+                // Routing never dials this address: the dispatch holds the engine.
+                transport: TransportType::Tcp(format!("direct/{instance_id:x}")),
+                device_type: None,
+                request_plane_codec: None,
+            },
+        ];
+        let discovery = self.endpoint.drt().discovery();
+        for spec in specs {
+            let registration = discovery
+                .register_as(spec, instance_id)
+                .await
+                .map_err(|error| {
+                    err(
+                        ErrorType::Backend(BackendError::CannotConnect),
+                        format!("direct engine discovery registration: {error:#}"),
+                    )
+                })?;
+            let orphan = match self.hosted.lock().get_mut(&instance_id) {
+                Some(hosted) => {
+                    hosted.registrations.push(registration);
+                    None
+                }
+                None => Some(registration),
+            };
+            // Removed while registering: withdraw what just landed.
+            if let Some(registration) = orphan {
+                if let Err(error) = discovery.unregister(registration).await {
+                    tracing::warn!(%error, "direct engine discovery unregister");
+                }
+                return Err(err(
+                    ErrorType::Backend(BackendError::Cancelled),
+                    format!("direct engine {instance_id:x} was removed while registering"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Distinct from the process connection id and from every other engine in
