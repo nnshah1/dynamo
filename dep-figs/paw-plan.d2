@@ -12,10 +12,15 @@ b: "B  #17598\naffinity on the core" {
   l: "HeadroomPicker · PoolDirectory\nsoft session table (idle TTL)" {class: plugin}
   d: "default: legacy (unchanged)" {class: note}
 }
-c: "C1  #17599\nreplica sync" {
+c: "C1  #17599\nreplica sync, built-in mesh" {
   class: core
-  l: "--replica-sync-port · --peer\nbookings + pins shared\n(companion DEP)" {class: plugin}
+  l: "--replica-sync-port · --peer tcp://\nbookings + pins shared" {class: plugin}
   d: "sync only when peers given" {class: note}
+}
+c2: "C2  gRPC ReplicaSync\n(three PRs, DEP #17639)" {
+  class: core
+  l: "C2a proto + codegen\nC2b server beside HTTP + host transport\nC2c peers from Global Discovery" {class: plugin}
+  d: "one port, mTLS-ready; C1 flags retired" {class: note}
 }
 d: "D  cutover" {
   class: legacy
@@ -23,6 +28,6 @@ d: "D  cutover" {
   d: "default flips" {class: note}
 }
 
-a -> b -> c -> d {class: flow}
+a -> b -> c -> c2 -> d {class: flow}
 
-k: "lib/kv-router: no change in A, B, C1 or D" {class: note}
+k: "lib/kv-router: no change in any PR" {class: note}

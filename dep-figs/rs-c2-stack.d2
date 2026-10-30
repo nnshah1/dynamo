@@ -1,0 +1,26 @@
+...@_style
+
+direction: right
+
+c1: "C1  #17599\nbuilt-in ZMQ mesh" {
+  class: core
+  l: "--replica-sync-port · --peer tcp://\nproof of behaviour" {class: plugin}
+}
+c2a: "C2a  proto" {
+  class: core
+  l: "lib/global-common\nreplica_sync.proto + tonic codegen\nwire ⇄ core event conversions + tests" {class: plugin}
+  d: "no runtime change" {class: note}
+}
+c2b: "C2b  transport" {
+  class: core
+  l: "ReplicaSync server beside the HTTP listener\nHostReplicaSyncFactory wiring in CoreSelector\n--peer http(s)://host:port · snapshot frame\ntwo-replica tests over gRPC" {class: plugin}
+  d: "mesh kept behind tcp:// peers" {class: note}
+}
+c2c: "C2c  peers from discovery" {
+  class: core
+  l: "dial every replica in GET /routers\n(poll with the pool catalog)\nTLS/mTLS from the relay client settings\nretire --replica-sync-port, tcp:// peers" {class: plugin}
+  d: "shippable form" {class: note}
+}
+
+c1 -> c2a -> c2b -> c2c {class: flow}
+k: "each PR builds and tests alone; lib/kv-router unchanged" {class: note}

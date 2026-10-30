@@ -1,0 +1,29 @@
+...@_style
+
+direction: right
+
+gf: "Global Frontend (one replica)" {
+  class: host
+  direction: right
+  pool: "a pool\nregion/namespace/deployment\nserves one model" {class: ext}
+  req: "a request\nPOST /v1/chat/completions" {class: ext}
+  sess: "a session\nx-dynamo-session-id" {class: ext}
+  pol: "a policy\nround-robin · least-in-flight · affinity" {class: ext}
+}
+
+core: "embedded router core (dynamo-kv-router, unchanged)" {
+  class: core
+  direction: right
+  worker: "a worker\nid = xxh3(pool id)" {class: state}
+  booking: "a booking in the ledger\nbook → prefill-complete → free" {class: state}
+  pin: "a binding in the session table\nsession → worker, soft, idle TTL" {class: state}
+  picker: "a WorkerPicker plugin\nRoundRobin · LeastRequests · Headroom" {class: plugin}
+}
+
+gf.pool -> core.worker: "is a" {class: flow}
+gf.req -> core.booking: "becomes a" {class: flow}
+gf.sess -> core.pin: "becomes a" {class: flow}
+gf.pol -> core.picker: "is a" {class: flow}
+
+relay: "PoolRelay occupancy\n(slots, KV) stays outside the core:\nread locally, handed to the Headroom picker" {class: note}
+relay -> core.picker {class: signal}

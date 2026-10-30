@@ -2,61 +2,46 @@
 
 direction: down
 
-before: "Before (#17524): each Global Frontend keeps its own routing state" {
+before: "Before (#17524): routing state lives in the frontend, once per replica" {
   class: host
   style.fill: "#fdf6f6"
   style.stroke: "#a33"
-
-  gf: "Global Frontend" {
-    class: host
-    sel: "PoolSelector\nround-robin · least-in-flight · affinity" {class: legacy}
-    inflight: "InFlightTracker\n(this process only)" {class: legacy}
-    pins: "session pins\n(this process only)" {class: legacy}
-    sel -> inflight: counts {class: no}
-    sel -> pins: pins {class: no}
-  }
-  gf2: "Global Frontend (replica 2)" {
+  grid-columns: 3
+  grid-gap: 40
+  a: "Global Frontend A" {
     class: host
     sel: "PoolSelector" {class: legacy}
-    inflight: "its own counts" {class: legacy}
-    pins: "its own pins" {class: legacy}
-    sel -> inflight {class: no}
+    cnt: "in-flight counts" {class: legacy}
+    pins: "session pins" {class: legacy}
+    sel -> cnt {class: no}
     sel -> pins {class: no}
   }
-  n: "two replicas = two ledgers, two pin maps,\nnothing shared" {class: note}
+  n: "✕  nothing shared\ntwo ledgers, two pin maps" {class: note}
+  b: "Global Frontend B" {
+    class: host
+    sel: "PoolSelector" {class: legacy}
+    cnt: "its own counts" {class: legacy}
+    pins: "its own pins" {class: legacy}
+    sel -> cnt {class: no}
+    sel -> pins {class: no}
+  }
 }
 
-after: "After (--selection core): pools are workers of an embedded router core" {
+after: "After (--selection core): routing state lives in the router core the frontend embeds" {
   class: host
-
-  gf: "Global Frontend" {
+  grid-columns: 3
+  grid-gap: 40
+  a: "Global Frontend A" {
     class: host
-    adapters: "adapters  (lib/global-router/src/core)" {
-      class: core
-      catalog: "PoolCatalogSource\npool → worker" {class: plugin}
-      selector: "CoreSelector\nbook · prefill-complete · free" {class: plugin}
-      pickers: "pickers\nRoundRobin · LeastRequests · Headroom" {class: plugin}
-    }
-    core: "router core  (dynamo-kv-router, unchanged)" {
-      class: core
-      ledger: "request ledger\nper pool" {class: state}
-      sessions: "session table\nsoft affinity, TTL" {class: state}
-      registry: "plugin registry" {class: state}
-    }
-    adapters.catalog -> core: "worker set" {class: flow}
-    adapters.selector -> core.ledger: "select_and_reserve" {class: flow}
-    adapters.pickers -> core.registry: "register_worker_selection" {class: flow}
-    core.sessions -> adapters.pickers: "affinity_target()" {class: flow}
+    core: "router core\nledger · session table · picker" {class: core}
   }
-  n: "same core the frontend embeds;\nledger + session table replicate\n(companion DEP)" {class: note}
+  n: "⟷  bookings + pins replicate\n(companion DEP #17639)" {class: note; style.font-color: "#5a8f00"}
+  b: "Global Frontend B" {
+    class: host
+    core: "router core\nledger · session table · picker" {class: core}
+  }
 }
 
 before -> after: "" {style.opacity: 0}
-
-relays: "PoolRelays\noccupancy per pool" {class: ext}
-pools: "Pools\nblue · green · tokyo …" {class: ext}
-
-relays -> before.gf.sel: "slots, KV" {class: signal}
-relays -> after.gf.adapters.pickers: "slots, KV\n(PoolSignals, side table)" {class: signal}
-pools -> relays: "load reports" {class: signal}
-after.gf.adapters.catalog -> pools: "mirrors the\npool catalog" {class: flow}
+k: "pools are the core's workers · policies are its picker plugins · lib/kv-router unchanged" {class: note}
+after -> k: "" {style.opacity: 0}
