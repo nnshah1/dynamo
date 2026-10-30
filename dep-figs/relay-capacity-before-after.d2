@@ -1,0 +1,48 @@
+...@_style
+
+direction: down
+
+problem: "Problem: a pool whose workers do not publish KV events never reports its capacity" {
+  class: host
+  style.fill: "#fdf6f6"
+  style.stroke: "#a33"
+  direction: right
+
+  workers: "workers\n(KV events off)\ncard: max_num_seqs=8 ×2" {class: ext}
+  relay: "PoolRelay" {
+    class: host
+    gate: "materialization gate\nneeds an active KV event source" {class: legacy}
+    catalog: "pool catalog\n(empty: no phantom pools)" {class: state}
+    load: "SubscribeServingLoad\npools[] = ∅\nmodels[]: requests only" {class: state}
+    gate -> catalog: "no pool" {class: no}
+    catalog -> load: "no deployment.max_concurrency" {class: no}
+  }
+  gf: "Global Frontend\noccupancy = in_flight / max_concurrency\n→ unknown → pool counts as full" {class: legacy}
+
+  workers -> relay.gate: "cards, load metrics\n(no events)" {class: signal}
+  relay.load -> gf {class: signal}
+}
+
+after: "After: capacity rides the topology, the catalog stays event-gated" {
+  class: host
+  direction: right
+
+  workers: "workers\n(KV events off)\ncard: max_num_seqs=8 ×2" {class: ext}
+  relay: "PoolRelay" {
+    class: host
+    gate: "materialization gate\n(unchanged)" {class: plugin}
+    catalog: "pool catalog\n(still empty)" {class: state}
+    topology: "topology members\n(namespace, model) → Σ max_num_seqs" {class: core}
+    load: "SubscribeServingLoad\npools[] = ∅\nmodels[].deployment:\n  live_workers=2, max_concurrency=16" {class: core}
+    gate -> catalog: "no pool" {class: no}
+    topology -> load: "ModelDeploymentStatus\nlive_workers · max_concurrency" {class: sync}
+  }
+  gf: "Global Frontend\nslots = in_flight / 16\n→ occupancy known" {class: core}
+
+  workers -> relay.gate: "cards" {class: signal}
+  workers -> relay.topology: "cards (membership)" {class: signal}
+  relay.load -> gf {class: sync}
+}
+
+problem -> after: "" {style.opacity: 0}
+k: "lib/llm/src/pool_relay only: proto adds two optional fields; no change to pool materialization or the KV index" {class: note}
