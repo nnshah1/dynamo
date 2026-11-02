@@ -1,0 +1,17 @@
+...@_style
+
+shape: sequence_diagram
+
+client: "Client" {class: ext}
+proxy: "Global Frontend\nproxy" {class: host}
+sel: "selector on main\nRoundRobin · LeastInFlight · Affinity" {class: legacy}
+pool: "Pool frontend\n(selected pool)" {class: ext}
+
+client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
+proxy -> sel: "select(request, candidate pools)"
+sel."the selector runs its rule with its own state:\nround-robin cursor · this replica's in-flight counts · affinity pin map"
+sel -> proxy: "pool" {class: flow}
+proxy."count the request in flight"
+proxy -> pool: "forward bytes unchanged"
+pool -> proxy: "… stream ends / client leaves"
+proxy."in-flight count −1"
