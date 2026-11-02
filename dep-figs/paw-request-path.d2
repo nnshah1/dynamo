@@ -5,23 +5,15 @@ shape: sequence_diagram
 client: "Client" {class: ext}
 proxy: "Global Frontend\nproxy" {class: host}
 sel: "CoreSelector\n(PoolSelector)" {class: plugin}
-core: "router core\nsession table · picker plugins" {class: core}
+core: "router core\npicker plugins · session table" {class: core}
 pool: "Pool frontend\n(selected pool)" {class: ext}
 
 client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
 proxy -> sel: "select(request, candidate pools)"
-
-rr: "round-robin, least-in-flight" {
-  sel."CoreSelector calls the picker's rule (choose) directly;\nno core call; then yield.\nLeast-in-flight counts the request in the pick."
-  sel -> proxy: "Selection { target, in_flight }" {class: flow}
-}
-aff: "affinity" {
-  sel -> core: "advisory select (honours the pin, books nothing)\nor select_and_reserve (new pin, move, refresh)" {class: flow}
-  core."the core calls the picker plugin (HeadroomPicker.pick):\nthe pin, else least full nearest pool; reads PoolRelay occupancy"
-  core -> sel: "pool (+ Reservation only when booked)" {class: flow}
-  sel -> proxy: "Selection { target, lifecycle }" {class: flow}
-}
-
+sel -> core: "select (books nothing)\naffinity only: select_and_reserve for a new, moved or old pin" {class: flow}
+core."the core runs the policy's picker plugin:\nround-robin · least-in-flight · headroom (affinity, with the session's pin)"
+core -> sel: "pool" {class: flow}
+sel -> proxy: "Selection { pool, in-flight count, pin booking if any }" {class: flow}
 proxy -> pool: "forward bytes unchanged"
 pool -> proxy: "… stream ends / client leaves"
-proxy."drop the Selection: in-flight count −1;\na Reservation frees its booking (background)"
+proxy."drop the Selection: in-flight count −1;\na pin booking is freed (background)"
