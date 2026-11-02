@@ -15,7 +15,7 @@ core: "embedded router core (dynamo-kv-router, unchanged)" {
   class: core
   direction: right
   worker: "a worker\nid = xxh3(pool id)" {class: state}
-  booking: "a booking in the ledger\nonly when the policy reads bookings\nor affinity sets / moves a pin" {class: state}
+  booking: "a booking in the ledger, by policy:\nround-robin: never\nleast-in-flight: never\naffinity: to set, move or refresh a pin\nleast-requests: every request" {class: state}
   pin: "a binding in the session table\nsession → worker, soft, idle TTL" {class: state}
   picker: "a WorkerPicker plugin\nRoundRobin · LeastInFlight · Headroom · LeastRequests" {class: plugin}
 }
@@ -23,7 +23,7 @@ core: "embedded router core (dynamo-kv-router, unchanged)" {
 gf.pool -> core.worker: "is a" {class: flow}
 gf.count: "an in-flight count per pool\n(FrontendSignals, shared by replica sync)" {class: state}
 gf.req -> gf.count: "is counted as" {class: flow}
-gf.req -> core.booking: "sometimes" {class: flow}
+gf.req -> core.booking: "if its policy books" {class: flow}
 gf.sess -> core.pin: "becomes a" {class: flow}
 gf.pol -> core.picker: "is a" {class: flow}
 
