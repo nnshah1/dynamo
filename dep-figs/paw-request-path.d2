@@ -12,12 +12,12 @@ client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
 proxy -> sel: "select(request, candidate pools)"
 
 rr: "round-robin, least-in-flight" {
-  sel."run the plugin's rule here (no core call), then yield;\nleast-in-flight counts the request in the pick"
+  sel."CoreSelector calls the picker's rule (choose) directly;\nno core call; then yield.\nLeast-in-flight counts the request in the pick."
   sel -> proxy: "Selection { target, in_flight }" {class: flow}
 }
 aff: "affinity" {
   sel -> core: "advisory select (honours the pin, books nothing)\nor select_and_reserve (new pin, move, refresh)" {class: flow}
-  core."Headroom picker: the pin, else least full nearest pool;\nreads PoolRelay occupancy"
+  core."the core calls the picker plugin (HeadroomPicker.pick):\nthe pin, else least full nearest pool; reads PoolRelay occupancy"
   core -> sel: "pool (+ Reservation only when booked)" {class: flow}
   sel -> proxy: "Selection { target, lifecycle }" {class: flow}
 }
