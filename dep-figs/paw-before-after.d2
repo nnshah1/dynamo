@@ -16,7 +16,7 @@ before: "Before (#17524): routing state lives in the frontend, once per replica"
     sel -> cnt {class: no}
     sel -> pins {class: no}
   }
-  n: "✕  nothing shared\ntwo ledgers, two pin maps" {class: note}
+  n: "✕  nothing shared\ntwo sets of counts, two pin maps" {class: note}
   b: "Global Frontend B" {
     class: host
     sel: "PoolSelector" {class: legacy}
@@ -27,21 +27,23 @@ before: "Before (#17524): routing state lives in the frontend, once per replica"
   }
 }
 
-after: "After (--selection core): routing state lives in the router core the frontend embeds" {
+after: "After (--use-selection-core): pools are workers of an embedded router core" {
   class: host
   grid-columns: 3
   grid-gap: 40
   a: "Global Frontend A" {
     class: host
-    core: "router core\nledger · session table · picker" {class: core}
+    core: "router core\nsession table · picker plugins" {class: core}
+    cnt: "in-flight counts" {class: state}
   }
-  n: "⟷  bookings + pins replicate\n(companion DEP #17639)" {class: note; style.font-color: "#5a8f00"}
+  n: "⟷  session pins + in-flight counts replicate\n(companion DEP #17639)" {class: note; style.font-color: "#5a8f00"}
   b: "Global Frontend B" {
     class: host
-    core: "router core\nledger · session table · picker" {class: core}
+    core: "router core\nsession table · picker plugins" {class: core}
+    cnt: "in-flight counts" {class: state}
   }
 }
 
 before -> after: "" {style.opacity: 0}
-k: "pools are the core's workers · policies are its picker plugins · lib/kv-router unchanged" {class: note}
+k: "pools are the core's workers · policies are its picker plugins · booking only for affinity pins · lib/kv-router unchanged" {class: note}
 after -> k: "" {style.opacity: 0}

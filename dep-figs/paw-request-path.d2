@@ -3,21 +3,25 @@
 shape: sequence_diagram
 
 client: "Client" {class: ext}
-proxy: "Global Frontend\nproxy.rs" {class: host}
-sel: "CoreSelector\n(adapter)" {class: plugin}
-core: "router core\nledger · session table · picker" {class: core}
+proxy: "Global Frontend\nproxy" {class: host}
+sel: "CoreSelector\n(PoolSelector)" {class: plugin}
+core: "router core\nsession table · picker plugins" {class: core}
 pool: "Pool frontend\n(selected pool)" {class: ext}
-relay: "PoolRelay" {class: ext}
-
-relay -> sel: "occupancy per pool\n(PoolSignals, read locally)" {class: signal}
 
 client -> proxy: "POST /v1/chat/completions\nx-dynamo-session-id: s1"
-proxy -> sel: "route(request, candidate pools)"
-sel -> core: "select_and_reserve (least-in-flight; affinity: new pin, move, refresh)\nor advisory select (round-robin; affinity otherwise)\nallowed = candidate worker ids · session = s1 · tokens = []" {class: flow}
-core."picker runs: RoundRobin · LeastRequests · Headroom\nHeadroom reads affinity_target() + occupancy"
-core -> sel: "worker id → pool (xxh3 of pool id)\nReservation (booking +1) only if booked" {class: flow}
-sel -> proxy: "Selection { target, lifecycle }"
+proxy -> sel: "select(request, candidate pools)"
+
+rr: "round-robin, least-in-flight" {
+  sel."run the plugin's rule here (no core call), then yield;\nleast-in-flight counts the request in the pick"
+  sel -> proxy: "Selection { target, in_flight }" {class: flow}
+}
+aff: "affinity" {
+  sel -> core: "advisory select (honours the pin, books nothing)\nor select_and_reserve (new pin, move, refresh)" {class: flow}
+  core."Headroom picker: the pin, else least full nearest pool;\nreads PoolRelay occupancy"
+  core -> sel: "pool (+ Reservation only when booked)" {class: flow}
+  sel -> proxy: "Selection { target, lifecycle }" {class: flow}
+}
+
 proxy -> pool: "forward bytes unchanged"
 pool -> proxy: "… stream ends / client leaves"
-proxy -> core: "drop(lifecycle) → free_reservation\n(booked picks only; background, never awaited)" {class: flow}
-core."soft affinity: a booking binds s1 to the picked pool;\nan advisory pick honours the pin without refreshing it"
+proxy."drop the Selection: in-flight count −1;\na Reservation frees its booking (background)"
