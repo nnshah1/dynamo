@@ -4,31 +4,31 @@ direction: right
 
 a: "Global Frontend A" {
   class: host
+  counts: "FrontendSignals\nrequests in flight per pool" {class: state}
   core: "embedded router core" {
     class: core
-    ledger: "request ledger\nbookings per pool" {class: state}
     sessions: "session table\nsession → pool" {class: state}
   }
-  signals: "PoolSignals\noccupancy (local view)" {class: ext}
+  signals: "PoolSignals\nRelay load (local view)" {class: ext}
 }
 
 b: "Global Frontend B" {
   class: host
+  counts: "FrontendSignals\nrequests in flight per pool" {class: state}
   core: "embedded router core" {
     class: core
-    ledger: "request ledger\nbookings per pool" {class: state}
     sessions: "session table\nsession → pool" {class: state}
   }
-  signals: "PoolSignals\noccupancy (local view)" {class: ext}
+  signals: "PoolSignals\nRelay load (local view)" {class: ext}
 }
 
-a.core.ledger <-> b.core.ledger: "ActiveSequenceEvent\nAddRequest · MarkPrefillCompleted · Free" {class: sync}
-a.core.sessions <-> b.core.sessions: "AffinityBindingEvent\nlast writer wins by AffinityVersion" {class: sync}
+a.counts <-> b.counts: "InflightCount\nevery 100 ms" {class: sync}
+a.core.sessions <-> b.core.sessions: "AffinityBinding\nlast writer wins by AffinityVersion" {class: sync}
 
 relays: "PoolRelays" {class: ext}
-relays -> a.signals: "SubscribeServingLoad\nSubscribeKvPoolLoad" {class: signal}
-relays -> b.signals: "SubscribeServingLoad\nSubscribeKvPoolLoad" {class: signal}
+relays -> a.signals: "serving load, KV" {class: signal}
+relays -> b.signals: "serving load, KV" {class: signal}
 
 a.signals -> b.signals: "load is never replicated" {class: no}
 
-legend: "shared: what replicas decide (bookings, pins)\nnot shared: what relays report (load)\nbest effort, bounded, off the request path" {class: note}
+legend: "shared: in-flight counts (least-in-flight)\nand session bindings (affinity)\nnot shared: Relay load, bookings\nbest effort, bounded, off the request path" {class: note}
